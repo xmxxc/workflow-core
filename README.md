@@ -1,10 +1,25 @@
 # workflow-core
 
-Wakes a sleeping controller window when a worker or reviewer window finishes, for the `ai-coding` workflow maintained in `/path/to/skills-repo`.
+A lightweight router between the controller and the workers it dispatches, for the `ai-coding` workflow maintained in `/path/to/skills-repo`. Workers report or ask through the router and then sleep. The controller sleeps on `router.py wait` and is woken by their messages.
 
 ## Status
 
-Phase 1, completion wake. The host probes listed in the handoff have not been run yet, so no code exists.
+Phase 1. `router.py` handles Codex workers and a Claude Code controller, and was verified end to end with a real Codex worker. OpenCode and Claude Code workers, the stalled-worker fallback, and pre-trusting new worktrees come next. `notify_controller.py` holds the earlier hook-based classifier, which the fallback will reuse.
+
+## Usage
+
+```sh
+# controller
+router.py dispatch --host codex --task <task.md> --cwd <worktree> --report <report.md>   # prints the dispatch id
+router.py wait --timeout 900        # blocks until a worker message arrives; exit code 3 on timeout
+router.py reply <question-id> "<answer>"
+
+# worker (the dispatch brief tells it these exact commands)
+router.py done --report <report.md>
+router.py ask "<question>" --options a,b
+```
+
+Each worker runs in its own tmux session, `wfc-<dispatch id>`; use `tmux attach -t wfc-<id>` to watch it or step in. State is kept in SQLite under `$WFC_STATE`, which defaults to `~/.local/state/workflow-core`. Run the tests with `python3 -m unittest discover -s tests`.
 
 ## Scope by phase
 
@@ -19,3 +34,4 @@ Each phase adds to the previous one, and each phase can be used on its own.
 ## Documents
 
 - [Handoff, 2026-11-04](docs/handoff-20261104-completion-wake.md): decisions made so far, the host wake matrix, the probes to run first, and the directions that were rejected.
+- `docs/probes-20261105-*.md`: measured wake and completion behaviour of Claude Code, Codex, OpenCode and Orca.
