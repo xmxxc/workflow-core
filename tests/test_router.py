@@ -381,5 +381,54 @@ class Watchdog(unittest.TestCase):
         self.assertTrue(result["timedOut"], result)
 
 
+class CodexRelay(unittest.TestCase):
+    """relay pushes controller messages into a Codex controller session with codex queue."""
+
+    THREAD = "01a1aa97-77da-7fc3-92ad-b9e7a2eb7fe4"
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+        self.dispatch = self.env.dispatch()
+        self.env.report.write_text("# report\n")
+
+    def relay(self, seconds="1.5", env=None):
+        return self.env.run("relay", "--codex-thread", self.THREAD, "--for", seconds, env=env)
+
+    def queued(self):
+        return [c for c in self.env.host_calls() if c[:2] == ["codex", "queue"]]
+
+    def test_messages_are_queued_into_the_codex_controller_once(self):
+        self.env.run("done", "--report", str(self.env.report), dispatch=self.dispatch)
+
+        first = self.relay()
+        second = self.relay(seconds="0.8")
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        [call] = self.queued()
+        self.assertEqual(call[2:4], ["--thread", self.THREAD])
+        self.assertEqual(call[-1], "--resume")
+        message = call[call.index("--message") + 1]
+        self.assertIn('"type": "done"', message)
+        self.assertIn(self.dispatch, message)
+
+    def test_messages_whose_queueing_failed_stay_waiting(self):
+        self.env.run("done", "--report", str(self.env.report), dispatch=self.dispatch)
+
+        self.relay(env={"FAKE_FAIL": "queue"})
+        [message] = self.env.json("wait", "--timeout", "1")["messages"]
+
+        self.assertEqual(message["type"], "done")
+
+    def test_relay_also_runs_the_watchdog(self):
+        self.env.end_session(self.dispatch)
+
+        self.relay()
+
+        [call] = self.queued()
+        self.assertIn('"type": "exited"', call[call.index("--message") + 1])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -259,6 +259,29 @@ def cmd_wait(args):
         time.sleep(0.5)  # ponytail: polls SQLite; switch to a FIFO/inotify wake if 0.5 s latency matters
 
 
+def queue_into_codex(thread, messages):
+    """Deliver one batch as a new turn of the Codex controller session (open or closed)."""
+    text = "[router] Messages for the controller: " + json.dumps({"messages": messages}, ensure_ascii=False)
+    return subprocess.run(["codex", "queue", "--thread", thread, "--message", text, "--resume"],
+                          capture_output=True).returncode == 0
+
+
+def cmd_relay(args):
+    """Like `wait`, but runs on and pushes each batch to a Codex controller, which then sleeps
+    between turns instead of blocking on `wait`."""
+    db = connect()
+    deadline = time.monotonic() + args.for_seconds if args.for_seconds else None
+    while deadline is None or time.monotonic() < deadline:
+        check_workers(db, args.stall_after)
+        messages = take_controller_messages(db)
+        if messages and not queue_into_codex(args.codex_thread, messages):
+            # Put the batch back so the next pass, or a `wait`, delivers it.
+            db.executemany("UPDATE message SET delivered = 0 WHERE id = ?", [(m["id"],) for m in messages])
+            time.sleep(5)
+        time.sleep(0.5)
+    return 0
+
+
 def main(argv):
     parser = argparse.ArgumentParser(prog="router.py")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -285,6 +308,11 @@ def main(argv):
     p.add_argument("--stall-after", type=float, default=300,
                    help="seconds a worker's screen may stay unchanged before it is reported as stalled")
     p.set_defaults(func=cmd_wait)
+    p = sub.add_parser("relay", help="push controller messages into a Codex controller session")
+    p.add_argument("--codex-thread", required=True, help="the Codex controller's session UUID or name")
+    p.add_argument("--stall-after", type=float, default=300)
+    p.add_argument("--for", dest="for_seconds", type=float, help="stop after this many seconds (default: run on)")
+    p.set_defaults(func=cmd_relay)
     args = parser.parse_args(argv)
     return args.func(args) or 0
 

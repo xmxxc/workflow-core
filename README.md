@@ -4,7 +4,7 @@ A lightweight router between the controller and the workers it dispatches, for t
 
 ## Status
 
-Phase 1. `router.py` dispatches Codex, OpenCode and Claude Code workers to a Claude Code controller. Each host was verified end to end with a real worker (dispatch → ask → reply → done). While waiting, the controller also watches its workers. A worker whose tmux session ended without `done` is reported as `exited`. A worker whose screen stays unchanged for `--stall-after` seconds, with no `done` and no pending question, is reported as `stalled`, together with its screen. Both cases were verified with a real Claude Code worker. Pre-trusting new worktrees comes next. `notify_controller.py`, the earlier hook-based classifier, has been superseded by the watchdog and is kept for reference.
+Phase 1. `router.py` dispatches Codex, OpenCode and Claude Code workers to a Claude Code controller. Each host was verified end to end with a real worker (dispatch → ask → reply → done). While waiting, the controller also watches its workers. A worker whose tmux session ended without `done` is reported as `exited`. A worker whose screen stays unchanged for `--stall-after` seconds, with no `done` and no pending question, is reported as `stalled`, together with its screen. Both cases were verified with a real Claude Code worker. A Codex controller does not block on `wait`. Instead, `relay` runs in the background and delivers each batch of messages to the controller's session with `codex queue --resume`. This was verified with a real Codex session, which woke on a `done` message. Pre-trusting new worktrees comes next. `notify_controller.py`, the earlier hook-based classifier, has been superseded by the watchdog and is kept for reference.
 
 ## Usage
 
@@ -13,6 +13,7 @@ Phase 1. `router.py` dispatches Codex, OpenCode and Claude Code workers to a Cla
 router.py dispatch --host codex|opencode|claude --task <task.md> --cwd <worktree> --report <report.md> [--model <model>]
 router.py wait --timeout 900 [--stall-after 300]   # blocks until a worker message (done, question, stalled, exited); exit code 3 on timeout
 router.py reply <question-id> "<answer>"
+router.py relay --codex-thread <session-uuid> [--stall-after 300] &   # Codex controller: push messages into its session instead of `wait`
 
 # worker (the dispatch brief tells it these exact commands)
 router.py done --report <report.md>
