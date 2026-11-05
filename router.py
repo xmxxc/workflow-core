@@ -41,7 +41,12 @@ def connect():
         CREATE TABLE IF NOT EXISTS message (
             id INTEGER PRIMARY KEY AUTOINCREMENT, dispatch TEXT, recipient TEXT,
             type TEXT, body TEXT, created REAL, delivered INTEGER DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS screen_watch (
+            dispatch TEXT PRIMARY KEY, screen TEXT, since REAL, reported_screen TEXT);
     """)
+    # `started` is set once the worker's tmux session exists; the watchdog ignores rows without it.
+    if "started" not in [c["name"] for c in db.execute("PRAGMA table_info(dispatch)")]:
+        db.execute("ALTER TABLE dispatch ADD COLUMN started REAL")
     return db
 
 
@@ -98,7 +103,7 @@ def cmd_dispatch(args):
     command, extra_env = LAUNCHERS[args.host](worker_brief(dispatch_id, task, report),
                                               [state_dir(), report.parent], cwd, args.model)
     env = {"WFC_DISPATCH": dispatch_id, "WFC_STATE": str(state_dir()), **extra_env}
-    db.execute("INSERT INTO dispatch VALUES (?, ?, ?, ?, ?)",
+    db.execute("INSERT INTO dispatch (id, host, cwd, task, created) VALUES (?, ?, ?, ?, ?)",
                (dispatch_id, args.host, str(cwd), str(task), time.time()))
     launched = subprocess.run(["tmux", "new-session", "-d", "-s", session_name(dispatch_id), "-c", str(cwd),
                                *[arg for k, v in env.items() for arg in ("-e", f"{k}={v}")],
@@ -106,6 +111,7 @@ def cmd_dispatch(args):
     if launched.returncode != 0:
         db.execute("DELETE FROM dispatch WHERE id = ?", (dispatch_id,))
         raise SystemExit(f"could not start the worker's tmux session (exit {launched.returncode})")
+    db.execute("UPDATE dispatch SET started = ? WHERE id = ?", (time.time(), dispatch_id))
     emit({"dispatch": dispatch_id, "host": args.host, "tmux": session_name(dispatch_id)})
 
 
@@ -154,9 +160,7 @@ def cmd_reply(args):
     question = db.execute("SELECT * FROM message WHERE id = ? AND type = 'question'", (args.message,)).fetchone()
     if question is None:
         raise SystemExit(f"no question with id {args.message}")
-    answered = db.execute("SELECT 1 FROM message WHERE type = 'reply' AND json_extract(body, '$.to') = ?",
-                          (question["id"],)).fetchone()
-    if answered:
+    if answered(db, question["id"]):
         raise SystemExit(f"question {question['id']} was already answered")
     # A newline would submit a partial answer in the worker's TUI, so the answer travels as one line.
     answer = " ".join(args.answer.splitlines())
@@ -175,10 +179,73 @@ def take_controller_messages(db):
     return [{"id": r["id"], "dispatch": r["dispatch"], "type": r["type"], **json.loads(r["body"])} for r in rows]
 
 
+def answered(db, question_id):
+    return db.execute("SELECT 1 FROM message WHERE type = 'reply' AND json_extract(body, '$.to') = ?",
+                      (question_id,)).fetchone() is not None
+
+
+def watched(db, dispatch_id):
+    """The watchdog watches a started dispatch until it reports done or is reported exited."""
+    return db.execute(
+        "SELECT 1 FROM dispatch d WHERE d.id = ? AND d.started IS NOT NULL AND NOT EXISTS "
+        "(SELECT 1 FROM message m WHERE m.dispatch = d.id AND m.type IN ('done', 'exited'))",
+        (dispatch_id,)).fetchone() is not None
+
+
+def awaiting_answer(db, dispatch_id):
+    return any(not answered(db, q["id"]) for q in db.execute(
+        "SELECT id FROM message WHERE dispatch = ? AND type = 'question'", (dispatch_id,)))
+
+
+def check_workers(db, stall_after):
+    """Report workers whose tmux session ended, or whose screen stopped changing,
+    without `done` or a pending question. A busy TUI redraws a timer or spinner;
+    an idle prompt, a crash message or an approval dialog stays still."""
+    candidates = [r["id"] for r in db.execute("SELECT id FROM dispatch WHERE started IS NOT NULL")]
+    for dispatch_id in candidates:
+        if not watched(db, dispatch_id):
+            continue
+        session = session_name(dispatch_id)
+        alive = subprocess.run(["tmux", "has-session", "-t", session], capture_output=True).returncode == 0
+        captured = subprocess.run(["tmux", "capture-pane", "-p", "-t", session],
+                                  capture_output=True, text=True) if alive else None
+        now = time.time()
+        # Decide and post under one write lock, re-checking state a worker's `done` may have changed.
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            if not watched(db, dispatch_id):
+                pass
+            elif not alive:
+                post(db, dispatch_id, "controller", "exited",
+                     {"reason": f"tmux session {session} ended without done"})
+            elif awaiting_answer(db, dispatch_id):
+                db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (dispatch_id,))
+            elif captured.returncode == 0:
+                watch_screen(db, dispatch_id, captured.stdout, now, stall_after)
+            db.execute("COMMIT")
+        except BaseException:
+            db.execute("ROLLBACK")
+            raise
+
+
+def watch_screen(db, dispatch_id, screen, now, stall_after):
+    watch = db.execute("SELECT * FROM screen_watch WHERE dispatch = ?", (dispatch_id,)).fetchone()
+    if watch is None or watch["screen"] != screen:
+        # A changed screen starts a new episode: the timer restarts and a later stall is reported again.
+        db.execute("INSERT OR REPLACE INTO screen_watch (dispatch, screen, since, reported_screen) "
+                   "VALUES (?, ?, ?, NULL)", (dispatch_id, screen, now))
+    elif now - watch["since"] >= stall_after and watch["reported_screen"] != screen:
+        tail = "\n".join([line for line in screen.splitlines() if line.strip()][-15:])
+        post(db, dispatch_id, "controller", "stalled",
+             {"idleSeconds": int(now - watch["since"]), "screen": tail})
+        db.execute("UPDATE screen_watch SET reported_screen = ? WHERE dispatch = ?", (screen, dispatch_id))
+
+
 def cmd_wait(args):
     db = connect()
     deadline = time.monotonic() + args.timeout
     while True:
+        check_workers(db, args.stall_after)
         # At-most-once: messages are marked delivered before they are printed; the ledger is the backstop.
         messages = take_controller_messages(db)
         if messages:
@@ -213,6 +280,8 @@ def main(argv):
     p.set_defaults(func=cmd_reply)
     p = sub.add_parser("wait")
     p.add_argument("--timeout", type=float, default=3600)
+    p.add_argument("--stall-after", type=float, default=300,
+                   help="seconds a worker's screen may stay unchanged before it is reported as stalled")
     p.set_defaults(func=cmd_wait)
     args = parser.parse_args(argv)
     return args.func(args) or 0

@@ -6,6 +6,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -30,12 +31,32 @@ class Env:
         self.bin = root / "bin"
         self.bin.mkdir()
         # Each fake logs its argv; FAKE_FAIL=<subcommand> makes that subcommand exit 1.
+        # The fake tmux keeps one marker file per session: new-session creates it (after
+        # FAKE_LAUNCH_DELAY seconds) and has-session checks it. capture-pane prints FAKE_SCREEN's
+        # file if set, else a fresh screen each time (a busy worker).
+        self.screen = root / "screen.txt"
+        self.sessions = root / "sessions"
+        self.sessions.mkdir()
         for name in ("tmux", "codex", "opencode", "claude"):
             fake = self.bin / name
-            fake.write_text(f"#!{sys.executable}\nimport json, os, sys\n"
-                            f"open({str(self.calls)!r}, 'a').write(json.dumps([{name!r}, *sys.argv[1:]]) + '\\n')\n"
-                            f"sys.exit(1 if os.environ.get('FAKE_FAIL') == sys.argv[1] else 0)\n")
+            fake.write_text(
+                f"#!{sys.executable}\nimport json, os, sys, time\n"
+                f"open({str(self.calls)!r}, 'a').write(json.dumps([{name!r}, *sys.argv[1:]]) + '\\n')\n"
+                f"if os.environ.get('FAKE_FAIL') == sys.argv[1]:\n"
+                f"    sys.exit(1)\n"
+                f"sessions = {str(self.sessions)!r}\n"
+                f"if {name!r} == 'tmux' and sys.argv[1] == 'new-session':\n"
+                f"    time.sleep(float(os.environ.get('FAKE_LAUNCH_DELAY', '0')))\n"
+                f"    open(os.path.join(sessions, sys.argv[sys.argv.index('-s') + 1]), 'w').close()\n"
+                f"if {name!r} == 'tmux' and sys.argv[1] == 'has-session':\n"
+                f"    sys.exit(0 if os.path.exists(os.path.join(sessions, sys.argv[sys.argv.index('-t') + 1])) else 1)\n"
+                f"if {name!r} == 'tmux' and sys.argv[1] == 'capture-pane':\n"
+                f"    screen = os.environ.get('FAKE_SCREEN')\n"
+                f"    print(open(screen).read() if screen else f'Working ({{time.time_ns()}})')\n")
             fake.chmod(0o755)
+
+    def end_session(self, dispatch):
+        (self.sessions / f"wfc-{dispatch}").unlink()
 
     def run(self, *args, dispatch=None, timeout=10, env=None, cwd=None):
         full_env = {**os.environ, "WFC_STATE": str(self.state),
@@ -263,7 +284,8 @@ class Waiting(unittest.TestCase):
     def test_wait_blocks_until_a_late_message_arrives(self):
         dispatch = self.env.dispatch()
         self.env.report.write_text("# report\n")
-        env = {**os.environ, "WFC_STATE": str(self.env.state)}
+        env = {**os.environ, "WFC_STATE": str(self.env.state),
+               "PATH": f"{self.env.bin}{os.pathsep}{os.environ['PATH']}"}
         waiter = subprocess.Popen([sys.executable, str(ROUTER), "wait", "--timeout", "10"],
                                   stdout=subprocess.PIPE, text=True, env=env)
         self.addCleanup(waiter.kill)
@@ -284,6 +306,78 @@ class Waiting(unittest.TestCase):
 
         self.assertEqual(result.returncode, 3)
         self.assertEqual(json.loads(result.stdout), {"messages": [], "timedOut": True})
+
+
+class Watchdog(unittest.TestCase):
+    """wait reports workers that exited or stopped changing without done or a pending question."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+        self.dispatch = self.env.dispatch()
+        self.env.screen.write_text("› Which color do you prefer?\n\n  Worked for 4s\n")
+        self.still = {"FAKE_SCREEN": str(self.env.screen)}
+
+    def wait(self, env=None, timeout="1.5"):
+        return self.env.json("wait", "--timeout", timeout, "--stall-after", "0.3", env=env)
+
+    def test_worker_whose_session_ended_without_done_is_reported_once(self):
+        self.env.end_session(self.dispatch)
+        first = self.wait()
+        second = self.wait(timeout="0.6")
+
+        [message] = first["messages"]
+        self.assertEqual((message["type"], message["dispatch"]), ("exited", self.dispatch))
+        self.assertTrue(second["timedOut"])
+
+    def test_worker_whose_screen_stopped_changing_is_reported_once_with_its_screen(self):
+        first = self.wait(env=self.still)
+        second = self.wait(env=self.still, timeout="0.8")
+
+        [message] = first["messages"]
+        self.assertEqual((message["type"], message["dispatch"]), ("stalled", self.dispatch))
+        self.assertIn("Which color do you prefer?", message["screen"])
+        self.assertTrue(second["timedOut"])
+
+    def test_busy_worker_is_not_reported(self):
+        self.assertTrue(self.wait(timeout="1")["timedOut"])
+
+    def test_worker_waiting_for_an_answer_is_not_reported(self):
+        self.env.run("ask", "Red or blue?", dispatch=self.dispatch)
+        [question] = self.wait()["messages"]
+
+        self.assertEqual(question["type"], "question")
+        self.assertTrue(self.wait(env=self.still, timeout="1")["timedOut"])
+
+    def test_finished_worker_is_not_reported(self):
+        self.env.report.write_text("# report\n")
+        self.env.run("done", "--report", str(self.env.report), dispatch=self.dispatch)
+        [done] = self.wait()["messages"]
+
+        self.assertEqual(done["type"], "done")
+        self.env.end_session(self.dispatch)
+        self.assertTrue(self.wait(env=self.still, timeout="1")["timedOut"])
+
+    def test_a_second_stall_on_the_same_screen_is_reported_after_the_worker_moved_on(self):
+        [first] = self.wait(env=self.still)["messages"]
+        self.assertTrue(self.wait(timeout="0.6")["timedOut"])  # busy: the screen changes every poll
+        [second] = self.wait(env=self.still)["messages"]
+
+        self.assertEqual((first["type"], second["type"]), ("stalled", "stalled"))
+
+    def test_worker_still_starting_up_is_not_reported_as_exited(self):
+        env = {**os.environ, "WFC_STATE": str(self.env.state), "FAKE_LAUNCH_DELAY": "2",
+               "PATH": f"{self.env.bin}{os.pathsep}{os.environ['PATH']}"}
+        starting = subprocess.Popen([sys.executable, str(ROUTER), "dispatch", "--host", "codex",
+                                     "--task", str(self.env.task), "--cwd", str(self.env.cwd),
+                                     "--report", str(self.env.report)], stdout=subprocess.PIPE, text=True, env=env)
+        self.addCleanup(starting.kill)
+        time.sleep(0.5)  # the new dispatch exists, its tmux session does not yet
+
+        result = self.wait(timeout="1")
+        starting.communicate(timeout=10)
+
+        self.assertTrue(result["timedOut"], result)
 
 
 if __name__ == "__main__":
