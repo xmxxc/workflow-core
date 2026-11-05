@@ -177,15 +177,17 @@ class Delivery(unittest.TestCase):
         [call] = self.env.host_calls()
         self.assertIn(f"WFC_STATE={root / 'state'}", call)
 
-    def test_opencode_worker_may_touch_only_the_state_and_report_dirs_outside_its_cwd(self):
+    def test_opencode_worker_may_reach_only_the_state_report_and_task_dirs_outside_its_cwd(self):
         self.env.dispatch("opencode")
 
         [call] = self.env.host_calls()
         config = json.loads(next(a for a in call if a.startswith("OPENCODE_CONFIG_CONTENT="))
                             .split("=", 1)[1])
+        task_dir = f"{self.env.task.parent}/**"
         # "*": "ask" overrides any broader rule in the user's own config, which OpenCode merges in.
         self.assertEqual(config["permission"]["external_directory"],
-                         {"*": "ask", f"{self.env.state}/**": "allow", f"{self.env.report.parent}/**": "allow"})
+                         {"*": "ask", f"{self.env.state}/**": "allow", f"{self.env.report.parent}/**": "allow",
+                          task_dir: "allow"})
         opencode = call[call.index("opencode"):]
         self.assertEqual(opencode[1], str(self.env.cwd))
         self.assertIn("done --report", opencode[opencode.index("--prompt") + 1])

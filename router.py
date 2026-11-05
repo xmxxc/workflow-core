@@ -66,25 +66,29 @@ def worker_brief(dispatch_id, task, report):
 
 
 # Each launcher returns (argv, extra environment) for an unattended worker that may write only
-# its cwd plus the `writable` directories (router state and the report's directory).
+# its cwd plus the `writable` directories (router state and the report's directory), and must be
+# able to read its task file in `task_dir`.
 
-def codex_command(brief, writable, cwd, model):
+def codex_command(brief, writable, task_dir, cwd, model):
     # --no-alt-screen keeps the transcript in the tmux scrollback, so `tmux attach` shows history.
     extra = [arg for d in writable for arg in ("--add-dir", str(d))]
     models = ["-m", model] if model else []
     return ["codex", "--no-alt-screen", "-s", "workspace-write", "-a", "never", *models, *extra, brief], {}
 
 
-def opencode_command(brief, writable, cwd, model):
+def opencode_command(brief, writable, task_dir, cwd, model):
     # Paths outside the cwd default to "ask"; allow exactly the writable dirs instead of --auto.
     # OpenCode merges this over the user's config, so "*": "ask" overrides any broader rule there.
-    config = {"permission": {"external_directory": {"*": "ask", **{f"{d}/**": "allow" for d in writable}}}}
+    # The task dir must be reachable for reading the task. OpenCode cannot make it read-only:
+    # an edit-tool deny is bypassed by shell writes (verified), so it is simply allowed.
+    reachable = {"*": "ask", **{f"{d}/**": "allow" for d in [*writable, task_dir]}}
+    config = {"permission": {"external_directory": reachable}}
     models = ["-m", model] if model else []
     return (["opencode", str(cwd), *models, "--prompt", brief],
             {"OPENCODE_CONFIG_CONTENT": json.dumps(config)})
 
 
-def claude_command(brief, writable, cwd, model):
+def claude_command(brief, writable, task_dir, cwd, model):
     # The brief goes first: --add-dir is variadic and would swallow a trailing prompt.
     models = ["--model", model] if model else []
     return ["claude", brief, "--permission-mode", "auto", *models, "--add-dir", *map(str, writable)], {}
@@ -101,7 +105,7 @@ def cmd_dispatch(args):
     report = Path(args.report).resolve()
     report.parent.mkdir(parents=True, exist_ok=True)  # hosts grant access to existing directories
     command, extra_env = LAUNCHERS[args.host](worker_brief(dispatch_id, task, report),
-                                              [state_dir(), report.parent], cwd, args.model)
+                                              [state_dir(), report.parent], task.parent, cwd, args.model)
     env = {"WFC_DISPATCH": dispatch_id, "WFC_STATE": str(state_dir()), **extra_env}
     db.execute("INSERT INTO dispatch (id, host, cwd, task, created) VALUES (?, ?, ?, ?, ?)",
                (dispatch_id, args.host, str(cwd), str(task), time.time()))
