@@ -56,16 +56,36 @@ def worker_brief(dispatch_id, task, report):
             f"When the task is finished, write your report and run: "
             f"{router} done --report {shlex.quote(str(report))}. "
             f"If you need a decision, run: {router} ask \"<question>\" [--options a,b], then end your turn; "
-            f"the answer arrives as your next message. Never ask questions in plain text.")
+            f"the answer arrives as your next message. Never ask questions in plain text "
+            f"or with an interactive question tool; nobody watches this window.")
 
 
-def codex_command(brief, writable):
+# Each launcher returns (argv, extra environment) for an unattended worker that may write only
+# its cwd plus the `writable` directories (router state and the report's directory).
+
+def codex_command(brief, writable, cwd, model):
     # --no-alt-screen keeps the transcript in the tmux scrollback, so `tmux attach` shows history.
     extra = [arg for d in writable for arg in ("--add-dir", str(d))]
-    return ["codex", "--no-alt-screen", "-s", "workspace-write", "-a", "never", *extra, brief]
+    models = ["-m", model] if model else []
+    return ["codex", "--no-alt-screen", "-s", "workspace-write", "-a", "never", *models, *extra, brief], {}
 
 
-LAUNCHERS = {"codex": codex_command}
+def opencode_command(brief, writable, cwd, model):
+    # Paths outside the cwd default to "ask"; allow exactly the writable dirs instead of --auto.
+    # OpenCode merges this over the user's config, so "*": "ask" overrides any broader rule there.
+    config = {"permission": {"external_directory": {"*": "ask", **{f"{d}/**": "allow" for d in writable}}}}
+    models = ["-m", model] if model else []
+    return (["opencode", str(cwd), *models, "--prompt", brief],
+            {"OPENCODE_CONFIG_CONTENT": json.dumps(config)})
+
+
+def claude_command(brief, writable, cwd, model):
+    # The brief goes first: --add-dir is variadic and would swallow a trailing prompt.
+    models = ["--model", model] if model else []
+    return ["claude", brief, "--permission-mode", "auto", *models, "--add-dir", *map(str, writable)], {}
+
+
+LAUNCHERS = {"codex": codex_command, "opencode": opencode_command, "claude": claude_command}
 
 
 def cmd_dispatch(args):
@@ -74,11 +94,14 @@ def cmd_dispatch(args):
     cwd = Path(args.cwd).resolve()
     task = Path(args.task).resolve()
     report = Path(args.report).resolve()
-    command = LAUNCHERS[args.host](worker_brief(dispatch_id, task, report), [state_dir(), report.parent])
+    report.parent.mkdir(parents=True, exist_ok=True)  # hosts grant access to existing directories
+    command, extra_env = LAUNCHERS[args.host](worker_brief(dispatch_id, task, report),
+                                              [state_dir(), report.parent], cwd, args.model)
+    env = {"WFC_DISPATCH": dispatch_id, "WFC_STATE": str(state_dir()), **extra_env}
     db.execute("INSERT INTO dispatch VALUES (?, ?, ?, ?, ?)",
                (dispatch_id, args.host, str(cwd), str(task), time.time()))
     launched = subprocess.run(["tmux", "new-session", "-d", "-s", session_name(dispatch_id), "-c", str(cwd),
-                               "-e", f"WFC_DISPATCH={dispatch_id}", "-e", f"WFC_STATE={state_dir()}",
+                               *[arg for k, v in env.items() for arg in ("-e", f"{k}={v}")],
                                *command])
     if launched.returncode != 0:
         db.execute("DELETE FROM dispatch WHERE id = ?", (dispatch_id,))
@@ -175,6 +198,7 @@ def main(argv):
     p.add_argument("--task", required=True)
     p.add_argument("--cwd", required=True)
     p.add_argument("--report", required=True, help="report path; its directory is made writable for the worker")
+    p.add_argument("--model", help="model for the worker; passed to the host's own model flag")
     p.set_defaults(func=cmd_dispatch)
     p = sub.add_parser("done")
     p.add_argument("--report", required=True)

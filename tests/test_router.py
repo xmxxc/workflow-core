@@ -30,7 +30,7 @@ class Env:
         self.bin = root / "bin"
         self.bin.mkdir()
         # Each fake logs its argv; FAKE_FAIL=<subcommand> makes that subcommand exit 1.
-        for name in ("tmux", "codex"):
+        for name in ("tmux", "codex", "opencode", "claude"):
             fake = self.bin / name
             fake.write_text(f"#!{sys.executable}\nimport json, os, sys\n"
                             f"open({str(self.calls)!r}, 'a').write(json.dumps([{name!r}, *sys.argv[1:]]) + '\\n')\n"
@@ -52,9 +52,9 @@ class Env:
             raise AssertionError(f"router {args[0]} exited {result.returncode}: {result.stderr}")
         return json.loads(result.stdout)
 
-    def dispatch(self, host="codex", **kw):
+    def dispatch(self, host="codex", extra_args=(), **kw):
         return self.json("dispatch", "--host", host, "--task", str(self.task), "--cwd", str(self.cwd),
-                         "--report", str(self.report), **kw)["dispatch"]
+                         "--report", str(self.report), *extra_args, **kw)["dispatch"]
 
     def host_calls(self):
         if not self.calls.exists():
@@ -125,7 +125,19 @@ class Delivery(unittest.TestCase):
         self.assertIn(shlex.quote(str(self.env.task)), brief)
         self.assertIn(f"{router} done --report {shlex.quote(str(self.env.report))}", brief)
         self.assertIn(f"{router} ask ", brief)
-        self.assertIn("Never ask questions in plain text", brief)
+        self.assertIn("Never ask questions in plain text or with an interactive question tool", brief)
+
+    def test_every_host_gets_its_worker_identity_and_a_created_report_directory(self):
+        self.env.report = self.env.report.parent / "new-scope" / "113-impl-r1.md"
+        for host in ("codex", "opencode", "claude"):
+            with self.subTest(host=host):
+                self.env.calls.unlink(missing_ok=True)
+                dispatch = self.env.dispatch(host)
+
+                [call] = self.env.host_calls()
+                self.assertIn(f"WFC_DISPATCH={dispatch}", call)
+                self.assertIn(f"WFC_STATE={self.env.state}", call)
+                self.assertTrue(self.env.report.parent.is_dir())
 
     def test_report_directory_is_writable_and_paths_with_spaces_are_quoted(self):
         self.env.report = self.env.report.parent.parent / "my reports" / "113 impl.md"
@@ -143,6 +155,39 @@ class Delivery(unittest.TestCase):
 
         [call] = self.env.host_calls()
         self.assertIn(f"WFC_STATE={root / 'state'}", call)
+
+    def test_opencode_worker_may_touch_only_the_state_and_report_dirs_outside_its_cwd(self):
+        self.env.dispatch("opencode")
+
+        [call] = self.env.host_calls()
+        config = json.loads(next(a for a in call if a.startswith("OPENCODE_CONFIG_CONTENT="))
+                            .split("=", 1)[1])
+        # "*": "ask" overrides any broader rule in the user's own config, which OpenCode merges in.
+        self.assertEqual(config["permission"]["external_directory"],
+                         {"*": "ask", f"{self.env.state}/**": "allow", f"{self.env.report.parent}/**": "allow"})
+        opencode = call[call.index("opencode"):]
+        self.assertEqual(opencode[1], str(self.env.cwd))
+        self.assertIn("done --report", opencode[opencode.index("--prompt") + 1])
+
+    def test_claude_worker_runs_in_auto_mode_with_state_and_report_dirs_added(self):
+        self.env.dispatch("claude")
+
+        [call] = self.env.host_calls()
+        claude = call[call.index("claude"):]
+        self.assertIn("done --report", claude[1])  # before --add-dir, which takes every following argument
+        self.assertEqual(claude[claude.index("--permission-mode") + 1], "auto")
+        added = claude[claude.index("--add-dir") + 1:]
+        self.assertEqual(added, [str(self.env.state), str(self.env.report.parent)])
+
+    def test_model_is_passed_to_each_host_in_its_own_flag(self):
+        for host, flag in (("codex", "-m"), ("opencode", "-m"), ("claude", "--model")):
+            with self.subTest(host=host):
+                self.env.calls.unlink(missing_ok=True)
+                self.env.dispatch(host, extra_args=["--model", "some/model"])
+
+                [call] = self.env.host_calls()
+                command = call[call.index(host):]
+                self.assertEqual(command[command.index(flag) + 1], "some/model")
 
     def test_dispatch_requires_a_report_path(self):
         result = self.env.run("dispatch", "--host", "codex", "--task", str(self.env.task),

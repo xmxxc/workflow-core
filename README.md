@@ -4,13 +4,13 @@ A lightweight router between the controller and the workers it dispatches, for t
 
 ## Status
 
-Phase 1. `router.py` handles Codex workers and a Claude Code controller, and was verified end to end with a real Codex worker. OpenCode and Claude Code workers, the stalled-worker fallback, and pre-trusting new worktrees come next. `notify_controller.py` holds the earlier hook-based classifier, which the fallback will reuse.
+Phase 1. `router.py` dispatches Codex, OpenCode and Claude Code workers to a Claude Code controller. Each host was verified end to end with a real worker (dispatch → ask → reply → done). The stalled-worker fallback and pre-trusting new worktrees come next. `notify_controller.py` holds the earlier hook-based classifier, which the fallback will reuse.
 
 ## Usage
 
 ```sh
 # controller
-router.py dispatch --host codex --task <task.md> --cwd <worktree> --report <report.md>   # prints the dispatch id
+router.py dispatch --host codex|opencode|claude --task <task.md> --cwd <worktree> --report <report.md> [--model <model>]
 router.py wait --timeout 900        # blocks until a worker message arrives; exit code 3 on timeout
 router.py reply <question-id> "<answer>"
 
@@ -19,7 +19,7 @@ router.py done --report <report.md>
 router.py ask "<question>" --options a,b
 ```
 
-Each worker runs in its own tmux session, `wfc-<dispatch id>`; use `tmux attach -t wfc-<id>` to watch it or step in. State is kept in SQLite under `$WFC_STATE`, which defaults to `~/.local/state/workflow-core`. Run the tests with `python3 -m unittest discover -s tests`.
+Workers run unattended. They may write only their worktree, the router state, and the report's directory: Codex uses `-s workspace-write -a never`; OpenCode allows exactly those external directories; Claude Code runs in `auto` mode with `--add-dir`. Pin `--model` for OpenCode, because its default model can be a rate-limited free one. Each worker runs in its own tmux session, `wfc-<dispatch id>`; use `tmux attach -t wfc-<id>` to watch it or step in. State is kept in SQLite under `$WFC_STATE`, which defaults to `~/.local/state/workflow-core`. Run the tests with `python3 -m unittest discover -s tests`.
 
 ## Scope by phase
 
