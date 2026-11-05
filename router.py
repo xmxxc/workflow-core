@@ -77,12 +77,10 @@ def codex_command(brief, writable, task_dir, cwd, model):
 
 
 def opencode_command(brief, writable, task_dir, cwd, model):
-    # Paths outside the cwd default to "ask"; allow exactly the writable dirs instead of --auto.
-    # OpenCode merges this over the user's config, so "*": "ask" overrides any broader rule there.
-    # The task dir must be reachable for reading the task. OpenCode cannot make it read-only:
-    # an edit-tool deny is bypassed by shell writes (verified), so it is simply allowed.
-    reachable = {"*": "ask", **{f"{d}/**": "allow" for d in [*writable, task_dir]}}
-    config = {"permission": {"external_directory": reachable}}
+    # OpenCode's directory rules are tool prompts, not a sandbox (shell writes bypass them), and
+    # git or pnpm reach into ~ constantly, so an unattended worker allows every external directory
+    # (user decision 2026-11-05). "*" overrides any narrower rule merged in from the user's config.
+    config = {"permission": {"external_directory": {"*": "allow"}}}
     models = ["-m", model] if model else []
     return (["opencode", str(cwd), *models, "--prompt", brief],
             {"OPENCODE_CONFIG_CONTENT": json.dumps(config)})
