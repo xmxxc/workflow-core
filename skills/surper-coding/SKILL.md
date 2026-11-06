@@ -1,5 +1,5 @@
 ---
-name: ai-router
+name: surper-coding
 description: "多票据开发总控（router 版）：用 workflow-core router 把实施与独立审查派发到 Codex、OpenCode 或 Claude Code 会话，总控睡眠、由 worker 消息唤醒；修复复用原会话并增量复核，放行前最终完整审查。"
 disable-model-invocation: true
 ---
