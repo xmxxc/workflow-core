@@ -96,6 +96,32 @@ def claude_command(brief, writable, task_dir, cwd, model):
     return ["claude", brief, "--permission-mode", "auto", *models, "--add-dir", *map(str, writable)], {}
 
 
+def claude_config():
+    return Path(os.environ.get("WFC_CLAUDE_CONFIG") or Path.home() / ".claude.json")
+
+
+def trust_claude_worktree(cwd):
+    """Claude Code asks for trust on every new path, worktrees included. Pre-trust `cwd` only
+    when the user already trusts one of its ancestors (user decision 2026-11-05); otherwise
+    leave the prompt for the user. Returns the trusted ancestor, or None."""
+    path = claude_config()
+    if not path.is_file():
+        return None
+    config = json.loads(path.read_text())
+    projects = config.setdefault("projects", {})
+    if projects.get(str(cwd), {}).get("hasTrustDialogAccepted"):
+        return str(cwd)
+    roots = [p for p, v in projects.items()
+             if v.get("hasTrustDialogAccepted") and cwd.is_relative_to(Path(p)) and Path(p) != cwd]
+    if not roots:
+        return None
+    projects[str(cwd)] = {**projects.get(str(cwd), {}), "hasTrustDialogAccepted": True}
+    tmp = path.with_name(f".{path.name}.wfc-{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(config, indent=2, ensure_ascii=False))
+    os.replace(tmp, path)
+    return max(roots, key=len)
+
+
 LAUNCHERS = {"codex": codex_command, "opencode": opencode_command, "claude": claude_command}
 
 
@@ -109,6 +135,7 @@ def cmd_dispatch(args):
     command, extra_env = LAUNCHERS[args.host](worker_brief(dispatch_id, task, report),
                                               [state_dir(), report.parent], task.parent, cwd, args.model)
     env = {"WFC_DISPATCH": dispatch_id, "WFC_STATE": str(state_dir()), **extra_env}
+    trusted_by = trust_claude_worktree(cwd) if args.host == "claude" else None
     db.execute("INSERT INTO dispatch (id, host, cwd, task, created, report_dir) VALUES (?, ?, ?, ?, ?, ?)",
                (dispatch_id, args.host, str(cwd), str(task), time.time(), str(report.parent)))
     launched = subprocess.run(["tmux", "new-session", "-d", "-s", session_name(dispatch_id), "-c", str(cwd),
@@ -118,7 +145,8 @@ def cmd_dispatch(args):
         db.execute("DELETE FROM dispatch WHERE id = ?", (dispatch_id,))
         raise SystemExit(f"could not start the worker's tmux session (exit {launched.returncode})")
     db.execute("UPDATE dispatch SET started = ? WHERE id = ?", (time.time(), dispatch_id))
-    emit({"dispatch": dispatch_id, "host": args.host, "tmux": session_name(dispatch_id)})
+    emit({"dispatch": dispatch_id, "host": args.host, "tmux": session_name(dispatch_id),
+          **({"trustedBy": trusted_by} if trusted_by else {})})
 
 
 def current_dispatch(db):

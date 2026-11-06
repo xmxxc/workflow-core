@@ -59,7 +59,9 @@ class Env:
         (self.sessions / f"wfc-{dispatch}").unlink()
 
     def run(self, *args, dispatch=None, timeout=10, env=None, cwd=None):
+        # Tests never read or write the real ~/.claude.json.
         full_env = {**os.environ, "WFC_STATE": str(self.state),
+                    "WFC_CLAUDE_CONFIG": str(self.bin.parent / "no-claude-config.json"),
                     "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}", **(env or {})}
         full_env.pop("WFC_DISPATCH", None)
         if dispatch:
@@ -438,6 +440,43 @@ class ContinueDispatch(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("Traceback", result.stderr)
         self.assertEqual(self.sends(), [])
+
+
+class ClaudeTrust(unittest.TestCase):
+    """dispatch --host claude trusts a new worktree only when the user already trusts an ancestor."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+        self.config = Path(self.env.tmp.name) / "claude.json"
+        self.root = self.env.cwd.parent
+
+    def dispatch(self, host="claude"):
+        self.env.dispatch(host, env={"WFC_CLAUDE_CONFIG": str(self.config)})
+        return json.loads(self.config.read_text())
+
+    def test_worktree_under_a_trusted_root_is_trusted_before_launch(self):
+        self.config.write_text(json.dumps({"projects": {str(self.root): {"hasTrustDialogAccepted": True}},
+                                           "otherSetting": 1}))
+
+        config = self.dispatch()
+
+        self.assertTrue(config["projects"][str(self.env.cwd)]["hasTrustDialogAccepted"])
+        self.assertEqual(config["otherSetting"], 1)
+        self.assertTrue(config["projects"][str(self.root)]["hasTrustDialogAccepted"])
+
+    def test_worktree_without_a_trusted_ancestor_is_left_alone(self):
+        untrusted = {"projects": {str(self.root): {"hasTrustDialogAccepted": False},
+                                  "/somewhere/else": {"hasTrustDialogAccepted": True}}}
+        self.config.write_text(json.dumps(untrusted))
+
+        self.assertEqual(self.dispatch(), untrusted)
+
+    def test_other_hosts_do_not_touch_claude_trust(self):
+        before = {"projects": {str(self.root): {"hasTrustDialogAccepted": True}}}
+        self.config.write_text(json.dumps(before))
+
+        self.assertEqual(self.dispatch("codex"), before)
 
 
 class CodexRelay(unittest.TestCase):
