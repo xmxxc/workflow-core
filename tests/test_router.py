@@ -381,6 +381,65 @@ class Watchdog(unittest.TestCase):
         self.assertTrue(result["timedOut"], result)
 
 
+class ContinueDispatch(unittest.TestCase):
+    """continue gives a finished worker its next task in the same session."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+        self.dispatch = self.env.dispatch()
+        self.env.report.write_text("# report r1\n")
+        self.env.run("done", "--report", str(self.env.report), dispatch=self.dispatch)
+        [done] = self.env.json("wait", "--timeout", "1")["messages"]
+        self.assertEqual(done["type"], "done")
+        self.next_task = self.env.task.with_name("113-impl-r2.md")
+        self.next_task.write_text("# fix round\n")
+        self.next_report = self.env.report.with_name("113-impl-r2.md")
+
+    def cont(self, report=None, env=None):
+        return self.env.run("continue", self.dispatch, "--task", str(self.next_task),
+                            "--report", str(report or self.next_report), env=env)
+
+    def sends(self):
+        return [c for c in self.env.host_calls() if c[:2] == ["tmux", "send-keys"]]
+
+    def test_next_task_is_typed_into_the_same_session(self):
+        result = self.cont()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text_call, enter_call = self.sends()
+        self.assertEqual(text_call[2:4], ["-t", f"wfc-{self.dispatch}"])
+        self.assertIn(shlex.quote(str(self.next_task)), text_call[-1])
+        self.assertIn(f"done --report {shlex.quote(str(self.next_report))}", text_call[-1])
+        self.assertEqual(enter_call, ["tmux", "send-keys", "-t", f"wfc-{self.dispatch}", "Enter"])
+
+    def test_a_continued_worker_is_watched_and_reports_again(self):
+        self.cont()
+        self.env.end_session(self.dispatch)
+
+        [exited] = self.env.json("wait", "--timeout", "1.5", "--stall-after", "0.3")["messages"]
+
+        self.assertEqual((exited["type"], exited["dispatch"]), ("exited", self.dispatch))
+
+    def test_the_next_report_must_stay_in_the_dispatch_report_directory(self):
+        elsewhere = self.env.report.parent.parent / "elsewhere" / "r2.md"
+
+        result = self.cont(report=elsewhere)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(str(self.env.report.parent), result.stderr)
+        self.assertEqual(self.sends(), [])
+
+    def test_continuing_a_worker_whose_session_ended_fails_cleanly(self):
+        self.env.end_session(self.dispatch)
+
+        result = self.cont()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(self.sends(), [])
+
+
 class CodexRelay(unittest.TestCase):
     """relay pushes controller messages into a Codex controller session with codex queue."""
 

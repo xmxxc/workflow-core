@@ -45,8 +45,12 @@ def connect():
             dispatch TEXT PRIMARY KEY, screen TEXT, since REAL, reported_screen TEXT);
     """)
     # `started` is set once the worker's tmux session exists; the watchdog ignores rows without it.
-    if "started" not in [c["name"] for c in db.execute("PRAGMA table_info(dispatch)")]:
+    columns = [c["name"] for c in db.execute("PRAGMA table_info(dispatch)")]
+    if "started" not in columns:
         db.execute("ALTER TABLE dispatch ADD COLUMN started REAL")
+    # `report_dir` is the directory the worker was given write access to at launch.
+    if "report_dir" not in columns:
+        db.execute("ALTER TABLE dispatch ADD COLUMN report_dir TEXT")
     return db
 
 
@@ -54,9 +58,9 @@ def emit(obj):
     print(json.dumps(obj, ensure_ascii=False))
 
 
-def worker_brief(dispatch_id, task, report):
+def worker_brief(dispatch_id, task, report, opening="You are a worker dispatched by the controller"):
     router = f"{shlex.quote(sys.executable)} {shlex.quote(str(ROUTER))}"
-    return (f"You are a worker dispatched by the controller (dispatch {dispatch_id}). "
+    return (f"{opening} (dispatch {dispatch_id}). "
             f"Read and do the task in {shlex.quote(str(task))}. "
             f"When the task is finished, write your report and run: "
             f"{router} done --report {shlex.quote(str(report))}. "
@@ -105,8 +109,8 @@ def cmd_dispatch(args):
     command, extra_env = LAUNCHERS[args.host](worker_brief(dispatch_id, task, report),
                                               [state_dir(), report.parent], task.parent, cwd, args.model)
     env = {"WFC_DISPATCH": dispatch_id, "WFC_STATE": str(state_dir()), **extra_env}
-    db.execute("INSERT INTO dispatch (id, host, cwd, task, created) VALUES (?, ?, ?, ?, ?)",
-               (dispatch_id, args.host, str(cwd), str(task), time.time()))
+    db.execute("INSERT INTO dispatch (id, host, cwd, task, created, report_dir) VALUES (?, ?, ?, ?, ?, ?)",
+               (dispatch_id, args.host, str(cwd), str(task), time.time(), str(report.parent)))
     launched = subprocess.run(["tmux", "new-session", "-d", "-s", session_name(dispatch_id), "-c", str(cwd),
                                *[arg for k, v in env.items() for arg in ("-e", f"{k}={v}")],
                                *command])
@@ -173,6 +177,28 @@ def cmd_reply(args):
     emit({"replied": question["id"], "dispatch": question["dispatch"]})
 
 
+def cmd_continue(args):
+    """Give a worker its next task (a fix round, an incremental review) in the same session."""
+    db = connect()
+    row = db.execute("SELECT * FROM dispatch WHERE id = ? AND started IS NOT NULL", (args.dispatch,)).fetchone()
+    if row is None:
+        raise SystemExit(f"unknown dispatch {args.dispatch} in {state_dir()}")
+    task = Path(args.task).resolve()
+    report = Path(args.report).resolve()
+    if row["report_dir"] and str(report.parent) != row["report_dir"]:
+        raise SystemExit(f"the next report must be in {row['report_dir']}, the directory this worker "
+                         f"was given write access to at dispatch")
+    session = session_name(args.dispatch)
+    if subprocess.run(["tmux", "has-session", "-t", session], capture_output=True).returncode != 0:
+        raise SystemExit(f"tmux session {session} has ended; dispatch a new worker instead")
+    brief = worker_brief(args.dispatch, task, report, opening="[router] New task for you")
+    if not type_into(session, brief):
+        raise SystemExit(f"could not type the next task into tmux session {session}")
+    message_id = post(db, args.dispatch, "worker", "continue", {"task": str(task), "report": str(report)})
+    db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
+    emit({"continued": args.dispatch, "message": message_id})
+
+
 def take_controller_messages(db):
     db.execute("BEGIN IMMEDIATE")
     rows = db.execute("SELECT * FROM message WHERE recipient = 'controller' AND delivered = 0 ORDER BY id").fetchall()
@@ -187,10 +213,13 @@ def answered(db, question_id):
 
 
 def watched(db, dispatch_id):
-    """The watchdog watches a started dispatch until it reports done or is reported exited."""
+    """The watchdog watches a started dispatch until it is reported exited, or until it reports
+    done for its current task (a `continue` starts a new task)."""
     return db.execute(
-        "SELECT 1 FROM dispatch d WHERE d.id = ? AND d.started IS NOT NULL AND NOT EXISTS "
-        "(SELECT 1 FROM message m WHERE m.dispatch = d.id AND m.type IN ('done', 'exited'))",
+        "SELECT 1 FROM dispatch d WHERE d.id = ? AND d.started IS NOT NULL "
+        "AND NOT EXISTS (SELECT 1 FROM message m WHERE m.dispatch = d.id AND m.type = 'exited') "
+        "AND NOT EXISTS (SELECT 1 FROM message m WHERE m.dispatch = d.id AND m.type = 'done' AND m.id > "
+        "  COALESCE((SELECT MAX(c.id) FROM message c WHERE c.dispatch = d.id AND c.type = 'continue'), 0))",
         (dispatch_id,)).fetchone() is not None
 
 
@@ -303,6 +332,11 @@ def main(argv):
     p.add_argument("message", type=int)
     p.add_argument("answer")
     p.set_defaults(func=cmd_reply)
+    p = sub.add_parser("continue", help="give a worker its next task in the same session")
+    p.add_argument("dispatch")
+    p.add_argument("--task", required=True)
+    p.add_argument("--report", required=True, help="must be in the dispatch's report directory")
+    p.set_defaults(func=cmd_continue)
     p = sub.add_parser("wait")
     p.add_argument("--timeout", type=float, default=3600)
     p.add_argument("--stall-after", type=float, default=300,
