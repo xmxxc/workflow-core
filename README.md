@@ -8,7 +8,7 @@ Phase 1 is functional. `router.py` dispatches Codex, OpenCode and Claude Code wo
 
 Known limits:
 - `codex queue` also succeeds for a thread id that does not exist, so a relay started with the wrong UUID delivers nothing. Confirm that the first relayed message arrives.
-- `resume` finds a worker's conversation by its first brief: Codex rollouts under `$CODEX_HOME/sessions` (default `~/.codex`), OpenCode's `opencode.db` (`$WFC_OPENCODE_DB`, default under `$XDG_DATA_HOME`), and for Claude Code the `--session-id` the router gives it at dispatch. These are host internals that may change. Only the OpenCode path has been verified against a real host; Codex and Claude Code resume are covered by unit tests only. OpenCode ignores `--prompt` on a reopened session, so the router types the brief in once the screen settles.
+- `resume` finds a worker's conversation by its first brief: Codex rollouts under `$CODEX_HOME/sessions` (default `~/.codex`), OpenCode's `opencode.db` (`$WFC_OPENCODE_DB`, default under `$XDG_DATA_HOME`), and for Claude Code the `--session-id` the router gives it at dispatch. These are host internals that may change. All three have been verified against real hosts: an OpenCode worker after Ctrl-C, and a Codex and a Claude Code reviewer that had quit, each resumed with its earlier rounds in context. OpenCode ignores `--prompt` on a reopened session, so the router types the brief in once the screen settles.
 - A running Claude Code session rewrites `~/.claude.json` from memory and can drop a trust entry the router just wrote. If that happens, the worker stops on the trust prompt and is reported `stalled`.
 
 ## Layout and installation
