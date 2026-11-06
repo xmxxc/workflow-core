@@ -1,0 +1,247 @@
+From b56cb12f5f44211049a5d65a473e37855f56b318 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=98=9F=E5=B0=98?=
+ <73565648+xmxxc@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 04:12:47 -0600
+Subject: [PATCH 1/2] ai-coding: add router dispatch mode
+
+The controller runs in Claude Code, dispatches workers to Codex,
+OpenCode or Claude Code tmux sessions through the workflow-core router,
+and sleeps on a background `router.py wait` until a done, question,
+stalled or exited message wakes it. Each task gets its own report
+directory; dispatch success records pending-handoff, worker activity
+records accepted. The other three modes, shared references and aliases
+are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ AGENTS.md                                     |  2 +-
+ README.md                                     |  2 +-
+ docs/ai-coding-router-dispatch-20261105.md    | 45 +++++++++++
+ docs/skill-selection.md                       |  2 +-
+ docs/workflow-principles.md                   |  2 +
+ skills/engineering/ai-coding/SKILL.md         |  3 +-
+ .../engineering/ai-coding/agents/openai.yaml  |  4 +-
+ .../engineering/ai-coding/dispatch/router.md  | 75 +++++++++++++++++++
+ 8 files changed, 129 insertions(+), 6 deletions(-)
+ create mode 100644 docs/ai-coding-router-dispatch-20261105.md
+ create mode 100644 skills/engineering/ai-coding/dispatch/router.md
+
+diff --git a/AGENTS.md b/AGENTS.md
+index df6bc77..38bcded 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -12,6 +12,6 @@ This is the active workflow repository in the workspace. Maintain workflow sourc
+ - Read [the Addy integration record](docs/addy-integration.md) for its source pin, portable resources and specialist boundaries.
+ - Preserve upstream bytes for files without an identified required adaptation. Retain each license and pinned source hashes in `UPSTREAM.json` or the source-specific `*-UPSTREAM.json` manifest named by its integration document.
+ - Keep `SKILL.md` invocation flags and `agents/openai.yaml` policy consistent. Initialization, whole-codebase surveys, `implement-spec`, `retro`, `ai-coding`, its aliases `issue-controller`, `full-ai-coding`, `full-codex-coding`, and `live-verify` remain explicit entries.
+-- Maintain the local coordination skills against [their initial design](docs/issue-controller-live-verify-design-20261024.md) and [the generic controller and review decisions](docs/generic-controller-review-design-20261024.md); [the older two modes](docs/controller-codex-coding-design-20261024.md) retain their historical scope; [the 2026-10-27 unification](docs/ai-coding-unification-20261027.md) records the current single `ai-coding` entry with three dispatch modes. Preserve existing unit skills; collaboration artifacts belong under the initialized project's `docs/agents/work/`, with one dispatcher per scope and human handoff to live acceptance.
++- Maintain the local coordination skills against [their initial design](docs/issue-controller-live-verify-design-20261024.md) and [the generic controller and review decisions](docs/generic-controller-review-design-20261024.md); [the older two modes](docs/controller-codex-coding-design-20261024.md) retain their historical scope; [the 2026-10-27 unification](docs/ai-coding-unification-20261027.md) records the current single `ai-coding` entry with three dispatch modes, and [the 2026-11-05 router mode](docs/ai-coding-router-dispatch-20261105.md) adds a fourth, backed by the external workflow-core router. Preserve existing unit skills; collaboration artifacts belong under the initialized project's `docs/agents/work/`, with one dispatcher per scope and human handoff to live acceptance.
+ - Run `python scripts/validate_skill.py`, `python scripts/validate_base.py --upstream <pinned-matt-checkout> --ponytail-upstream <pinned-ponytail-checkout> --echo-upstream ../no-negative-echo --playwright-upstream <playwright-cli-checkout> --addy-upstream <pinned-addy-checkout> --firecrawl-upstream <pinned-firecrawl-catalog>`, `python scripts/check_review_scope.py` and `python scripts/check_upstream_validation.py` after relevant changes. Record actual execution separately from document simulations in the relevant validation document.
+ - Review changes before committing task-owned files locally. Push and publication require separate authorization.
+diff --git a/README.md b/README.md
+index ee20335..19c3576 100644
+--- a/README.md
++++ b/README.md
+@@ -14,7 +14,7 @@
+ 
+ 2026-10-25 源码将 `codex-coding` 更名为 `full-ai-coding`，三个本地入口按宿主能力通用化，并采用修复中增量、放行前完整 PR 审查，见[适配记录](docs/generic-controller-adaptation-20261025.md)。已按用户授权同步至 Skills Manager，Codex 为 39 项、134 个技能文件，其他八个宿主各 38 项、129 个文件；旧入口已替换，既有宿主选择保持不变。双库历史已汇合，部署与本轮推送凭据见[部署记录](docs/deployment-20261025.md)。
+ 
+-2026-10-27 三个开发总控合并为 `ai-coding`，人工转交、宿主独立任务和 Codex 独立线程成为同一入口的三种派发模式，账本统一为 `docs/agents/work/ai-coding/<范围>/`；三个旧名保留为指向对应模式的别名，源码为 41 项，见[合并记录](docs/ai-coding-unification-20261027.md)。
++2026-10-27 三个开发总控合并为 `ai-coding`，人工转交、宿主独立任务和 Codex 独立线程成为同一入口的三种派发模式，账本统一为 `docs/agents/work/ai-coding/<范围>/`；三个旧名保留为指向对应模式的别名，源码为 41 项，见[合并记录](docs/ai-coding-unification-20261027.md)。2026-11-05 新增第四种派发模式 router 派发：总控在 Claude Code 中运行，由仓库外的 workflow-core router 派发 worker，并在 worker 发消息时被唤醒。源码数不变，见[router 模式记录](docs/ai-coding-router-dispatch-20261105.md)。
+ 
+ 2026-10-18 核对本机 Codex 已安装的 36 个对应技能目录，115 个文件与本仓库逐字节一致；该结果只覆盖这次文件核对，不证明其他宿主的部署或自动调用效果。本仓库没有启动钩子，也不会因被下载而自动接管其他项目。
+ 
+diff --git a/docs/ai-coding-router-dispatch-20261105.md b/docs/ai-coding-router-dispatch-20261105.md
+new file mode 100644
+index 0000000..62b0087
+--- /dev/null
++++ b/docs/ai-coding-router-dispatch-20261105.md
+@@ -0,0 +1,45 @@
++# ai-coding 新增 router 派发模式（2026-11-05）
++
++起点为 `9d38b84`。`ai-coding` 新增第四种派发模式 `dispatch/router.md`。总控在 Claude Code 中运行，用 workflow-core 的 `router.py` 把实施者和审查者派到各宿主的 tmux 会话中，然后后台等待它们的消息唤醒。原有三种模式、共用 reference 和三个旧名别名都不变。
++
++## 原因
++
++- 用户要求补齐工作流的最后一块：总控能够睡眠，worker 或审查者在独立窗口中运行完毕后唤醒总控。原有的宿主独立任务模式需要总控一直保持唤醒来等待回收。
++- 2026-11-05 在 `/path/to/workflow-core` 实测了 Claude Code、Codex、OpenCode 和 Orca（记录见该仓库 `docs/probes-20261105-*.md`）：
++  - 三家宿主的完成钩子都会把"worker 停下来问人"当成"完成"，所以不能靠钩子判断完工；
++  - Orca 的编排可用，但 worker 失败时不会通知总控，而且依赖桌面应用。
++- 用户因此选择自研一个轻量 router：worker 主动用 `done` 报告完工、用 `ask` 提问；总控用后台 `wait` 等待；看门狗把会话消失报为 `exited`，把画面长时间不变报为 `stalled`。router 在 `/path/to/workflow-core` 的 `router` 分支，提交 `15de395`、`c9bce1f`、`186d1b9`。
++- 用户确认的模型与宿主绑定：GPT 用 Codex，Claude 用 Claude Code，其他模型用 OpenCode。三家都用各自的官方 CLI 和登录方式，router 支持全部三种 worker。
++
++## 决定
++
++1. 新增 `dispatch/router.md`。每个任务的回报放在独立子目录 `reports/<任务名>/`，这样 worker 只能写自己的回报。派发成功只记 `pending-handoff`，看到 worker 已进入任务或收到它的消息才记 `accepted`。文件写明以下内容：
++   - 前提：router 路径、每个范围一个状态目录、总控与 worker 使用同一个 tmux 服务、worker 工作目录已被宿主信任；
++   - 派发命令，以及 `accepted` 和 `returned` 各自对应的 router 证据；
++   - 后台 `wait` 与唤醒的节奏；
++   - `done`、`question`、`stalled`、`exited` 四类消息分别怎么处理；
++   - worker 授权与恢复。
++2. `SKILL.md` 的派发模式列表和 description 加入 router 派发，`agents/openai.yaml` 同步修改说明文字。调用策略不变，仍然只能手动调用。
++3. 独立性继续沿用 `references/review.md` 的定义。实施和审查分别派发，dispatch id 不同即为不同会话，以此作为独立性证据。
++
++## 限制与待办
++
++- **Codex 联网**：Codex worker 在 `workspace-write` 沙箱下默认不能联网，推送和建 PR 可能被拦截。router 实测只覆盖了本地写回报，没有覆盖推送。模式文件要求先确认 Codex 能否联网，或者改派其他宿主。
++- **新目录信任**：新 worktree 路径会停在 Codex 或 Claude 的信任提示上。看门狗会把它报为 `stalled`，但仍需要人工确认。预先信任新目录尚未实现。
++- **提醒 worker**：提醒停住的 worker 时，目前由总控直接用 `tmux send-keys` 打字，router 还没有对应命令。
++- **审查者能读取 router 状态**：每个 worker 只能写自己的回报子目录，但同一范围的 router 状态库对所有 worker 可读，其中包括实施者的提问内容。把它当作已知的独立性限制；需要更严格隔离时，审查改用其他派发模式。
++- **恢复时可能漏消息**：`wait` 先标记已送达、再输出。恢复时要先读上一次 `wait` 的输出，再对照 `router.db` 和 `wfc-*` 会话，模式文件已写明这一步。
++- **未在真实项目中运行**：`ai-coding` 以本模式完整推进一张真实票据的回放尚未执行。router 本身已经用真实 worker 跑通了派发、提问、回答、完工，以及 `stalled` 和 `exited` 两种情况。
++
++## 验证
++
++以下检查实际执行并通过：
++
++- `validate_skill.py`：42/42 通过；
++- 不带上游参数的 `validate_base.py`：退出码 0，`errors` 为空；
++- `check_review_scope.py`；
++- `git diff --check`。
++
++`check_upstream_validation.py` 以退出码 1 结束，因为本机没有固定的 Firecrawl 检出（`/path/to/firecrawl-skills`）。本次没有改动任何上游来源文件，2026-10-27 的合并记录也因同样原因没有运行它。
++
++`ai-coding` 以本模式进行的行为回放没有执行，见上文"限制与待办"。
+diff --git a/docs/skill-selection.md b/docs/skill-selection.md
+index 91ff264..bf11a02 100644
+--- a/docs/skill-selection.md
++++ b/docs/skill-selection.md
+@@ -23,7 +23,7 @@
+ | `full-ai-coding` | 用户需要直接派发独立实施与审查、回收和修复，减少人工实施转交；由原 `codex-coding` 通用化更名 | 手动启动，按固定票据清单及宿主持续能力推进至最终 PR 完整独立通过；正式合并/真实验收保留原长线，通信缺能力明确阻塞 |
+ | `full-codex-coding` | 用户需要 Codex 原生独立任务的严格任务 ID、回读和续接边界 | 仅在宿主提供合格 Codex 独立任务接口时启动；缺少接口时保留现场并报告能力阻塞 |
+ 
+-2026-10-27 上表三个开发总控合并为 `ai-coding`，各自成为 `dispatch/` 下的派发模式，三个旧名保留为别名，见[合并记录](ai-coding-unification-20261027.md)；上表保留各自的纳入原因。三种开发总控的原始角色、Goal 和默认开发发布委托见[历史确认方案](controller-codex-coding-design-20261024.md)；现行宿主能力与审查边界见[2026-10-25 适配](generic-controller-adaptation-20261025.md)。不改变 Matt 单元的自动路由，也不将新入口算成额外上游来源。
++2026-10-27 上表三个开发总控合并为 `ai-coding`，各自成为 `dispatch/` 下的派发模式，三个旧名保留为别名，见[合并记录](ai-coding-unification-20261027.md)；上表保留各自的纳入原因。三种开发总控的原始角色、Goal 和默认开发发布委托见[历史确认方案](controller-codex-coding-design-20261024.md)；现行宿主能力与审查边界见[2026-10-25 适配](generic-controller-adaptation-20261025.md)；2026-11-05 新增的第四种 router 派发见[router 模式记录](ai-coding-router-dispatch-20261105.md)。不改变 Matt 单元的自动路由，也不将新入口算成额外上游来源。
+ 
+ 下表六源清单与后续来源比较继续对应原固定提交，本轮不更新 pin 或新增来源仓库。
+ 
+diff --git a/docs/workflow-principles.md b/docs/workflow-principles.md
+index e6ee002..2960ae7 100644
+--- a/docs/workflow-principles.md
++++ b/docs/workflow-principles.md
+@@ -48,6 +48,8 @@ Playwright 保持用户逐次明确选择的单一手动工具入口，不参与
+ 
+ 2026-10-27 按用户确认将三个开发总控合并为手动入口 `ai-coding`，三种派发方式成为同一入口的模式，共用规则只保留一处，三个旧名保留为指向对应模式的别名；源码为 41 项。`live-verify` 和其他单元保持原字节，见[合并记录](ai-coding-unification-20261027.md)。
+ 
++2026-11-05 按用户确认，为 `ai-coding` 新增第四种派发模式 router 派发。它依赖仓库外的 workflow-core router：总控在后台等待，由 worker 的完工或提问消息唤醒，看门狗报告退出或停住的 worker。原三种模式、共用规则和别名不变，`live-verify` 及其他单元保持原字节，见[router 模式记录](ai-coding-router-dispatch-20261105.md)。
++
+ Firecrawl 是根据 CLI 能力本地编写的工具入口，属于已有实现中的明确例外，不计作上游技能原文导入。其来源快照、选用命令及排除范围见[融合说明](firecrawl-cli-integration.md)。2026-10-21 任务再次确认单一手动入口、保留当前公开网页取材范围及本地编写身份；维护继续以这些明确目标为准。已恢复的来源原文、Git 映射和按需参考见[2026-10-21 六源同步、适配复核与验证](upstream-sync-20261021.md)。
+ 
+ ## 决定、事实与分析分开记录
+diff --git a/skills/engineering/ai-coding/SKILL.md b/skills/engineering/ai-coding/SKILL.md
+index 8f142e0..a0fd3ac 100644
+--- a/skills/engineering/ai-coding/SKILL.md
++++ b/skills/engineering/ai-coding/SKILL.md
+@@ -1,6 +1,6 @@
+ ---
+ name: ai-coding
+-description: "多票据开发总控：固定范围与候选，按人工转交、宿主独立任务或 Codex 独立线程派发实施与独立审查，维护 Issue/PR 留痕直到放行和收尾。"
++description: "多票据开发总控：固定范围与候选，按人工转交、宿主独立任务、Codex 独立线程或 router 派发实施与独立审查，维护 Issue/PR 留痕直到放行和收尾。"
+ disable-model-invocation: true
+ ---
+ 
+@@ -17,6 +17,7 @@ disable-model-invocation: true
+ - 人工转交：你写任务文件，用户转交执行者并带回结果。读取 [人工转交](dispatch/manual.md)。
+ - 宿主独立任务：你用当前宿主的独立会话或任务接口直接派发和回收。读取 [宿主独立任务](dispatch/host.md)。
+ - Codex 独立线程：你在 Codex 中为每个 worker 和审查者新建可单独回读的线程。读取 [Codex 独立线程](dispatch/codex.md)。
++- router 派发：总控在 Claude Code 中运行，用 workflow-core 的 router 把 worker 派到各宿主的 tmux 会话中，后台等待它们的消息唤醒。读取 [router 派发](dispatch/router.md)。
+ 
+ 换模式时接续同一账本，同票同阶段不重复派发。
+ 
+diff --git a/skills/engineering/ai-coding/agents/openai.yaml b/skills/engineering/ai-coding/agents/openai.yaml
+index 92c103a..3ae0287 100644
+--- a/skills/engineering/ai-coding/agents/openai.yaml
++++ b/skills/engineering/ai-coding/agents/openai.yaml
+@@ -1,6 +1,6 @@
+ interface:
+   display_name: "AI 开发总控"
+-  short_description: "多票据开发总控：人工、宿主或 Codex 线程派发，留痕到放行收尾"
+-  default_prompt: "使用 $ai-coding 接管指定 Issue/PR 范围，说明派发模式（人工转交、宿主独立任务或 Codex 独立线程），推进到最终 PR 完整独立审查通过并交付放行。"
++  short_description: "多票据开发总控：人工、宿主、Codex 线程或 router 派发，留痕到放行收尾"
++  default_prompt: "使用 $ai-coding 接管指定 Issue/PR 范围，说明派发模式（人工转交、宿主独立任务、Codex 独立线程，或总控在 Claude Code 中的 router 派发），推进到最终 PR 完整独立审查通过并交付放行。"
+ policy:
+   allow_implicit_invocation: false
+diff --git a/skills/engineering/ai-coding/dispatch/router.md b/skills/engineering/ai-coding/dispatch/router.md
+new file mode 100644
+index 0000000..1006544
+--- /dev/null
++++ b/skills/engineering/ai-coding/dispatch/router.md
+@@ -0,0 +1,75 @@
++# router 派发
++
++你用 workflow-core 的 `router.py` 把 worker 和审查者派发到各自宿主的 tmux 会话中，然后睡眠：后台挂 `wait`，由 worker 的消息唤醒你。本模式要求总控运行在 Claude Code 中；worker 可以是 Codex、OpenCode 或 Claude Code。
++
++## 前提
++
++- **router 位置**：先用用户本次给出的 `router.py` 路径；没有就用账本已记录的路径；两处都没有时，问用户一次。
++- **状态目录**：每个范围用一个独立的 `WFC_STATE`，例如 `~/.local/state/workflow-core/<仓库>-<范围>`。对该范围执行的每条 router 命令都要带上它；路径写入 `state.md`。
++- **同一 tmux 服务**：每个 worker 运行在名为 `wfc-<dispatch id>` 的 tmux 会话中。总控、worker 和用户执行 `tmux attach` 时，都要连接同一个 tmux 服务（同一个用户，同一个 `TMUX_TMPDIR`）。看门狗找不到会话时，会把它报为 `exited`。
++- **信任**：worker 的工作目录需要先被它的宿主信任。新路径（例如新建的 worktree）会停在信任提示上，看门狗随后把它报为 `stalled`。
++
++## 派发
++
++每个任务执行一次：
++
++```sh
++WFC_STATE=<状态目录> python3 <router.py> dispatch --host <codex|opencode|claude> [--model <模型>] \
++  --task <prompts/ 中任务文件的绝对路径> --cwd <工作树> --report <reports/<任务名>/ 下的回报绝对路径>
++```
++
++- 宿主和模型按用户的角色分配来选。派给 OpenCode 时必须带 `--model`，因为它的默认模型可能是受限的免费模型。
++- **回报**：每个任务的回报放在自己专属的子目录里，例如 `reports/113-impl-r1/report.md`，任务文件里"回报"一行写同一个路径。router 会建好这个目录，并且只把这个目录开放给该 worker 写入，其他任务的回报它写不了。
++- worker 在无人值守下运行，权限由各自宿主限制：
++  - Codex：`workspace-write` 沙箱，不请求审批；
++  - OpenCode：只放行状态目录和自己的回报目录；
++  - Claude Code：`auto` 模式。
++
++  worker 用 `done` 报告完工，用 `ask` 提问。这两条命令的用法由 router 写进 worker 的说明，任务文件不用重复。
++- **Codex 沙箱默认不能联网**。任务需要推送分支、创建 PR 或发评论时，先确认 Codex 当前配置能联网；不能联网就改派 Claude Code 或 OpenCode，或者由你按授权代为发布。
++
++每个派发返回一个 dispatch id，把它记为该任务的标识。各状态需要的 router 证据如下：
++
++| 状态 | router 证据 |
++| --- | --- |
++| `pending-handoff` | `dispatch` 返回了 dispatch id：会话已建立，但还没有证据表明 worker 已收到任务 |
++| `accepted` | 收到该 dispatch 的任一条消息，或者 `tmux capture-pane -p -t wfc-<id>` 显示 worker 已开始处理任务 |
++| `returned` | 收到该 dispatch 的 `done`，并按[账本](../references/ledger.md)完成 `returned` 的回读核对 |
++
++**独立性**：实施和审查分别派发。不同的 dispatch id 对应不同的宿主会话和新的上下文；每个任务只能写自己的回报目录。审查者的 `--cwd` 用固定快照或独立工作树，见[独立审查](../references/review.md)。把双方的 dispatch id 记为独立性证据。
++
++## 等待与唤醒
++
++派发后，在后台挂上等待：
++
++```sh
++WFC_STATE=<状态目录> python3 <router.py> wait --timeout <秒> [--stall-after <秒>]
++```
++
++挂好后结束当前回复，等待被唤醒。`wait` 一返回你就会醒来：先处理输出里的全部消息并写入账本，再挂下一次 `wait`，然后结束当前回复。同一时刻只保留一个 `wait`。用户在窗口里发言也会唤醒你；回应完用户后，确认后台的 `wait` 还在运行。
++
++`wait` 返回退出码 3 表示超时，期间没有收到任何消息。这时回读各任务的现场：回报、分支，以及 `tmux capture-pane -p -t wfc-<id>` 的画面。有进展就重新挂 `wait`；没有进展的任务记为 `blocked`。
++
++## 消息处理
++
++| 消息 | 处理 |
++| --- | --- |
++| `done` | 按"派发"一节的 `returned` 证据完成核对。缺留痕时，按[账本](../references/ledger.md)补发转录，或者交回 worker 补发 |
++| `question`（worker 用 `ask` 发出） | 已固定的范围、验收条件和授权能回答的，直接执行 `router.py reply <消息 id> "<答案>"`。需要用户决定的，把原问题和选项原样转给用户，拿到答复后再 `reply`。问题和答案都记入账本 |
++| `stalled` | 读附带的画面。<br>停在信任或权限提示上：请用户执行 `tmux attach -t wfc-<id>` 处理，该任务记为 `blocked`。<br>停下了却没报告也没提问：回读现场，然后用 `tmux send-keys -t wfc-<id> -l "<提醒>"` 打一行提醒，隔半秒再发 `Enter`，提醒它按说明用 `done` 或 `ask`。这次介入要记入账本。提醒后再次报为 `stalled` 的，记为 `blocked` |
++| `exited` | 先检查 worker 退出前是否已经提交或推送，然后按[账本](../references/ledger.md)的失效规则处理：记为 `stale`，保留现场，用下一轮编号改派，在新任务文件里写明真实起点，以及旧现场是续用还是放弃 |
++
++每条消息都带 dispatch id，对照账本找到它所属的票和任务。记为 `blocked` 的任务，在 `state.md` 写明在等谁、要做什么、结果交回哪里。
++
++## worker 的授权
++
++用户以本模式调用并指定仓库和范围，即授权 worker 提交自有任务分支、推送、创建或更新 PR，以及发必要的 Issue/PR 评论。生产操作、正式合并和其他仓库的操作，仍按已有授权处理。
++
++## 恢复
++
++`wait` 取走消息时会先把它标为已送达，再输出。所以换会话、上下文压缩或意外中断之后，单靠重新执行 `wait`，拿不回已经取走却还没处理的消息。恢复按以下顺序进行：
++
++1. 按[账本](../references/ledger.md)回读 `state.md`。
++2. 读上一次后台 `wait` 的输出（宿主的后台任务输出文件）。
++3. 把账本与 `<状态目录>/router.db` 的 `message` 表、`tmux ls` 列出的 `wfc-*` 会话逐一对照。尤其要找出那些已经提问、但账本里还没有答复的任务，按 `question` 处理。
++4. 对账完成后，再挂 `wait`。
+-- 
+2.43.0
+

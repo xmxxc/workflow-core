@@ -1,0 +1,177 @@
+From 630a83fa1bca56230c4f340f8c2ec9a78240dc60 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=98=9F=E5=B0=98?=
+ <73565648+xmxxc@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 10:14:57 -0600
+Subject: [PATCH 2/2] ai-coding router mode: Codex controller and first
+ live-run lessons
+
+Add the Codex controller (danger-full-access session woken by router
+relay; never run wait and relay together; recovery against router.db
+and relay.log), open all external paths for OpenCode workers, have the
+user trust a repo once at its root for Codex, and have the controller
+prepare verification logs and requirement text for an offline Codex
+reviewer. File isolation is no longer claimed as independence evidence.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/ai-coding-router-dispatch-20261105.md    | 27 +++++++++++++--
+ skills/engineering/ai-coding/SKILL.md         |  2 +-
+ .../engineering/ai-coding/agents/openai.yaml  |  2 +-
+ .../engineering/ai-coding/dispatch/router.md  | 34 ++++++++++++++++---
+ 4 files changed, 55 insertions(+), 10 deletions(-)
+
+diff --git a/docs/ai-coding-router-dispatch-20261105.md b/docs/ai-coding-router-dispatch-20261105.md
+index 62b0087..622928f 100644
+--- a/docs/ai-coding-router-dispatch-20261105.md
++++ b/docs/ai-coding-router-dispatch-20261105.md
+@@ -1,6 +1,6 @@
+ # ai-coding 新增 router 派发模式（2026-11-05）
+ 
+-起点为 `9d38b84`。`ai-coding` 新增第四种派发模式 `dispatch/router.md`。总控在 Claude Code 中运行，用 workflow-core 的 `router.py` 把实施者和审查者派到各宿主的 tmux 会话中，然后后台等待它们的消息唤醒。原有三种模式、共用 reference 和三个旧名别名都不变。
++起点为 `9d38b84`。`ai-coding` 新增第四种派发模式 `dispatch/router.md`。总控在 Claude Code 或 Codex 中运行，用 workflow-core 的 `router.py` 把实施者和审查者派到各宿主的 tmux 会话中，然后后台等待它们的消息唤醒。原有三种模式、共用 reference 和三个旧名别名都不变。
+ 
+ ## 原因
+ 
+@@ -20,17 +20,38 @@
+    - `done`、`question`、`stalled`、`exited` 四类消息分别怎么处理；
+    - worker 授权与恢复。
+ 2. `SKILL.md` 的派发模式列表和 description 加入 router 派发，`agents/openai.yaml` 同步修改说明文字。调用策略不变，仍然只能手动调用。
+-3. 独立性继续沿用 `references/review.md` 的定义。实施和审查分别派发，dispatch id 不同即为不同会话，以此作为独立性证据。
++3. 独立性继续沿用 `references/review.md` 的定义。实施和审查分别派发，dispatch id 不同即为不同会话，以此作为独立性证据；文件隔离不作为证据。
++4. 首次真实运行后补充两项（依据见下文"补充"）：OpenCode worker 的外部路径一律放行；新增"Codex 总控"，由 relay 唤醒。
+ 
+ ## 限制与待办
+ 
+ - **Codex 联网**：Codex worker 在 `workspace-write` 沙箱下默认不能联网，推送和建 PR 可能被拦截。router 实测只覆盖了本地写回报，没有覆盖推送。模式文件要求先确认 Codex 能否联网，或者改派其他宿主。
+-- **新目录信任**：新 worktree 路径会停在 Codex 或 Claude 的信任提示上。看门狗会把它报为 `stalled`，但仍需要人工确认。预先信任新目录尚未实现。
++- **新目录信任**：Codex 的信任作用到仓库根，用户确认一次就覆盖该仓库的所有 worktree。Claude Code 对新路径是否同样处理，还没有在 worktree 上验证。
+ - **提醒 worker**：提醒停住的 worker 时，目前由总控直接用 `tmux send-keys` 打字，router 还没有对应命令。
+ - **审查者能读取 router 状态**：每个 worker 只能写自己的回报子目录，但同一范围的 router 状态库对所有 worker 可读，其中包括实施者的提问内容。把它当作已知的独立性限制；需要更严格隔离时，审查改用其他派发模式。
+ - **恢复时可能漏消息**：`wait` 先标记已送达、再输出。恢复时要先读上一次 `wait` 的输出，再对照 `router.db` 和 `wfc-*` 会话，模式文件已写明这一步。
+ - **未在真实项目中运行**：`ai-coding` 以本模式完整推进一张真实票据的回放尚未执行。router 本身已经用真实 worker 跑通了派发、提问、回答、完工，以及 `stalled` 和 `exited` 两种情况。
+ 
++## 补充：首次真实运行之后（2026-11-05）
++
++在 xmxxc/example-project #2 上用本模式实际推进（Claude Code 总控，OpenCode 实施，Codex 审查）。
++
++观察到的事实：
++
++- OpenCode 访问任务文件、工作区根、`~/.config/git`、`/etc`、`/tmp/opencode` 时，都停在外部目录确认提示上，看门狗把每一次都报成了 `stalled`。
++- 一次实测里，OpenCode 对某个目录有一条禁止编辑的规则，但 worker 用 shell 命令仍然在该目录写入了文件。所以它的路径规则只作用于工具层面，并不是沙箱。
++- Codex 的信任提示写明：在 git 子目录或 worktree 中确认的信任，作用到仓库根。
++- 总控尝试替用户确认信任，被 Claude Code 的权限系统以"削弱安全设置"为由拒绝。
++- Codex 审查者在 `workspace-write` 沙箱下不能联网，因此装不了依赖，也发不了 PR 评论。
++- relay 用真实 Codex 会话验证通过：OpenCode worker 的 `done` 经 `codex queue --resume` 投递后，Codex 开始了新的一轮。
++
++据此做出的决定：
++
++- 用户决定：OpenCode worker 的外部路径一律放行，router 已按此修改。
++- 信任由用户在仓库根确认一次，总控不代为确认。
++- Codex 审查者断网时，由总控在固定快照上执行全量检查并保存日志，同时提供需求原文；审查结论标为待发布，由总控转录到 PR。
++- 用户决定：Codex 总控会话以 `danger-full-access` 启动，用 relay 唤醒；`wait` 和 relay 不能同时运行。
++
+ ## 验证
+ 
+ 以下检查实际执行并通过：
+diff --git a/skills/engineering/ai-coding/SKILL.md b/skills/engineering/ai-coding/SKILL.md
+index a0fd3ac..8ca66ed 100644
+--- a/skills/engineering/ai-coding/SKILL.md
++++ b/skills/engineering/ai-coding/SKILL.md
+@@ -17,7 +17,7 @@ disable-model-invocation: true
+ - 人工转交：你写任务文件，用户转交执行者并带回结果。读取 [人工转交](dispatch/manual.md)。
+ - 宿主独立任务：你用当前宿主的独立会话或任务接口直接派发和回收。读取 [宿主独立任务](dispatch/host.md)。
+ - Codex 独立线程：你在 Codex 中为每个 worker 和审查者新建可单独回读的线程。读取 [Codex 独立线程](dispatch/codex.md)。
+-- router 派发：总控在 Claude Code 中运行，用 workflow-core 的 router 把 worker 派到各宿主的 tmux 会话中，后台等待它们的消息唤醒。读取 [router 派发](dispatch/router.md)。
++- router 派发：总控在 Claude Code 或 Codex 中运行，用 workflow-core 的 router 把 worker 派到各宿主的 tmux 会话中，然后睡眠，由 worker 的消息唤醒。读取 [router 派发](dispatch/router.md)。
+ 
+ 换模式时接续同一账本，同票同阶段不重复派发。
+ 
+diff --git a/skills/engineering/ai-coding/agents/openai.yaml b/skills/engineering/ai-coding/agents/openai.yaml
+index 3ae0287..debbda0 100644
+--- a/skills/engineering/ai-coding/agents/openai.yaml
++++ b/skills/engineering/ai-coding/agents/openai.yaml
+@@ -1,6 +1,6 @@
+ interface:
+   display_name: "AI 开发总控"
+   short_description: "多票据开发总控：人工、宿主、Codex 线程或 router 派发，留痕到放行收尾"
+-  default_prompt: "使用 $ai-coding 接管指定 Issue/PR 范围，说明派发模式（人工转交、宿主独立任务、Codex 独立线程，或总控在 Claude Code 中的 router 派发），推进到最终 PR 完整独立审查通过并交付放行。"
++  default_prompt: "使用 $ai-coding 接管指定 Issue/PR 范围，说明派发模式（人工转交、宿主独立任务、Codex 独立线程或 router 派发），推进到最终 PR 完整独立审查通过并交付放行。"
+ policy:
+   allow_implicit_invocation: false
+diff --git a/skills/engineering/ai-coding/dispatch/router.md b/skills/engineering/ai-coding/dispatch/router.md
+index 1006544..19023e3 100644
+--- a/skills/engineering/ai-coding/dispatch/router.md
++++ b/skills/engineering/ai-coding/dispatch/router.md
+@@ -1,13 +1,13 @@
+ # router 派发
+ 
+-你用 workflow-core 的 `router.py` 把 worker 和审查者派发到各自宿主的 tmux 会话中，然后睡眠：后台挂 `wait`，由 worker 的消息唤醒你。本模式要求总控运行在 Claude Code 中；worker 可以是 Codex、OpenCode 或 Claude Code。
++你用 workflow-core 的 `router.py` 把 worker 和审查者派发到各自宿主的 tmux 会话中，然后睡眠，由 worker 的消息唤醒你。总控在 Claude Code 中时，在后台挂 `wait`；在 Codex 中时，见文末的 [Codex 总控](#codex-总控)。worker 可以是 Codex、OpenCode 或 Claude Code。
+ 
+ ## 前提
+ 
+ - **router 位置**：先用用户本次给出的 `router.py` 路径；没有就用账本已记录的路径；两处都没有时，问用户一次。
+ - **状态目录**：每个范围用一个独立的 `WFC_STATE`，例如 `~/.local/state/workflow-core/<仓库>-<范围>`。对该范围执行的每条 router 命令都要带上它；路径写入 `state.md`。
+ - **同一 tmux 服务**：每个 worker 运行在名为 `wfc-<dispatch id>` 的 tmux 会话中。总控、worker 和用户执行 `tmux attach` 时，都要连接同一个 tmux 服务（同一个用户，同一个 `TMUX_TMPDIR`）。看门狗找不到会话时，会把它报为 `exited`。
+-- **信任**：worker 的工作目录需要先被它的宿主信任。新路径（例如新建的 worktree）会停在信任提示上，看门狗随后把它报为 `stalled`。
++- **信任**：worker 的工作目录需要先被它的宿主信任，否则会停在信任提示上，随后被看门狗报为 `stalled`。Codex 的信任作用到 git 仓库根：接管时请用户在仓库根运行一次 `codex` 并选择信任，之后这个仓库的所有 worktree 都不会再问。信任由用户亲自确认。
+ 
+ ## 派发
+ 
+@@ -19,14 +19,19 @@ WFC_STATE=<状态目录> python3 <router.py> dispatch --host <codex|opencode|cla
+ ```
+ 
+ - 宿主和模型按用户的角色分配来选。派给 OpenCode 时必须带 `--model`，因为它的默认模型可能是受限的免费模型。
+-- **回报**：每个任务的回报放在自己专属的子目录里，例如 `reports/113-impl-r1/report.md`，任务文件里"回报"一行写同一个路径。router 会建好这个目录，并且只把这个目录开放给该 worker 写入，其他任务的回报它写不了。
++- **回报**：每个任务的回报放在自己专属的子目录里，例如 `reports/113-impl-r1/report.md`，任务文件里"回报"一行写同一个路径。router 会建好这个目录并开放给该 worker 写入。
+ - worker 在无人值守下运行，权限由各自宿主限制：
+   - Codex：`workspace-write` 沙箱，不请求审批；
+-  - OpenCode：只放行状态目录和自己的回报目录；
++  - OpenCode：工作目录以外的路径一律放行，没有目录限制。它的路径规则只作用于工具，挡不住 shell 写入。
+   - Claude Code：`auto` 模式。
+ 
+   worker 用 `done` 报告完工，用 `ask` 提问。这两条命令的用法由 router 写进 worker 的说明，任务文件不用重复。
+ - **Codex 沙箱默认不能联网**。任务需要推送分支、创建 PR 或发评论时，先确认 Codex 当前配置能联网；不能联网就改派 Claude Code 或 OpenCode，或者由你按授权代为发布。
++- **给断网的审查者准备材料**：审查者是 Codex 时，派发前先做两件事：
++  - 在固定快照上执行项目的全量检查（安装、类型、lint、格式、测试），日志保存到它的回报目录，记录每条命令真实的退出码；
++  - 把需求来源（Issue / spec 正文）写进同一目录。
++
++  审查任务文件指向这两份材料，审查结论写进报告并标为"待发布"，由你注明原作者后转录到 PR。这也就是[验证分层](../references/verification.md)里由一个明确步骤负责的共用验证。
+ 
+ 每个派发返回一个 dispatch id，把它记为该任务的标识。各状态需要的 router 证据如下：
+ 
+@@ -36,7 +41,7 @@ WFC_STATE=<状态目录> python3 <router.py> dispatch --host <codex|opencode|cla
+ | `accepted` | 收到该 dispatch 的任一条消息，或者 `tmux capture-pane -p -t wfc-<id>` 显示 worker 已开始处理任务 |
+ | `returned` | 收到该 dispatch 的 `done`，并按[账本](../references/ledger.md)完成 `returned` 的回读核对 |
+ 
+-**独立性**：实施和审查分别派发。不同的 dispatch id 对应不同的宿主会话和新的上下文；每个任务只能写自己的回报目录。审查者的 `--cwd` 用固定快照或独立工作树，见[独立审查](../references/review.md)。把双方的 dispatch id 记为独立性证据。
++**独立性**：实施和审查分别派发。不同的 dispatch id 对应不同的宿主会话和新的上下文。各 worker 都能读到同一个状态库，OpenCode worker 还能写任意路径，所以文件隔离不作为独立性证据。审查者的 `--cwd` 用固定快照或独立工作树，见[独立审查](../references/review.md)。把双方的 dispatch id 记为独立性证据。
+ 
+ ## 等待与唤醒
+ 
+@@ -73,3 +78,22 @@ WFC_STATE=<状态目录> python3 <router.py> wait --timeout <秒> [--stall-after
+ 2. 读上一次后台 `wait` 的输出（宿主的后台任务输出文件）。
+ 3. 把账本与 `<状态目录>/router.db` 的 `message` 表、`tmux ls` 列出的 `wfc-*` 会话逐一对照。尤其要找出那些已经提问、但账本里还没有答复的任务，按 `question` 处理。
+ 4. 对账完成后，再挂 `wait`。
++
++## Codex 总控
++
++总控在 Codex 中时，按以下方式运行：
++
++- **启动**：用 `danger-full-access` 启动总控所在的这一个 Codex 会话，因为它需要用 `gh` 访问 tracker 和 PR，还要运行 router。worker 和审查者仍按"派发"一节的限制运行。
++- **唤醒**：不挂 `wait`。接管后，用你的会话 UUID 在后台启动一次 relay，把它的进程号记入 `state.md`：
++
++  ```sh
++  WFC_STATE=<状态目录> nohup python3 <router.py> relay --codex-thread <你的会话 UUID> [--stall-after <秒>] >> <状态目录>/relay.log 2>&1 &
++  ```
++
++  会话 UUID 的找法：在 `~/.codex/sessions/` 下找到包含本会话启动提示原文的 rollout 文件，取它第一行的 `id`。
++- **节奏**：每次派发或回复后，结束当前回复。relay 会把 worker 的消息作为一条以 `[router] Messages for the controller:` 开头的新消息投递给你；处理完它的全部消息，再结束当前回复。
++- **恢复**：`wait` 和 `relay` 同一时刻只能运行一个，否则两者会抢同一批消息，被 `wait` 取走的消息你永远看不到。relay 投递失败时会把消息放回，下一轮重新投递。换会话、上下文压缩或意外中断之后，按以下顺序恢复：
++  1. 按[账本](../references/ledger.md)回读 `state.md`。
++  2. 用 `state.md` 里记录的进程号确认旧 relay 的状态。仍在运行但指向旧会话的，停掉它。
++  3. 把账本与 `<状态目录>/router.db` 的 `message` 表、`relay.log`、`tmux ls` 列出的 `wfc-*` 会话逐一对照。已投递给旧会话但账本还没处理的消息，按消息处理表补做。
++  4. 用当前会话的 UUID 重新启动唯一一个 relay，并记下新的进程号。
+-- 
+2.43.0
+
