@@ -123,7 +123,7 @@ WFC_STATE=<状态目录> python3 <router.py> relay --codex-thread <你的会话 
 | --- | --- |
 | `done` | 完成 `returned` 的回读核对。缺留痕的，按账本补发转录，或者交回 worker 补发 |
 | `question`（由 `ask` 发出） | 在已固定的范围、验收条件和授权内能回答的，直接执行 `router.py reply <消息 id> "<答案>"`。需要用户决定的，把原问题和选项原样转给用户。问题和答案都记入账本 |
-| `stalled` | 先读附带的画面。<br>停在信任或权限提示上：请用户执行 `tmux attach -t wfc-<id>` 处理，该任务记为 `blocked`。<br>停下了，但没报告也没提问（例如模型调用遇到网络错误）：回读现场，然后用 `tmux send-keys -t wfc-<id> -l "<提醒>"` 打一行提醒，隔半秒再发 `Enter`，并把这次介入记入账本。提醒之后再次报 `stalled` 的，记为 `blocked` |
+| `stalled` | 先读附带的画面。<br>停在信任或权限提示上：请用户执行 `tmux attach -t wfc-<id>` 处理，该任务记为 `blocked`。同时告诉用户怎么离开：按 Ctrl-b 再按 d；如果终端截获了 Ctrl-b（例如 VS Code 的终端），就在另一个终端执行 `tmux detach-client -s wfc-<id>`，或者让总控代为执行。千万不要按 Ctrl-C，那会直接退出 worker。<br>停下了，但没报告也没提问（例如模型调用遇到网络错误）：回读现场，然后用 `tmux send-keys -t wfc-<id> -l "<提醒>"` 打一行提醒，隔半秒再发 `Enter`，并把这次介入记入账本。提醒之后再次报 `stalled` 的，记为 `blocked` |
 | `exited` | 先检查 worker 退出前是否已经提交或推送，再用 `resume <dispatch>` 让它回到原会话，接着做当前任务，并记入账本。`resume` 找不到会话或者再次 `exited` 时，按账本的失效规则处理：记为 `stale`，保留现场，用下一轮编号新派，在新任务文件里写明真实起点，以及旧现场是续用还是放弃 |
 
 每条消息都带 dispatch id，对照账本找到它所属的票和任务。记为 `blocked` 的任务，在 `state.md` 写清楚在等谁、要做什么、结果交回哪里。
