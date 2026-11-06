@@ -14,6 +14,7 @@ Known limits:
 ## Layout and installation
 
 - `router.py`: the dispatcher (Python standard library only). `tests/test_router.py` covers it through its command line.
+- `ctl.py`: the controller's routine checks between rounds (snapshot checks with real exit codes, candidate read-back, transcribing an offline reviewer's record, label switch). `tests/test_ctl.py` covers it with real git and a fake `gh`.
 - `skills/surper-coding`: the controller skill that uses the router. Install it by linking it into each host's skills directory:
   `ln -s "$PWD/skills/surper-coding" ~/.claude/skills/surper-coding` and `ln -s "$PWD/skills/surper-coding" ~/.codex/skills/surper-coding`.
 - `skills/ai-coding`, `skills/live-verify`: pinned copies of the prototypes `surper-coding` builds on; see [skills/VENDORED.md](skills/VENDORED.md). They are not installed from here.

@@ -39,6 +39,26 @@ WFC_STATE=<状态目录> python3 <router.py> dispatch --host <codex|opencode|cla
 
 断网审查者在报告里列出的"限制"（例如没法核实上游字段的业务含义），由你联网关闭：抓取真实上游数据，和权威来源交叉比对。发现缺陷时，以总控核验记录的形式发到 PR，再走修复和增量复核。修复任务里遇到故障分支，要事先定好原则（宁可不可用，不给错值），不要交给实施者自选。
 
+### 总控例行检查：ctl.py
+
+每一轮都要做的四件事，统一用 router 旁边的 `ctl.py` 执行，不要每次临时拼命令。每条命令都输出一份 JSON，任何一项检查不通过时退出码为 1。
+
+```sh
+# 1. 把审查快照切到新 head，跑全量检查，日志记录每条命令真实的退出码（用 pipefail）
+python3 <ctl.py> checks --cwd <审查快照> --head <sha> --log <reports/…/verification-rN.log> \
+  --cmd "pnpm install --frozen-lockfile" --cmd "pnpm typecheck" --cmd "pnpm test" …
+# 2. 回读候选：远端 head、tree、未 force-push、密钥没有提交、没有关闭关键词、留痕评论存在、端口已释放
+python3 <ctl.py> candidate --git <仓库克隆> --repo <owner/name> --branch <分支> --head <sha> \
+  [--since <上次获审候选>] [--pr <N>] [--secret-file <.env> --secret-key PGPASSWORD] [--comment <id> …] [--port <端口>]
+# 3. 把断网审查者的报告段落转录到 PR（带原作者说明，正文不改）
+python3 <ctl.py> transcribe --repo <owner/name> --pr <N> --report <r2.md> --start "## 独立复核记录" \
+  [--end "## 最终完整审查状态"] --author "Codex 审查者（router dispatch `d-…`）"
+# 4. 切换生命周期标签并回读
+python3 <ctl.py> label --repo <owner/name> --issue <N> --from in-review --to changes-requested
+```
+
+`checks` 在快照有本地改动时会拒绝执行。`candidate` 不会打印密钥的值。`transcribe` 失败时，先到 PR 上看评论是否其实已经发出，再决定要不要重试，因为 GitHub 偶尔会返回 502 或 EOF。
+
 ### 状态与证据
 
 | 状态 | router 证据 |
