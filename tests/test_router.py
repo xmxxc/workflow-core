@@ -398,7 +398,7 @@ class ContinueDispatch(unittest.TestCase):
         self.next_task.write_text("# fix round\n")
         self.next_report = self.env.report.with_name("113-impl-r2.md")
 
-    def cont(self, report=None, env=None):
+    def continue_with(self, report=None, env=None):
         return self.env.run("continue", self.dispatch, "--task", str(self.next_task),
                             "--report", str(report or self.next_report), env=env)
 
@@ -406,7 +406,7 @@ class ContinueDispatch(unittest.TestCase):
         return [c for c in self.env.host_calls() if c[:2] == ["tmux", "send-keys"]]
 
     def test_next_task_is_typed_into_the_same_session(self):
-        result = self.cont()
+        result = self.continue_with()
 
         self.assertEqual(result.returncode, 0, result.stderr)
         text_call, enter_call = self.sends()
@@ -416,7 +416,7 @@ class ContinueDispatch(unittest.TestCase):
         self.assertEqual(enter_call, ["tmux", "send-keys", "-t", f"wfc-{self.dispatch}", "Enter"])
 
     def test_a_continued_worker_is_watched_and_reports_again(self):
-        self.cont()
+        self.continue_with()
         self.env.end_session(self.dispatch)
 
         [exited] = self.env.json("wait", "--timeout", "1.5", "--stall-after", "0.3")["messages"]
@@ -426,7 +426,7 @@ class ContinueDispatch(unittest.TestCase):
     def test_the_next_report_must_stay_in_the_dispatch_report_directory(self):
         elsewhere = self.env.report.parent.parent / "elsewhere" / "r2.md"
 
-        result = self.cont(report=elsewhere)
+        result = self.continue_with(report=elsewhere)
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(str(self.env.report.parent), result.stderr)
@@ -435,11 +435,26 @@ class ContinueDispatch(unittest.TestCase):
     def test_continuing_a_worker_whose_session_ended_fails_cleanly(self):
         self.env.end_session(self.dispatch)
 
-        result = self.cont()
+        result = self.continue_with()
 
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("Traceback", result.stderr)
         self.assertEqual(self.sends(), [])
+
+
+class ContinueBeforeDone(unittest.TestCase):
+    def test_a_worker_still_on_its_task_cannot_be_given_another(self):
+        env = Env()
+        self.addCleanup(env.close)
+        dispatch = env.dispatch()
+        task = env.task.with_name("next.md")
+        task.write_text("# next\n")
+
+        result = env.run("continue", dispatch, "--task", str(task), "--report", str(env.report.with_name("r2.md")))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not done", result.stderr)
+        self.assertEqual([c for c in env.host_calls() if c[:2] == ["tmux", "send-keys"]], [])
 
 
 class ClaudeTrust(unittest.TestCase):
@@ -471,6 +486,33 @@ class ClaudeTrust(unittest.TestCase):
         self.config.write_text(json.dumps(untrusted))
 
         self.assertEqual(self.dispatch(), untrusted)
+
+    def test_malformed_config_is_left_alone_and_dispatch_still_works(self):
+        self.config.write_text("{not json")
+
+        result = self.env.run("dispatch", "--host", "claude", "--task", str(self.env.task), "--cwd",
+                              str(self.env.cwd), "--report", str(self.env.report),
+                              env={"WFC_CLAUDE_CONFIG": str(self.config)})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.config.read_text(), "{not json")
+
+    def test_config_file_mode_is_kept(self):
+        self.config.write_text(json.dumps({"projects": {str(self.root): {"hasTrustDialogAccepted": True}}}))
+        self.config.chmod(0o600)
+
+        self.dispatch()
+
+        self.assertEqual(self.config.stat().st_mode & 0o777, 0o600)
+
+    def test_trusted_root_given_through_a_symlink_is_recognised(self):
+        link = Path(self.env.tmp.name) / "root-link"
+        link.symlink_to(self.root)
+        self.config.write_text(json.dumps({"projects": {str(link): {"hasTrustDialogAccepted": True}}}))
+
+        config = self.dispatch()
+
+        self.assertTrue(config["projects"][str(self.env.cwd)]["hasTrustDialogAccepted"])
 
     def test_other_hosts_do_not_touch_claude_trust(self):
         before = {"projects": {str(self.root): {"hasTrustDialogAccepted": True}}}
@@ -519,6 +561,17 @@ class CodexRelay(unittest.TestCase):
 
         self.assertEqual(message["type"], "done")
 
+    def test_messages_stay_waiting_when_codex_is_not_installed(self):
+        self.env.run("done", "--report", str(self.env.report), dispatch=self.dispatch)
+        (self.env.bin / "codex").unlink()
+
+        result = self.relay(env={"PATH": str(self.env.bin)})  # only the fakes: no real codex either
+        [message] = self.env.json("wait", "--timeout", "1")["messages"]
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Traceback", result.stderr + result.stdout)
+        self.assertEqual(message["type"], "done")
+
     def test_relay_also_runs_the_watchdog(self):
         self.env.end_session(self.dispatch)
 
@@ -537,6 +590,8 @@ class CodexRelay(unittest.TestCase):
         os.kill(pid, 0)  # still running after the launching command returned
         self.assertNotEqual(os.getsid(pid), os.getsid(0))
         self.assertEqual(Path(started["log"]).parent, self.env.state)
+        child_argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        self.assertNotIn(b"--detach", child_argv)
 
         self.env.run("done", "--report", str(self.env.report), dispatch=self.dispatch)
         deadline = time.monotonic() + 3

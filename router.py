@@ -70,17 +70,16 @@ def worker_brief(dispatch_id, task, report, opening="You are a worker dispatched
 
 
 # Each launcher returns (argv, extra environment) for an unattended worker that may write only
-# its cwd plus the `writable` directories (router state and the report's directory), and must be
-# able to read its task file in `task_dir`.
+# its cwd plus the `writable` directories (router state and the report's directory).
 
-def codex_command(brief, writable, task_dir, cwd, model):
+def codex_command(brief, writable, cwd, model):
     # --no-alt-screen keeps the transcript in the tmux scrollback, so `tmux attach` shows history.
     extra = [arg for d in writable for arg in ("--add-dir", str(d))]
     models = ["-m", model] if model else []
     return ["codex", "--no-alt-screen", "-s", "workspace-write", "-a", "never", *models, *extra, brief], {}
 
 
-def opencode_command(brief, writable, task_dir, cwd, model):
+def opencode_command(brief, writable, cwd, model):
     # OpenCode's directory rules are tool prompts, not a sandbox (shell writes bypass them), and
     # git or pnpm reach into ~ constantly, so an unattended worker allows every external directory
     # (user decision 2026-11-05). "*" overrides any narrower rule merged in from the user's config.
@@ -90,7 +89,7 @@ def opencode_command(brief, writable, task_dir, cwd, model):
             {"OPENCODE_CONFIG_CONTENT": json.dumps(config)})
 
 
-def claude_command(brief, writable, task_dir, cwd, model):
+def claude_command(brief, writable, cwd, model):
     # The brief goes first: --add-dir is variadic and would swallow a trailing prompt.
     models = ["--model", model] if model else []
     return ["claude", brief, "--permission-mode", "auto", *models, "--add-dir", *map(str, writable)], {}
@@ -103,22 +102,36 @@ def claude_config():
 def trust_claude_worktree(cwd):
     """Claude Code asks for trust on every new path, worktrees included. Pre-trust `cwd` only
     when the user already trusts one of its ancestors (user decision 2026-11-05); otherwise
-    leave the prompt for the user. Returns the trusted ancestor, or None."""
-    path = claude_config()
-    if not path.is_file():
+    leave the prompt for the user. Returns the trusted ancestor, or None.
+
+    A running Claude Code session rewrites this file from memory, so the new entry can be lost
+    to a concurrent save; the worker then stops on the trust prompt and is reported `stalled`."""
+    path = claude_config().resolve()  # write through a symlinked config to its real file
+    try:
+        config = json.loads(path.read_text())
+        projects = config.setdefault("projects", {})
+        if not isinstance(projects, dict):
+            raise ValueError("projects is not an object")
+    except FileNotFoundError:
         return None
-    config = json.loads(path.read_text())
-    projects = config.setdefault("projects", {})
+    except (OSError, ValueError) as err:
+        print(f"router: not pre-trusting {cwd}: cannot read {path}: {err}", file=sys.stderr)
+        return None
     if projects.get(str(cwd), {}).get("hasTrustDialogAccepted"):
         return str(cwd)
     roots = [p for p, v in projects.items()
-             if v.get("hasTrustDialogAccepted") and cwd.is_relative_to(Path(p)) and Path(p) != cwd]
+             if isinstance(v, dict) and v.get("hasTrustDialogAccepted")
+             and Path(p).resolve() != cwd and cwd.is_relative_to(Path(p).resolve())]
     if not roots:
         return None
     projects[str(cwd)] = {**projects.get(str(cwd), {}), "hasTrustDialogAccepted": True}
     tmp = path.with_name(f".{path.name}.wfc-{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(config, indent=2, ensure_ascii=False))
-    os.replace(tmp, path)
+    try:
+        tmp.write_text(json.dumps(config, indent=2, ensure_ascii=False))
+        os.chmod(tmp, path.stat().st_mode & 0o777)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
     return max(roots, key=len)
 
 
@@ -133,7 +146,7 @@ def cmd_dispatch(args):
     report = Path(args.report).resolve()
     report.parent.mkdir(parents=True, exist_ok=True)  # hosts grant access to existing directories
     command, extra_env = LAUNCHERS[args.host](worker_brief(dispatch_id, task, report),
-                                              [state_dir(), report.parent], task.parent, cwd, args.model)
+                                              [state_dir(), report.parent], cwd, args.model)
     env = {"WFC_DISPATCH": dispatch_id, "WFC_STATE": str(state_dir()), **extra_env}
     trusted_by = trust_claude_worktree(cwd) if args.host == "claude" else None
     db.execute("INSERT INTO dispatch (id, host, cwd, task, created, report_dir) VALUES (?, ?, ?, ?, ?, ?)",
@@ -216,14 +229,18 @@ def cmd_continue(args):
     if row["report_dir"] and str(report.parent) != row["report_dir"]:
         raise SystemExit(f"the next report must be in {row['report_dir']}, the directory this worker "
                          f"was given write access to at dispatch")
+    if watched(db, args.dispatch):
+        raise SystemExit(f"dispatch {args.dispatch} has not done its current task yet")
     session = session_name(args.dispatch)
     if subprocess.run(["tmux", "has-session", "-t", session], capture_output=True).returncode != 0:
         raise SystemExit(f"tmux session {session} has ended; dispatch a new worker instead")
-    brief = worker_brief(args.dispatch, task, report, opening="[router] New task for you")
-    if not type_into(session, brief):
-        raise SystemExit(f"could not type the next task into tmux session {session}")
+    # Record first, so a `done` for the new task can never get an id below its `continue`.
     message_id = post(db, args.dispatch, "worker", "continue", {"task": str(task), "report": str(report)})
     db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
+    brief = worker_brief(args.dispatch, task, report, opening="[router] New task for you")
+    if not type_into(session, brief):
+        db.execute("DELETE FROM message WHERE id = ?", (message_id,))
+        raise SystemExit(f"could not type the next task into tmux session {session}")
     emit({"continued": args.dispatch, "message": message_id})
 
 
@@ -319,8 +336,15 @@ def cmd_wait(args):
 def queue_into_codex(thread, messages):
     """Deliver one batch as a new turn of the Codex controller session (open or closed)."""
     text = "[router] Messages for the controller: " + json.dumps({"messages": messages}, ensure_ascii=False)
-    return subprocess.run(["codex", "queue", "--thread", thread, "--message", text, "--resume"],
-                          capture_output=True).returncode == 0
+    try:
+        result = subprocess.run(["codex", "queue", "--thread", thread, "--message", text, "--resume"],
+                                capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as err:
+        print(f"router relay: codex queue failed: {err}", flush=True)
+        return False
+    if result.returncode != 0:
+        print(f"router relay: codex queue exited {result.returncode}: {result.stderr.strip()}", flush=True)
+    return result.returncode == 0
 
 
 def cmd_relay(args):
@@ -330,7 +354,8 @@ def cmd_relay(args):
         # A Codex controller's shell may end its background jobs; run in a new session instead.
         log = state_dir() / "relay.log"
         state_dir().mkdir(parents=True, exist_ok=True)
-        argv = [a for a in sys.argv[1:] if a != "--detach"]
+        argv = ["relay", "--codex-thread", args.codex_thread, "--stall-after", str(args.stall_after),
+                *(["--for", str(args.for_seconds)] if args.for_seconds else [])]
         with open(log, "a") as out:
             child = subprocess.Popen([sys.executable, str(ROUTER), *argv], stdin=subprocess.DEVNULL,
                                      stdout=out, stderr=out, start_new_session=True)
@@ -350,8 +375,10 @@ def cmd_relay(args):
 
 
 def main(argv):
-    parser = argparse.ArgumentParser(prog="router.py")
+    parser = argparse.ArgumentParser(prog="router.py", allow_abbrev=False)
     sub = parser.add_subparsers(dest="command", required=True)
+    add_parser = sub.add_parser
+    sub.add_parser = lambda *a, **kw: add_parser(*a, allow_abbrev=False, **kw)  # `--deta` must not mean --detach
     p = sub.add_parser("dispatch")
     p.add_argument("--host", required=True, choices=sorted(LAUNCHERS))
     p.add_argument("--task", required=True)

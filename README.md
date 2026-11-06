@@ -4,7 +4,11 @@ A lightweight router between the controller and the workers it dispatches, for t
 
 ## Status
 
-Phase 1. `router.py` dispatches Codex, OpenCode and Claude Code workers to a Claude Code controller. Each host was verified end to end with a real worker (dispatch → ask → reply → done). While waiting, the controller also watches its workers. A worker whose tmux session ended without `done` is reported as `exited`. A worker whose screen stays unchanged for `--stall-after` seconds, with no `done` and no pending question, is reported as `stalled`, together with its screen. Both cases were verified with a real Claude Code worker. A Codex controller does not block on `wait`. Instead, `relay` runs in the background and delivers each batch of messages to the controller's session with `codex queue --resume`. This was verified with a real Codex session, which woke on a `done` message. Pre-trusting new worktrees comes next. `notify_controller.py`, the earlier hook-based classifier, has been superseded by the watchdog and is kept for reference.
+Phase 1 is functional. `router.py` dispatches Codex, OpenCode and Claude Code workers. A Claude Code controller sleeps on `wait`; a Codex controller is woken by `relay`. `continue` gives a worker its next task in the same session, so a fix round reuses the implementer and an incremental review reuses the reviewer. While waiting, the router watches its workers and reports `exited` (the session ended without `done`) or `stalled` (the screen was unchanged for `--stall-after` seconds with no pending question), with the screen tail attached. Two tickets in xmxxc/example-project were taken through dispatch, review, release and live acceptance this way, one with each controller host. `notify_controller.py`, the earlier hook-based classifier, has been replaced by the watchdog and is kept for reference.
+
+Known limits:
+- `codex queue` also succeeds for a thread id that does not exist, so a relay started with the wrong UUID delivers nothing. Confirm that the first relayed message arrives.
+- A running Claude Code session rewrites `~/.claude.json` from memory and can drop a trust entry the router just wrote. If that happens, the worker stops on the trust prompt and is reported `stalled`.
 
 ## Usage
 
