@@ -56,7 +56,26 @@ WFC_STATE=<状态目录> python3 <router.py> continue <dispatch> --task <下一�
 - **修复**：审查有阻塞时，用 `continue` 把修复任务交给原来的实施者。任务文件里写明审查记录的链接、要修的各项、当前 head，以及"在现有提交上追加，不要 force-push"。
 - **增量复核**：修复报告 `returned` 之后，把审查快照移到新的 head，在快照上执行全量检查，然后用 `continue` 让原来的审查者复核"上次获审候选 → 新 head"。
 - **何时可以续派**：只有在该 dispatch 已经对当前任务报告 `done` 之后才行。`continue` 发现上一轮还没有 `done`，会直接报错。
-- **何时不能续派**：会话已经结束（`exited`），或者原会话不再合适（例如宿主配置已经改了），这时就新派一个会话，并在任务文件里写明真实的起点。会话已经结束时，`continue` 会直接报错，不会把任务打进去。
+- **会话已经结束**（`exited`、误关或被 Ctrl-C）：用 `resume` 把 worker 重新拉回它原来的宿主会话，上下文都还在。会话结束时，`continue` 会直接报错，不会把任务打进去。
+- **原会话不再合适**（例如宿主配置已经改了）：新派一个会话，在任务文件里写明真实的起点。
+- **最后一轮增量复核**：预计能通过时，可以在同一个任务里写两步，先增量复核，无阻塞时紧接着做最终完整审查，两份记录分开写。有阻塞就只做第一步。
+
+## 恢复会话：resume
+
+```sh
+WFC_STATE=<状态目录> python3 <router.py> resume <dispatch> [--task <下一轮任务文件> --report <同一回报目录中的 r<N+1>.md>]
+```
+
+- 不带 `--task`：worker 回到原会话，接着做没做完的当前任务。
+- 带 `--task`：worker 已经报告了 `done`，回到原会话做下一轮，效果等同于 `continue`。
+- router 按 brief 里的 `(dispatch <id>)` 找到宿主会话：Codex 查 rollout 文件，OpenCode 查它的会话库；Claude Code 在派发时就指定了会话 id。找不到时报错，这时新派一个会话。
+- tmux 会话还在时，`resume` 会拒绝执行；这种情况用 `continue`，或者 attach 上去看。
+
+## 会话的生命周期
+
+- 每个 worker 和审查者的 tmux 会话，都保留到整个范围放行或关闭为止。worker 报告 `done` 之后也不要关掉它，后面的修复和复核还要用 `continue` 续派。
+- 范围结束后，把 tmux 会话、worktree、router 状态目录和端口占用都列进回收清单，由用户决定什么时候回收。总控不要自己去关会话、停服务。
+- 每张票分配不同的端口，并写进任务文件。router 的 brief 会要求 worker 在报告完工前停掉自己启动的服务。
 
 ## 等待与唤醒
 
@@ -83,7 +102,7 @@ WFC_STATE=<状态目录> python3 <router.py> relay --codex-thread <你的会话 
 | `done` | 完成 `returned` 的回读核对。缺留痕的，按账本补发转录，或者交回 worker 补发 |
 | `question`（由 `ask` 发出） | 在已固定的范围、验收条件和授权内能回答的，直接执行 `router.py reply <消息 id> "<答案>"`。需要用户决定的，把原问题和选项原样转给用户。问题和答案都记入账本 |
 | `stalled` | 先读附带的画面。<br>停在信任或权限提示上：请用户执行 `tmux attach -t wfc-<id>` 处理，该任务记为 `blocked`。<br>停下了，但没报告也没提问（例如模型调用遇到网络错误）：回读现场，然后用 `tmux send-keys -t wfc-<id> -l "<提醒>"` 打一行提醒，隔半秒再发 `Enter`，并把这次介入记入账本。提醒之后再次报 `stalled` 的，记为 `blocked` |
-| `exited` | 先检查 worker 退出前是否已经提交或推送，然后按账本的失效规则处理：记为 `stale`，保留现场，用下一轮编号新派，在新任务文件里写明真实起点，以及旧现场是续用还是放弃 |
+| `exited` | 先检查 worker 退出前是否已经提交或推送，再用 `resume <dispatch>` 让它回到原会话，接着做当前任务，并记入账本。`resume` 找不到会话或者再次 `exited` 时，按账本的失效规则处理：记为 `stale`，保留现场，用下一轮编号新派，在新任务文件里写明真实起点，以及旧现场是续用还是放弃 |
 
 每条消息都带 dispatch id，对照账本找到它所属的票和任务。记为 `blocked` 的任务，在 `state.md` 写清楚在等谁、要做什么、结果交回哪里。
 

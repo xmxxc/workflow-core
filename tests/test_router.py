@@ -3,6 +3,7 @@
 import json
 import os
 import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -62,6 +63,8 @@ class Env:
         # Tests never read or write the real ~/.claude.json.
         full_env = {**os.environ, "WFC_STATE": str(self.state),
                     "WFC_CLAUDE_CONFIG": str(self.bin.parent / "no-claude-config.json"),
+                    "CODEX_HOME": str(self.bin.parent / "codex-home"),
+                    "WFC_OPENCODE_DB": str(self.bin.parent / "opencode.db"),
                     "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}", **(env or {})}
         full_env.pop("WFC_DISPATCH", None)
         if dispatch:
@@ -599,6 +602,179 @@ class CodexRelay(unittest.TestCase):
             time.sleep(0.2)
         [call] = self.queued()
         self.assertIn('"type": "done"', call[call.index("--message") + 1])
+
+
+
+class Resume(unittest.TestCase):
+    """A worker whose session ended (closed by mistake, Ctrl-C, a crash) is relaunched into its own
+    host conversation, so it keeps the context of every earlier round."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+
+    def launch(self, dispatch):
+        return [c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]
+                and c[c.index("-s") + 1] == f"wfc-{dispatch}"]
+
+    def codex_rollout(self, dispatch, session_id, subagent=False):
+        day = self.env.bin.parent / "codex-home" / "sessions" / "2026" / "11" / "06"
+        day.mkdir(parents=True, exist_ok=True)
+        source = {"subagent": {"thread_spawn": {"parent_thread_id": "p"}}} if subagent else "cli"
+        meta = {"type": "session_meta", "payload": {"id": session_id, "source": source}}
+        text = f"You are a worker dispatched by the controller (dispatch {dispatch}). Read ..."
+        prompt = {"type": "response_item", "payload": {"type": "message", "role": "user",
+                                                        "content": [{"type": "input_text", "text": text}]}}
+        (day / f"rollout-{session_id}.jsonl").write_text(json.dumps(meta) + "\n" + json.dumps(prompt) + "\n")
+
+    def opencode_session(self, dispatch, session_id):
+        db = sqlite3.connect(self.env.bin.parent / "opencode.db")
+        db.executescript("CREATE TABLE IF NOT EXISTS session (id TEXT, parent_id TEXT, time_created INTEGER);"
+                         "CREATE TABLE IF NOT EXISTS part (id TEXT, session_id TEXT, data TEXT);")
+        brief = f"You are a worker dispatched by the controller (dispatch {dispatch}). Read ..."
+        db.execute("INSERT INTO session VALUES (?, NULL, 2)", (session_id,))
+        db.execute("INSERT INTO part VALUES ('p1', ?, ?)", (session_id, json.dumps({"type": "text", "text": brief})))
+        db.execute("INSERT INTO session VALUES ('ses_child', ?, 3)", (session_id,))
+        db.execute("INSERT INTO part VALUES ('p2', 'ses_child', ?)", (json.dumps({"type": "text", "text": brief}),))
+        # A controller session that only quoted the brief, created earlier, must not be picked.
+        db.execute("INSERT INTO session VALUES ('ses_controller', NULL, 1)")
+        db.execute("INSERT INTO part VALUES ('p3', 'ses_controller', ?)",
+                   (json.dumps({"type": "text", "text": f"[router] stalled screen: {brief}"}),))
+        db.commit()
+        db.close()
+
+    def test_claude_worker_is_given_a_session_id_and_resumed_into_it(self):
+        dispatch = self.env.dispatch("claude")
+        [first] = self.launch(dispatch)
+        session_id = first[first.index("--session-id") + 1]
+        self.env.end_session(dispatch)
+
+        self.env.json("resume", dispatch)
+
+        [_, again] = self.launch(dispatch)
+        self.assertEqual(again[again.index("--resume") + 1], session_id)
+        self.assertIn(str(self.env.report), again[again.index("claude") + 1])
+
+    def test_codex_worker_is_resumed_into_its_rollout_not_a_subagent(self):
+        dispatch = self.env.dispatch("codex")
+        self.codex_rollout(dispatch, "sub-1111", subagent=True)
+        self.codex_rollout(dispatch, "main-2222")
+        self.env.end_session(dispatch)
+
+        self.env.json("resume", dispatch)
+
+        [_, again] = self.launch(dispatch)
+        codex = again[again.index("codex"):]
+        self.assertEqual(codex[1], "resume")
+        self.assertIn("main-2222", codex)
+        self.assertNotIn("sub-1111", codex)
+        self.assertEqual(codex[codex.index("-s") + 1], "workspace-write")
+
+    def test_opencode_worker_is_resumed_into_its_session_with_its_model(self):
+        self.env.screen.write_text("> ready\n")
+        dispatch = self.env.dispatch("opencode", extra_args=("--model", "deepseek/v4"))
+        self.opencode_session(dispatch, "ses_main")
+        self.env.end_session(dispatch)
+
+        self.env.json("resume", dispatch, env={"FAKE_SCREEN": str(self.env.screen)}, timeout=20)
+
+        [_, again] = self.launch(dispatch)
+        opencode = again[again.index("opencode"):]
+        self.assertEqual(opencode[opencode.index("-s") + 1], "ses_main")
+        self.assertEqual(opencode[opencode.index("-m") + 1], "deepseek/v4")
+        # OpenCode ignores --prompt on a reopened session, so the brief is typed in once it settles.
+        self.assertNotIn("--prompt", opencode)
+        typed = [c for c in self.env.host_calls() if c[:2] == ["tmux", "send-keys"] and "-l" in c]
+        self.assertIn(str(self.env.report), typed[-1][-1])
+
+    def test_a_resumed_worker_is_watched_again(self):
+        dispatch = self.env.dispatch("claude")
+        self.env.end_session(dispatch)
+        [exited] = self.env.json("wait", "--timeout", "2", "--stall-after", "60")["messages"]
+        self.env.json("resume", dispatch)
+        self.env.end_session(dispatch)
+
+        [again] = self.env.json("wait", "--timeout", "2", "--stall-after", "60")["messages"]
+
+        self.assertEqual((exited["type"], again["type"]), ("exited", "exited"))
+
+    def test_a_finished_worker_resumes_into_its_next_task(self):
+        dispatch = self.env.dispatch("claude")
+        self.env.report.write_text("# r1\n")
+        self.env.run("done", "--report", str(self.env.report), dispatch=dispatch)
+        self.env.json("wait", "--timeout", "2")
+        self.env.end_session(dispatch)
+        task2 = self.env.task.with_name("113-impl-r2.md")
+        task2.write_text("# fix\n")
+        report2 = self.env.report.with_name("r2.md")
+
+        self.env.json("resume", dispatch, "--task", str(task2), "--report", str(report2))
+        report2.write_text("# r2\n")
+        self.env.run("done", "--report", str(report2), dispatch=dispatch)
+
+        [_, again] = self.launch(dispatch)
+        self.assertIn(str(task2), again[again.index("claude") + 1])
+        [done] = self.env.json("wait", "--timeout", "2")["messages"]
+        self.assertEqual(done["report"], str(report2))
+
+    def test_a_finished_worker_needs_a_next_task_to_resume(self):
+        dispatch = self.env.dispatch("claude")
+        self.env.report.write_text("# r1\n")
+        self.env.run("done", "--report", str(self.env.report), dispatch=dispatch)
+        self.env.end_session(dispatch)
+
+        result = self.env.run("resume", dispatch)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--task", result.stderr)
+
+    def test_a_worker_still_on_its_task_cannot_be_resumed_into_another(self):
+        dispatch = self.env.dispatch("claude")
+        self.env.end_session(dispatch)
+
+        result = self.env.run("resume", dispatch, "--task", str(self.env.task),
+                              "--report", str(self.env.report.with_name("r2.md")))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not done", result.stderr)
+        self.assertEqual(len(self.launch(dispatch)), 1)
+
+    def test_codex_controller_that_only_quoted_the_brief_is_not_resumed(self):
+        dispatch = self.env.dispatch("codex")
+        day = self.env.bin.parent / "codex-home" / "sessions" / "2026" / "11" / "06"
+        day.mkdir(parents=True, exist_ok=True)
+        quote = f"[router] Messages for the controller: You are a worker dispatched by the controller (dispatch {dispatch})"
+        lines = [{"type": "session_meta", "payload": {"id": "ctl-9999", "source": "cli"}},
+                 {"type": "response_item", "payload": {"type": "message", "role": "user",
+                                                       "content": [{"type": "input_text", "text": quote}]}}]
+        (day / "rollout-z-ctl-9999.jsonl").write_text("".join(json.dumps(l) + "\n" for l in lines))
+        self.codex_rollout(dispatch, "main-2222")
+        self.env.end_session(dispatch)
+
+        self.env.json("resume", dispatch)
+
+        [_, again] = self.launch(dispatch)
+        self.assertIn("main-2222", again)
+        self.assertNotIn("ctl-9999", again)
+
+    def test_a_live_session_is_not_resumed(self):
+        dispatch = self.env.dispatch("claude")
+
+        result = self.env.run("resume", dispatch)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("still running", result.stderr)
+        self.assertEqual(len(self.launch(dispatch)), 1)
+
+    def test_a_worker_whose_conversation_cannot_be_found_is_not_relaunched(self):
+        dispatch = self.env.dispatch("codex")
+        self.env.end_session(dispatch)
+
+        result = self.env.run("resume", dispatch)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("conversation", result.stderr)
+        self.assertEqual(len(self.launch(dispatch)), 1)
 
 
 if __name__ == "__main__":

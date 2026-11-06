@@ -32,4 +32,4 @@ disable-model-invocation: true
 与 ai-coding 相同，另外加两条：
 
 - 每个 dispatch 的最终状态都记入账本：`returned`、`stale` 或 `blocked`，并写明原因。
-- 范围完成时，停掉 relay，列出 worktree 和 router 状态目录作为回收清单。
+- 范围完成时，停掉 relay，列出 tmux 会话、worktree、router 状态目录和端口占用，作为回收清单交给用户。在此之前，worker 的会话一律保留。
