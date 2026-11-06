@@ -55,8 +55,10 @@ def cmd_checks(args):
         log.write(f"# snapshot {head} tree {tree} — run by controller {datetime.now().astimezone().isoformat()}\n")
         for command in args.cmd:
             # pipefail: a `... | tail` must report the command's failure, not tail's success.
-            run = subprocess.run(["bash", "-o", "pipefail", "-c", command], cwd=cwd, capture_output=True, text=True)
-            tail = "\n".join((run.stdout + run.stderr).rstrip().splitlines()[-args.tail:])
+            # One merged stream keeps the order: a test summary on stdout is not pushed out by stderr logs.
+            run = subprocess.run(["bash", "-o", "pipefail", "-c", command], cwd=cwd, text=True,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            tail = "\n".join(run.stdout.rstrip().splitlines()[-args.tail:])
             log.write(f"## $ {command}\n{tail}\n## exit={run.returncode}\n")
             log.flush()
             results.append({"cmd": command, "exit": run.returncode})

@@ -209,6 +209,12 @@ class Checks(unittest.TestCase):
         self.assertIn(f"# snapshot {self.head}", log)
         self.assertIn("## exit=7", log)
 
+    def test_the_log_keeps_the_last_lines_in_the_order_they_were_printed(self):
+        self.env.json("checks", "--cwd", str(self.snapshot), "--head", self.head, "--log", str(self.log), "--tail", "2",
+                      "--cmd", "echo log >&2; echo log >&2; echo summary")
+
+        self.assertIn("log\nsummary\n## exit=0", self.log.read_text())
+
     def test_a_snapshot_with_local_changes_is_not_moved(self):
         (self.snapshot / "README.md").write_text("edited\n")
 
