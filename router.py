@@ -326,6 +326,16 @@ def queue_into_codex(thread, messages):
 def cmd_relay(args):
     """Like `wait`, but runs on and pushes each batch to a Codex controller, which then sleeps
     between turns instead of blocking on `wait`."""
+    if args.detach:
+        # A Codex controller's shell may end its background jobs; run in a new session instead.
+        log = state_dir() / "relay.log"
+        state_dir().mkdir(parents=True, exist_ok=True)
+        argv = [a for a in sys.argv[1:] if a != "--detach"]
+        with open(log, "a") as out:
+            child = subprocess.Popen([sys.executable, str(ROUTER), *argv], stdin=subprocess.DEVNULL,
+                                     stdout=out, stderr=out, start_new_session=True)
+        emit({"pid": child.pid, "log": str(log)})
+        return 0
     db = connect()
     deadline = time.monotonic() + args.for_seconds if args.for_seconds else None
     while deadline is None or time.monotonic() < deadline:
@@ -374,6 +384,8 @@ def main(argv):
     p.add_argument("--codex-thread", required=True, help="the Codex controller's session UUID or name")
     p.add_argument("--stall-after", type=float, default=300)
     p.add_argument("--for", dest="for_seconds", type=float, help="stop after this many seconds (default: run on)")
+    p.add_argument("--detach", action="store_true",
+                   help="run in a new session with output to $WFC_STATE/relay.log; prints the pid")
     p.set_defaults(func=cmd_relay)
     args = parser.parse_args(argv)
     return args.func(args) or 0

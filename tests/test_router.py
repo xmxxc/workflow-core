@@ -527,6 +527,24 @@ class CodexRelay(unittest.TestCase):
         [call] = self.queued()
         self.assertIn('"type": "exited"', call[call.index("--message") + 1])
 
+    def test_detached_relay_outlives_its_launcher_in_its_own_session(self):
+        result = self.env.run("relay", "--codex-thread", self.THREAD, "--for", "4", "--detach")
+        started = json.loads(result.stdout)
+        pid = started["pid"]
+        self.addCleanup(lambda: subprocess.run(["kill", str(pid)], capture_output=True))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        os.kill(pid, 0)  # still running after the launching command returned
+        self.assertNotEqual(os.getsid(pid), os.getsid(0))
+        self.assertEqual(Path(started["log"]).parent, self.env.state)
+
+        self.env.run("done", "--report", str(self.env.report), dispatch=self.dispatch)
+        deadline = time.monotonic() + 3
+        while not self.queued() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        [call] = self.queued()
+        self.assertIn('"type": "done"', call[call.index("--message") + 1])
+
 
 if __name__ == "__main__":
     unittest.main()

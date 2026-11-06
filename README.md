@@ -14,7 +14,7 @@ router.py dispatch --host codex|opencode|claude --task <task.md> --cwd <worktree
 router.py wait --timeout 900 [--stall-after 300]   # blocks until a worker message (done, question, stalled, exited); exit code 3 on timeout
 router.py reply <question-id> "<answer>"
 router.py continue <dispatch> --task <next-task.md> --report <next-report.md>   # next round in the same session (report in the same dir)
-router.py relay --codex-thread <session-uuid> [--stall-after 300] &   # Codex controller: push messages into its session instead of `wait`
+router.py relay --codex-thread <session-uuid> --detach [--stall-after 300]   # Codex controller: push messages into its session instead of `wait`; prints the pid
 
 # worker (the dispatch brief tells it these exact commands)
 router.py done --report <report.md>
