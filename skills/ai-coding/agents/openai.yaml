@@ -1,0 +1,6 @@
+interface:
+  display_name: "AI 开发总控"
+  short_description: "多票据开发总控：人工、宿主或 Codex 线程派发，留痕到放行收尾"
+  default_prompt: "使用 $ai-coding 接管指定 Issue/PR 范围，说明派发模式（人工转交、宿主独立任务或 Codex 独立线程），推进到最终 PR 完整独立审查通过并交付放行。"
+policy:
+  allow_implicit_invocation: false

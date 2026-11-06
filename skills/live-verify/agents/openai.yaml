@@ -1,0 +1,6 @@
+interface:
+  display_name: "真实环境验收"
+  short_description: "长期主持人工真实环境验收，核对已放行 PR、合并版本、现场证据与问题闭环"
+  default_prompt: "使用 $live-verify 接管本项目的真实环境验收，读取总控放行记录，按授权合并并带我逐轮验证和留痕。"
+policy:
+  allow_implicit_invocation: false

@@ -11,6 +11,14 @@ Known limits:
 - `resume` finds a worker's conversation by its first brief: Codex rollouts under `$CODEX_HOME/sessions` (default `~/.codex`), OpenCode's `opencode.db` (`$WFC_OPENCODE_DB`, default under `$XDG_DATA_HOME`), and for Claude Code the `--session-id` the router gives it at dispatch. These are host internals that may change. Only the OpenCode path has been verified against a real host; Codex and Claude Code resume are covered by unit tests only. OpenCode ignores `--prompt` on a reopened session, so the router types the brief in once the screen settles.
 - A running Claude Code session rewrites `~/.claude.json` from memory and can drop a trust entry the router just wrote. If that happens, the worker stops on the trust prompt and is reported `stalled`.
 
+## Layout and installation
+
+- `router.py`: the dispatcher (Python standard library only). `tests/test_router.py` covers it through its command line.
+- `skills/surper-coding`: the controller skill that uses the router. Install it by linking it into each host's skills directory:
+  `ln -s "$PWD/skills/surper-coding" ~/.claude/skills/surper-coding` and `ln -s "$PWD/skills/surper-coding" ~/.codex/skills/surper-coding`.
+- `skills/ai-coding`, `skills/live-verify`: pinned copies of the prototypes `surper-coding` builds on; see [skills/VENDORED.md](skills/VENDORED.md). They are not installed from here.
+- `docs/decision-log.md`: user decisions, controller decisions and lessons; `docs/probes-*.md`: host capability probes behind the design.
+
 ## Usage
 
 ```sh
