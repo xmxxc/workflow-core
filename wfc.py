@@ -5,7 +5,7 @@
   wfc --version
 
 `build.py` packs this file and router.py into one executable file. The controller skill that
-drives it, surper-coding, is published separately in xmxxc/surper-coding.
+drives it, super-coding, is published separately in xmxxc/super-coding.
 """
 
 import sys

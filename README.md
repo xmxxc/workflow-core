@@ -1,6 +1,6 @@
 # workflow-core
 
-A lightweight router between the controller and the workers it dispatches, shipped as one command, `wfc`. The controller skill that drives it, `surper-coding` (with its routine-check script), is published separately in [xmxxc/surper-coding](https://github.com/xmxxc/surper-coding). Workers report or ask through `wfc` and then sleep. The controller sleeps on `wfc wait` and is woken by their messages.
+A lightweight router between the controller and the workers it dispatches, shipped as one command, `wfc`. The controller skill that drives it, `super-coding` (with its routine-check script), is published separately in [xmxxc/super-coding](https://github.com/xmxxc/super-coding). Workers report or ask through `wfc` and then sleep. The controller sleeps on `wfc wait` and is woken by their messages.
 
 ## Status
 
@@ -19,7 +19,7 @@ Requirements: Linux or macOS (on Windows, use WSL2), python3 (3.9+), tmux, and t
 
 1. Download `wfc` from this repository's Releases, put it on your PATH and make it executable:
    `install -m 755 wfc ~/.local/bin/wfc` (check with `wfc --version`).
-2. For the development workflow on top of it, install the `surper-coding` skills from xmxxc/surper-coding (see its README).
+2. For the development workflow on top of it, install the `super-coding` skills from xmxxc/super-coding (see its README).
 
 To build `wfc` from a checkout: `python3 build.py` writes `dist/wfc`.
 
@@ -29,7 +29,7 @@ CI (`.github/workflows/ci.yml`) runs the tests and a build on Ubuntu and macOS w
 
 - `router.py`: the dispatcher (Python standard library only). `tests/test_router.py` covers it through its command line.
 - `wfc.py`: the single command; `build.py` packs it with `router.py` into the one-file `wfc` (a Python zip application). `tests/test_wfc.py` covers the build.
-- `docs/decision-log.md`: user decisions, controller decisions and lessons; `docs/probes-*.md`: host capability probes behind the design. These also record the design of the `surper-coding` skill.
+- `docs/decision-log.md`: user decisions, controller decisions and lessons; `docs/probes-*.md`: host capability probes behind the design. These also record the design of the `super-coding` skill.
 
 ## Usage
 
