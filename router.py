@@ -16,6 +16,8 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
 
@@ -679,14 +681,55 @@ def queue_into_codex(thread, messages):
     return "delivered"
 
 
+def post_into_opencode(url, session, messages):
+    """Deliver one batch as a new turn of an OpenCode controller session through its HTTP API
+    (the TUI or `opencode serve` started with a fixed --port). Same outcomes as queue_into_codex:
+    "failed" only when OpenCode certainly did not take it (nothing listening), else "uncertain"
+    unless it answered 2xx."""
+    text = "[router] Messages for the controller: " + json.dumps({"messages": messages}, ensure_ascii=False)
+    ids = [m["id"] for m in messages]
+    request = urllib.request.Request(f"{url.rstrip('/')}/session/{session}/prompt_async", method="POST",
+                                     data=json.dumps({"parts": [{"type": "text", "text": text}]}).encode(),
+                                     headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=float(os.environ.get("WFC_QUEUE_TIMEOUT", 60))):
+            return "delivered"
+    except urllib.error.HTTPError as err:
+        reason = f"OpenCode answered {err.code}"
+    except urllib.error.URLError as err:
+        if isinstance(err.reason, ConnectionRefusedError):
+            print(f"router relay: nothing listens at {url}; messages {ids} stay waiting", flush=True)
+            return "failed"
+        reason = f"request failed: {err.reason}"
+    except (OSError, TimeoutError) as err:
+        reason = f"request failed: {err}"
+    print(f"router relay: {reason}; delivery of messages {ids} is uncertain and not retried. Check the "
+          f"controller session; the messages stay in router.db.", flush=True)
+    return "uncertain"
+
+
+def relay_target(args):
+    """The controller to push into: a Codex thread, or an OpenCode session at a URL."""
+    opencode = bool(args.opencode_url) or bool(args.opencode_session)
+    if bool(args.codex_thread) == opencode or (opencode and not (args.opencode_url and args.opencode_session)):
+        raise SystemExit("give either --codex-thread, or both --opencode-url and --opencode-session")
+    if opencode and not args.opencode_url.startswith(("http://", "https://")):
+        raise SystemExit("--opencode-url must be an http(s) URL, e.g. http://127.0.0.1:4096")
+    if args.codex_thread:
+        return ["--codex-thread", args.codex_thread], lambda batch: queue_into_codex(args.codex_thread, batch)
+    return (["--opencode-url", args.opencode_url, "--opencode-session", args.opencode_session],
+            lambda batch: post_into_opencode(args.opencode_url, args.opencode_session, batch))
+
+
 def cmd_relay(args):
-    """Like `wait`, but runs on and pushes each batch to a Codex controller, which then sleeps
-    between turns instead of blocking on `wait`."""
+    """Like `wait`, but runs on and pushes each batch to a Codex or OpenCode controller, which then
+    sleeps between turns instead of blocking on `wait`."""
+    target_args, deliver = relay_target(args)
     if args.detach:
         # A Codex controller's shell may end its background jobs; run in a new session instead.
         log = state_dir() / "relay.log"
         state_dir().mkdir(parents=True, exist_ok=True)
-        argv = ["relay", "--codex-thread", args.codex_thread, "--stall-after", str(args.stall_after),
+        argv = ["relay", *target_args, "--stall-after", str(args.stall_after),
                 *(["--for", str(args.for_seconds)] if args.for_seconds else [])]
         with open(log, "a") as out:
             child = subprocess.Popen([sys.executable, str(PROGRAM), *argv], stdin=subprocess.DEVNULL,
@@ -698,7 +741,7 @@ def cmd_relay(args):
     while deadline is None or time.monotonic() < deadline:
         check_workers(db, args.stall_after)
         messages = take_controller_messages(db)
-        if messages and queue_into_codex(args.codex_thread, messages) == "failed":
+        if messages and deliver(messages) == "failed":
             # Put the batch back so the next pass, or a `wait`, delivers it.
             db.executemany("UPDATE message SET delivered = 0 WHERE id = ?", [(m["id"],) for m in messages])
             time.sleep(5)
@@ -744,8 +787,10 @@ def main(argv):
     p.add_argument("--stall-after", type=float, default=300,
                    help="seconds a worker's screen may stay unchanged before it is reported as stalled")
     p.set_defaults(func=cmd_wait)
-    p = sub.add_parser("relay", help="push controller messages into a Codex controller session")
-    p.add_argument("--codex-thread", required=True, help="the Codex controller's session UUID or name")
+    p = sub.add_parser("relay", help="push controller messages into a Codex or OpenCode controller session")
+    p.add_argument("--codex-thread", help="the Codex controller's session UUID or name")
+    p.add_argument("--opencode-url", help="the OpenCode controller's server, e.g. http://127.0.0.1:4096")
+    p.add_argument("--opencode-session", help="the OpenCode controller's session id (ses_...)")
     p.add_argument("--stall-after", type=float, default=300)
     p.add_argument("--for", dest="for_seconds", type=float, help="stop after this many seconds (default: run on)")
     p.add_argument("--detach", action="store_true",

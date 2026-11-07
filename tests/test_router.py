@@ -1234,5 +1234,92 @@ class ReportReuse(unittest.TestCase):
         self.assertIn("already used", result.stderr)
 
 
+
+class OpenCodeRelay(unittest.TestCase):
+    """relay pushes controller messages into an OpenCode controller session over its HTTP API
+    (prompt_async), the OpenCode counterpart of `codex queue`."""
+
+    SESSION = "ses_controller1"
+
+    def setUp(self):
+        import http.server
+        import threading
+        self.env = Env()
+        self.addCleanup(self.env.close)
+        self.dispatch = self.env.dispatch()
+        self.env.report.write_text("# report\n")
+        self.posts, self.status = [], 204
+        test = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                test.posts.append((self.path, json.loads(body)))
+                self.send_response(test.status)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.shutdown)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def relay(self, url=None, seconds="1.5"):
+        return self.env.run("relay", "--opencode-url", url or self.url, "--opencode-session", self.SESSION,
+                            "--for", seconds)
+
+    def test_messages_are_posted_into_the_opencode_controller_once(self):
+        self.env.run("done", "--report", str(self.env.report), dispatch=self.dispatch)
+
+        first = self.relay()
+        second = self.relay(seconds="0.8")
+
+        self.assertEqual((first.returncode, second.returncode), (0, 0), first.stderr)
+        [(path, body)] = self.posts
+        self.assertEqual(path, f"/session/{self.SESSION}/prompt_async")
+        [part] = body["parts"]
+        self.assertEqual(part["type"], "text")
+        self.assertTrue(part["text"].startswith("[router] Messages for the controller: "))
+        self.assertIn('"type": "done"', part["text"])
+
+    def test_messages_stay_waiting_when_opencode_is_not_listening(self):
+        self.env.run("done", "--report", str(self.env.report), dispatch=self.dispatch)
+        closed = socket_free_port()
+
+        self.relay(url=f"http://127.0.0.1:{closed}", seconds="1")
+
+        [message] = self.env.json("wait", "--timeout", "1")["messages"]
+        self.assertEqual(message["type"], "done")
+
+    def test_an_error_answer_is_logged_as_uncertain_and_not_retried(self):
+        self.status = 500
+        self.env.run("done", "--report", str(self.env.report), dispatch=self.dispatch)
+
+        result = self.relay(seconds="2")
+
+        self.assertEqual(len(self.posts), 1)
+        self.assertIn("uncertain", result.stdout)
+        self.assertEqual(self.env.json("wait", "--timeout", "0.5")["messages"], [])
+
+    def test_relay_needs_exactly_one_controller(self):
+        both = self.env.run("relay", "--codex-thread", "t", "--opencode-url", self.url, "--opencode-session",
+                            self.SESSION, "--for", "0.1")
+        neither = self.env.run("relay", "--for", "0.1")
+        half = self.env.run("relay", "--opencode-url", self.url, "--for", "0.1")
+
+        self.assertNotEqual(both.returncode, 0)
+        self.assertNotEqual(neither.returncode, 0)
+        self.assertNotEqual(half.returncode, 0)
+
+
+def socket_free_port():
+    import socket
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
 if __name__ == "__main__":
     unittest.main()

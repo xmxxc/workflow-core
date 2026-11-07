@@ -4,7 +4,7 @@ A lightweight router between the controller and the workers it dispatches, shipp
 
 ## Status
 
-Phase 1 is functional. `router.py` dispatches Codex, OpenCode and Claude Code workers. A Claude Code controller sleeps on `wait`; a Codex controller is woken by `relay`. `continue` gives a worker its next task in the same session, so a fix round reuses the implementer and an incremental review reuses the reviewer. While waiting, the router watches its workers and reports `exited` (the session ended without `done`) or `stalled` (the screen was unchanged for `--stall-after` seconds with no pending question), with the screen tail attached. `resume` relaunches a worker whose session ended into its own host conversation, so it keeps the context of earlier rounds. Three tickets in xmxxc/example-project were taken through dispatch, review, release and live acceptance this way. `notify_controller.py`, the earlier hook-based classifier, has been replaced by the watchdog and is kept for reference.
+Phase 1 is functional. `router.py` dispatches Codex, OpenCode and Claude Code workers. A Claude Code controller sleeps on `wait`; a Codex or OpenCode controller is woken by `relay` (through `codex queue`, or OpenCode's `prompt_async` HTTP API). `continue` gives a worker its next task in the same session, so a fix round reuses the implementer and an incremental review reuses the reviewer. While waiting, the router watches its workers and reports `exited` (the session ended without `done`) or `stalled` (the screen was unchanged for `--stall-after` seconds with no pending question), with the screen tail attached. `resume` relaunches a worker whose session ended into its own host conversation, so it keeps the context of earlier rounds. Three tickets in xmxxc/example-project were taken through dispatch, review, release and live acceptance this way. `notify_controller.py`, the earlier hook-based classifier, has been replaced by the watchdog and is kept for reference.
 
 Known limits:
 - `relay` never queues a batch twice: when `codex queue` times out or exits non-zero, it may already have taken the batch, so delivery is uncertain: the batch is logged in `relay.log` and not retried (check the controller session). Only a queue that could not start at all (codex missing) is retried.
@@ -41,6 +41,7 @@ wfc reply <question-id> "<answer>"
 wfc continue <dispatch> --task <next-task.md> --report <next-report.md>   # next round in the same session (report in the same dir)
 wfc resume <dispatch> [--task <next-task.md> --report <next-report.md>]   # session ended: relaunch into its own conversation; --task only after done
 wfc relay --codex-thread <session-uuid> --detach [--stall-after 300]   # Codex controller: push messages into its session instead of `wait`; prints the pid
+wfc relay --opencode-url http://127.0.0.1:<port> --opencode-session <ses_id> --detach   # OpenCode controller (started with --port): push messages over its HTTP API
 
 # worker (the dispatch brief tells it these exact commands)
 wfc done --report <report.md>

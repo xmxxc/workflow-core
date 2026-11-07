@@ -40,3 +40,4 @@
 | U9 | 2026-11-07 | 用户决定：workflow-core 每次推送前，都要像工作流一样先经过 Codex 的全量审查；有阻塞的先修复，修完再复核 | 用户授权推送时附带的条件 | 适用于每一次推送 |
 | U10 | 2026-11-07 | 用户决定：拆成两个仓库。调度器（`wfc`）留在 xmxxc/workflow-core；技能 surper-coding、它的例行检查脚本 `ctl.py`（移到 `skills/surper-coding/scripts/`）、ai-coding/live-verify 的锁定副本和安装脚本放进新的私密仓库 xmxxc/surper-coding。开发者按需各取 | 公开时，调度器可以单独使用；标签等检查脚本是技能规则的执行部分，随技能分发，免得两边版本对不上 | 决策记录和探针文档留在 workflow-core |
 | U11 | 2026-11-07 | 用户决定：以单文件 `wfc`（Python zipapp）分发，CI 跑 Ubuntu、macOS × Python 3.9、3.12，打标签时自动发布 Release；不做 Windows 原生支持，暂不改用 Go | 下载即用，技能里不再写调度器路径 | Windows 用户用 WSL2 |
+| D12 | 2026-11-07 | OpenCode 当总控：`wfc relay --opencode-url --opencode-session` 通过 OpenCode 的 `POST /session/<id>/prompt_async` 投递消息，总控须以固定 `--port` 启动。投递语义与 Codex 一致：连接被拒（确定未送达）就重试；错误响应或超时属于不确定，不重试，写入 relay.log | 用户要求三个宿主都能当总控，并且必须实测 | 真机验证：OpenCode 总控收到探针 worker 的 done 后回复 "ACK done"；在小范围票据上的完整总控测试另行进行 |
