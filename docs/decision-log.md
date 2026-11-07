@@ -38,3 +38,5 @@
 | D9a | 2026-11-06 | `resume` 已在三种宿主上真机验证：OpenCode（#9 实施者被 Ctrl-C 结束后恢复，完成了任务）、Codex（#8 审查者 /quit 后用 `resume --task` 回到 rollout 01a1b107…，历史中有第 1 轮的 X1）、Claude Code（#9 审查者 /exit 后用 `--resume` 回到 23ac9e32…，第 2 轮任务接在第 1 轮之后） | 补齐 D9 中"Codex 和 Claude 只有单元测试"的限制 | — |
 | U8 | 2026-11-07 | 用户决定：测试环境下 OpenCode 可以读取 `.env`。router 给 OpenCode 的配置放行 `*.env`、`*.env.*` 的读取 | #9 的 worker 卡在 OpenCode 默认的"Read .env"询问上 | 只适用于测试环境；生产密钥不放进 worker 能读到的工作树 |
 | U9 | 2026-11-07 | 用户决定：workflow-core 每次推送前，都要像工作流一样先经过 Codex 的全量审查；有阻塞的先修复，修完再复核 | 用户授权推送时附带的条件 | 适用于每一次推送 |
+| U10 | 2026-11-07 | 用户决定：拆成两个仓库。调度器（`wfc`）留在 xmxxc/workflow-core；技能 surper-coding、它的例行检查脚本 `ctl.py`（移到 `skills/surper-coding/scripts/`）、ai-coding/live-verify 的锁定副本和安装脚本放进新的私密仓库 xmxxc/surper-coding。开发者按需各取 | 公开时，调度器可以单独使用；标签等检查脚本是技能规则的执行部分，随技能分发，免得两边版本对不上 | 决策记录和探针文档留在 workflow-core |
+| U11 | 2026-11-07 | 用户决定：以单文件 `wfc`（Python zipapp）分发，CI 跑 Ubuntu、macOS × Python 3.9、3.12，打标签时自动发布 Release；不做 Windows 原生支持，暂不改用 Go | 下载即用，技能里不再写调度器路径 | Windows 用户用 WSL2 |

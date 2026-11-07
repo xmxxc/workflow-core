@@ -1,6 +1,6 @@
 # workflow-core
 
-A lightweight router between the controller and the workers it dispatches, shipped as one command, `wfc`, together with the `surper-coding` controller skill. Workers report or ask through `wfc` and then sleep. The controller sleeps on `wfc wait` and is woken by their messages.
+A lightweight router between the controller and the workers it dispatches, shipped as one command, `wfc`. The controller skill that drives it, `surper-coding` (with its routine-check script), is published separately in [xmxxc/surper-coding](https://github.com/xmxxc/surper-coding). Workers report or ask through `wfc` and then sleep. The controller sleeps on `wfc wait` and is woken by their messages.
 
 ## Status
 
@@ -19,8 +19,7 @@ Requirements: Linux or macOS (on Windows, use WSL2), python3 (3.9+), tmux, and t
 
 1. Download `wfc` from this repository's Releases, put it on your PATH and make it executable:
    `install -m 755 wfc ~/.local/bin/wfc` (check with `wfc --version`).
-2. Install the skills it carries: `wfc install-skills`. This installs `surper-coding` into `~/.claude/skills` and `~/.codex/skills`, and the `ai-coding` and `live-verify` prototypes it builds on only where you have none of your own. A linked development install is left alone.
-3. `ai-coding` uses further general skills (`code-review`, `implement`, `tdd` and so on) from the user's skills collection; install those separately.
+2. For the development workflow on top of it, install the `surper-coding` skills from xmxxc/surper-coding (see its README).
 
 To build `wfc` from a checkout: `python3 build.py` writes `dist/wfc`.
 
@@ -28,12 +27,9 @@ CI (`.github/workflows/ci.yml`) runs the tests and a build on Ubuntu and macOS w
 
 ## Layout
 
-- `wfc.py`: the single command; `build.py` packs it with `router.py`, `ctl.py` and `skills/` into the one-file `wfc` (a Python zip application). `tests/test_wfc.py` covers the build.
 - `router.py`: the dispatcher (Python standard library only). `tests/test_router.py` covers it through its command line.
-- `ctl.py`: the controller's routine checks between rounds (snapshot checks with real exit codes, candidate read-back, transcribing an offline reviewer's record, label switch). `tests/test_ctl.py` covers it with real git and a fake `gh`.
-- `skills/surper-coding`: the controller skill that uses `wfc`. For development, link it instead of installing: `ln -s "$PWD/skills/surper-coding" ~/.claude/skills/surper-coding`.
-- `skills/ai-coding`, `skills/live-verify`: pinned copies of the prototypes `surper-coding` builds on; see [skills/VENDORED.md](skills/VENDORED.md).
-- `docs/decision-log.md`: user decisions, controller decisions and lessons; `docs/probes-*.md`: host capability probes behind the design.
+- `wfc.py`: the single command; `build.py` packs it with `router.py` into the one-file `wfc` (a Python zip application). `tests/test_wfc.py` covers the build.
+- `docs/decision-log.md`: user decisions, controller decisions and lessons; `docs/probes-*.md`: host capability probes behind the design. These also record the design of the `surper-coding` skill.
 
 ## Usage
 
@@ -45,8 +41,6 @@ wfc reply <question-id> "<answer>"
 wfc continue <dispatch> --task <next-task.md> --report <next-report.md>   # next round in the same session (report in the same dir)
 wfc resume <dispatch> [--task <next-task.md> --report <next-report.md>]   # session ended: relaunch into its own conversation; --task only after done
 wfc relay --codex-thread <session-uuid> --detach [--stall-after 300]   # Codex controller: push messages into its session instead of `wait`; prints the pid
-wfc checks | candidate | transcribe | label …   # routine checks between rounds; see skills/surper-coding/references/router.md
-wfc install-skills                               # install the bundled skills
 
 # worker (the dispatch brief tells it these exact commands)
 wfc done --report <report.md>

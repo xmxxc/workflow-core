@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Build the single-file `wfc` command: a Python zip application with router.py, ctl.py, wfc.py
-and the bundled skills. It needs only python3 (3.9+) and, at run time, tmux.
+"""Build the single-file `wfc` command: a Python zip application with router.py and wfc.py.
+It needs only python3 (3.9+) and, at run time, tmux.
 
   python3 build.py [--out dist/wfc]
 """
@@ -12,8 +12,7 @@ import zipapp
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-MODULES = ("router.py", "ctl.py", "wfc.py")
-SKILLS = ("surper-coding", "ai-coding", "live-verify")
+MODULES = ("router.py", "wfc.py")
 
 
 def build(out):
@@ -23,8 +22,6 @@ def build(out):
         for module in MODULES:
             shutil.copy2(ROOT / module, staging / module)
         (staging / "__main__.py").write_text("import sys\nimport wfc\n\nsys.exit(wfc.main())\n")
-        for skill in SKILLS:
-            shutil.copytree(ROOT / "skills" / skill, staging / "skills" / skill)
         out.parent.mkdir(parents=True, exist_ok=True)
         zipapp.create_archive(staging, out, interpreter="/usr/bin/env python3", compressed=True)
     out.chmod(0o755)
