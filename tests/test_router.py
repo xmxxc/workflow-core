@@ -1256,6 +1256,8 @@ class OpenCodeRelay(unittest.TestCase):
                 body = self.rfile.read(int(self.headers["Content-Length"]))
                 test.posts.append((self.path, json.loads(body)))
                 self.send_response(test.status)
+                if getattr(test, "location", None):
+                    self.send_header("Location", test.location)
                 self.end_headers()
 
             def log_message(self, *args):
@@ -1295,6 +1297,20 @@ class OpenCodeRelay(unittest.TestCase):
 
     def test_an_error_answer_is_logged_as_uncertain_and_not_retried(self):
         self.status = 500
+        self.env.run("done", "--report", str(self.env.report), dispatch=self.dispatch)
+
+        result = self.relay(seconds="2")
+
+        self.assertEqual(len(self.posts), 1)
+        self.assertIn("uncertain", result.stdout)
+        self.assertEqual(self.env.json("wait", "--timeout", "0.5")["messages"], [])
+
+    def test_a_redirect_is_not_followed_and_counts_as_uncertain(self):
+        # The first endpoint may already have taken the POST; following a redirect could resend it
+        # or mistake an unrelated answer for delivery.
+        closed = socket_free_port()
+        self.status = 302
+        self.location = f"http://127.0.0.1:{closed}/elsewhere"
         self.env.run("done", "--report", str(self.env.report), dispatch=self.dispatch)
 
         result = self.relay(seconds="2")

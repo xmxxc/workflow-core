@@ -681,6 +681,17 @@ def queue_into_codex(thread, messages):
     return "delivered"
 
 
+class _KeepRedirects(urllib.request.HTTPRedirectHandler):
+    """Report a redirect as the HTTPError it is: the first endpoint may already have taken the POST,
+    so following it could resend the batch or take an unrelated answer for delivery."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+NO_REDIRECTS = urllib.request.build_opener(_KeepRedirects)
+
+
 def post_into_opencode(url, session, messages):
     """Deliver one batch as a new turn of an OpenCode controller session through its HTTP API
     (the TUI or `opencode serve` started with a fixed --port). Same outcomes as queue_into_codex:
@@ -692,7 +703,7 @@ def post_into_opencode(url, session, messages):
                                      data=json.dumps({"parts": [{"type": "text", "text": text}]}).encode(),
                                      headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(request, timeout=float(os.environ.get("WFC_QUEUE_TIMEOUT", 60))):
+        with NO_REDIRECTS.open(request, timeout=float(os.environ.get("WFC_QUEUE_TIMEOUT", 60))):
             return "delivered"
     except urllib.error.HTTPError as err:
         reason = f"OpenCode answered {err.code}"
