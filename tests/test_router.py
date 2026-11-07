@@ -253,13 +253,15 @@ class Replies(unittest.TestCase):
         self.assertNotEqual(second.returncode, 0)
         self.assertEqual(len(self.sends()), 2)  # text + Enter of the first reply only
 
-    def test_undeliverable_reply_fails_cleanly_and_can_be_retried(self):
+    def test_a_failed_text_send_to_a_live_session_fails_cleanly_and_is_not_retried(self):
+        # The session is still there, so the text may have arrived: retrying could double the answer.
         failed = self.env.run("reply", str(self.question["id"]), "blue", env={"FAKE_FAIL": "send-keys"})
         retried = self.env.run("reply", str(self.question["id"]), "blue")
 
         self.assertNotEqual(failed.returncode, 0)
         self.assertNotIn("Traceback", failed.stderr)
-        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertIn("may or may not", failed.stderr)
+        self.assertNotEqual(retried.returncode, 0)
 
     def test_multi_line_answer_is_typed_as_one_line(self):
         self.env.run("reply", str(self.question["id"]), "blue\nand keep the tests")
@@ -918,15 +920,76 @@ class PartialTyping(unittest.TestCase):
         texts = [c for c in self.env.host_calls() if c[:2] == ["tmux", "send-keys"] and "-l" in c]
         self.assertEqual(len(texts), 1)
 
+    def test_a_reply_whose_text_send_was_interrupted_is_not_typed_again(self):
+        # send-keys was killed after handing the text over: a non-zero exit is not proof it did not arrive.
+        fake = self.env.bin / "tmux"
+        fake.write_text(fake.read_text().replace(
+            "if os.environ.get('FAKE_FAIL') == sys.argv[1]:",
+            "kflag = os.path.join(os.path.dirname(sys.argv[0]), '.text-killed')\n"
+            "if sys.argv[1] == 'send-keys' and '-l' in sys.argv and os.environ.get('FAKE_TEXT_KILL') and not os.path.exists(kflag):\n"
+            "    open(kflag, 'w').close()\n"
+            "    import signal; os.kill(os.getpid(), signal.SIGTERM)\n"
+            "if os.environ.get('FAKE_FAIL') == sys.argv[1]:", 1))
+        dispatch = self.env.dispatch()
+        question = self.env.json("ask", "Red or blue?", dispatch=dispatch)["message"]
+        env = {"FAKE_TEXT_KILL": "1"}
+
+        first = self.env.run("reply", str(question), "blue", env=env)
+        second = self.env.run("reply", str(question), "blue", env=env)
+
+        self.assertNotEqual(first.returncode, 0)
+        self.assertIn("may or may not", first.stderr)
+        self.assertNotEqual(second.returncode, 0)
+        texts = [c for c in self.env.host_calls() if c[:2] == ["tmux", "send-keys"] and "-l" in c]
+        self.assertEqual(len(texts), 1)
+
     def test_a_reply_whose_text_never_arrived_can_be_retried(self):
         dispatch = self.env.dispatch()
         question = self.env.json("ask", "Red or blue?", dispatch=dispatch)["message"]
 
+        # The session is gone, so the text certainly did not arrive; once it is back, the reply can go.
+        session_file = self.env.sessions / f"wfc-{dispatch}"
+        session_file.rename(session_file.with_suffix(".away"))
         first = self.env.run("reply", str(question), "blue", env={"FAKE_FAIL": "send-keys"})
+        session_file.with_suffix(".away").rename(session_file)
         second = self.env.run("reply", str(question), "blue")
 
         self.assertNotEqual(first.returncode, 0)
         self.assertEqual(second.returncode, 0, second.stderr)
+
+
+class ResumePartialTyping(unittest.TestCase):
+    def test_an_opencode_resume_whose_enter_failed_still_records_the_new_task(self):
+        env = Env()
+        self.addCleanup(env.close)
+        fake = env.bin / "tmux"
+        fake.write_text(fake.read_text().replace(
+            "if os.environ.get('FAKE_FAIL') == sys.argv[1]:",
+            "flag = os.path.join(os.path.dirname(sys.argv[0]), '.enter-failed')\n"
+            "if sys.argv[1] == 'send-keys' and sys.argv[-1] == 'Enter' and os.environ.get('FAKE_ENTER_FAIL') and not os.path.exists(flag):\n"
+            "    open(flag, 'w').close()\n"
+            "    sys.exit(1)\n"
+            "if os.environ.get('FAKE_FAIL') == sys.argv[1]:", 1))
+        dispatch = env.dispatch("opencode", extra_args=("--model", "m"))
+        Resume.opencode_session(type("R", (), {"env": env})(), dispatch, "ses_main")
+        env.report.write_text("# r1\n")
+        env.run("done", "--report", str(env.report), dispatch=dispatch)
+        env.end_session(dispatch)
+        task2 = env.task.with_name("113-impl-r2.md")
+        task2.write_text("# r2\n")
+        report2 = env.report.with_name("r2.md")
+        env.screen.write_text("> ready\n")
+        screen = {"FAKE_SCREEN": str(env.screen)}
+
+        first = env.run("resume", dispatch, "--task", str(task2), "--report", str(report2),
+                        env={**screen, "FAKE_ENTER_FAIL": "1"}, timeout=20)
+        env.end_session(dispatch)
+        second = env.run("resume", dispatch, env=screen, timeout=20)
+
+        self.assertNotEqual(first.returncode, 0)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        typed = [c[-1] for c in env.host_calls() if c[:2] == ["tmux", "send-keys"] and "-l" in c]
+        self.assertIn(str(report2), typed[-1])
 
 
 class RelayUncertainDelivery(unittest.TestCase):

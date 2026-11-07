@@ -329,22 +329,29 @@ def cmd_ask(args):
     emit({"message": message_id, "next": "End your turn now; the answer arrives as your next message."})
 
 
-SENT, NOT_SENT, PARTIAL = "sent", "not-sent", "partial"
+SENT, NOT_SENT, UNCERTAIN, PARTIAL = "sent", "not-sent", "uncertain", "partial"
 
 
 def type_into(session, text):
-    """Type one line into a TUI and submit it. Returns SENT; NOT_SENT when tmux took nothing
-    (safe to type again); or PARTIAL when the text arrived but its Enter was not confirmed, so
-    typing it again would double the line: someone has to look at the session."""
-    if tmux("send-keys", "-t", session, "-l", text).returncode != 0:
-        return NOT_SENT
+    """Type one line into a TUI and submit it. Returns
+    SENT;
+    NOT_SENT when the text certainly did not arrive (tmux could not run, or the session is gone):
+      safe to type again;
+    UNCERTAIN when the text command ran but failed (it may have been killed after handing over);
+    PARTIAL when the text arrived but its Enter was not confirmed.
+    After UNCERTAIN or PARTIAL, typing again could double the line: someone has to look."""
+    sent = tmux("send-keys", "-t", session, "-l", text)
+    if sent.returncode != 0:
+        return NOT_SENT if sent.returncode == 127 or not session_alive(session) else UNCERTAIN
     time.sleep(0.5)  # TUIs drop an Enter that arrives in the same burst as the text
     return SENT if tmux("send-keys", "-t", session, "Enter").returncode == 0 else PARTIAL
 
 
-def partial_typing_error(session, what):
-    return SystemExit(f"{what} was typed into tmux session {session} but its Enter was not confirmed. "
-                      f"Attach (tmux attach -t {session}) and press Enter or clear the line; do not send it again.")
+def typing_error(session, what, typed):
+    state = ("may or may not have reached" if typed == UNCERTAIN
+             else "was typed into, but its Enter was not confirmed in,")
+    return SystemExit(f"{what} {state} tmux session {session}. Attach (tmux attach -t {session}), check the input "
+                      f"line, and press Enter or clear it yourself; do not send it again.")
 
 
 def cmd_reply(args):
@@ -366,8 +373,8 @@ def cmd_reply(args):
     if typed == NOT_SENT:
         db.execute("DELETE FROM message WHERE id = ?", (reply_id,))
         raise SystemExit(f"could not type the answer into tmux session {session}; is the worker still running?")
-    if typed == PARTIAL:
-        raise partial_typing_error(session, f"The answer to question {question['id']}")  # the claim stays
+    if typed in (PARTIAL, UNCERTAIN):
+        raise typing_error(session, f"The answer to question {question['id']}", typed)  # the claim stays
     emit({"replied": question["id"], "dispatch": question["dispatch"]})
 
 
@@ -395,9 +402,9 @@ def cmd_continue(args):
     if typed == NOT_SENT:
         db.execute("DELETE FROM message WHERE id = ?", (message_id,))
         raise SystemExit(f"could not type the next task into tmux session {session}")
-    if typed == PARTIAL:
+    if typed in (PARTIAL, UNCERTAIN):
         db.execute("UPDATE dispatch SET task = ?, report = ? WHERE id = ?", (str(task), str(report), args.dispatch))
-        raise partial_typing_error(session, "The next task")
+        raise typing_error(session, "The next task", typed)
     db.execute("UPDATE dispatch SET task = ?, report = ? WHERE id = ?", (str(task), str(report), args.dispatch))
     emit({"continued": args.dispatch, "message": message_id})
 
@@ -447,16 +454,17 @@ def cmd_resume(args):
     if not launch(args.dispatch, row["cwd"], command, extra_env):
         db.execute("ROLLBACK")
         raise SystemExit(f"could not start tmux session {session}")
+    # The session now runs this task: record it with the launch, before typing can fail.
+    db.execute("UPDATE dispatch SET task = ?, report = ?, host_session = ? WHERE id = ?",
+               (str(task), str(report), host_session, args.dispatch))
     db.execute("COMMIT")
     if row["host"] == "opencode":
         brief = worker_brief(args.dispatch, task, report, opening=opening)
         typed = type_into(session, brief) if wait_for_quiet_screen(session) else NOT_SENT
-        if typed == PARTIAL:
-            raise partial_typing_error(session, "The brief")
+        if typed in (PARTIAL, UNCERTAIN):
+            raise typing_error(session, "The brief", typed)
         if typed == NOT_SENT:
             raise SystemExit(f"resumed {session} but could not type the brief into it; attach and paste it: {brief}")
-    db.execute("UPDATE dispatch SET task = ?, report = ?, host_session = ? WHERE id = ?",
-               (str(task), str(report), host_session, args.dispatch))
     emit({"resumed": args.dispatch, "session": host_session, "tmux": session})
 
 
