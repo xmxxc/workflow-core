@@ -13,6 +13,7 @@ printed. Uses git and gh; Python standard library only.
 """
 
 import argparse
+import fcntl
 import json
 import re
 import socket
@@ -43,7 +44,16 @@ def gh(*args):
 
 
 def cmd_checks(args):
+    """Hold the snapshot for the whole run, so a parallel `checks` cannot move it to another head
+    while this one checks. The lock lives in the snapshot's git directory, outside the work tree."""
     cwd = Path(args.cwd)
+    git_dir = Path(git(cwd, "rev-parse", "--absolute-git-dir").stdout.strip())
+    with open(git_dir / "wfc-checks.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return run_checks(args, cwd)
+
+
+def run_checks(args, cwd):
     # Untracked files count too: they would be checked as if they were part of the recorded tree.
     if git(cwd, "status", "--porcelain").stdout.strip():
         raise SystemExit(f"{cwd} has local changes or untracked files; a review snapshot must stay read-only")

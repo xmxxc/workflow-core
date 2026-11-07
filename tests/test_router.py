@@ -1097,5 +1097,101 @@ class ParallelState(unittest.TestCase):
         self.assertEqual(len(texts), 1)
 
 
+
+class RoundIdentity(unittest.TestCase):
+    """W12, W14, W15 from the 2026-11-07 round-6 review."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+
+    def test_a_retried_done_from_an_earlier_round_does_not_finish_the_current_one(self):
+        dispatch = self.env.dispatch()
+        self.env.report.write_text("# r1\n")
+        self.env.run("done", "--report", str(self.env.report), dispatch=dispatch)
+        self.env.json("wait", "--timeout", "1")
+        task2 = self.env.task.with_name("r2.md")
+        task2.write_text("# r2\n")
+        self.env.json("continue", dispatch, "--task", str(task2), "--report", str(self.env.report.with_name("r2.md")))
+
+        stale = self.env.run("done", "--report", str(self.env.report), dispatch=dispatch)
+
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertIn("earlier round", stale.stderr)
+        self.assertEqual(self.env.json("wait", "--timeout", "0.5")["messages"], [])
+
+    def test_a_resume_decided_on_a_stale_view_does_not_relaunch_a_finished_task(self):
+        import concurrent.futures
+        dispatch = self.env.dispatch("codex")
+        Resume.codex_rollout(type("R", (), {"env": self.env})(), dispatch, "main-session")
+        self.env.end_session(dispatch)
+        root = self.env.bin.parent / "blocked-home" / "sessions"
+        root.mkdir(parents=True)
+        fifo = root / "rollout-blocked.jsonl"
+        os.mkfifo(fifo)
+        text = f"You are a worker dispatched by the controller (dispatch {dispatch}). Read ..."
+        payload = (json.dumps({"type": "session_meta", "payload": {"id": "main-session", "source": "cli"}}) + "\n"
+                   + json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user",
+                                 "content": [{"type": "input_text", "text": text}]}}) + "\n")
+        fd = None
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            # This resume blocks while it looks up the conversation, after deciding what to do.
+            delayed = pool.submit(lambda: self.env.run("resume", dispatch, env={"CODEX_HOME": str(root.parent)},
+                                                       timeout=20))
+            for _ in range(500):
+                try:
+                    fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+                    break
+                except OSError:
+                    time.sleep(0.01)
+            self.env.json("resume", dispatch)
+            self.env.report.write_text("# done\n")
+            self.env.run("done", "--report", str(self.env.report), dispatch=dispatch)
+            self.env.end_session(dispatch)
+            os.write(fd, payload.encode())
+            os.close(fd)
+            late = delayed.result()
+
+        self.assertNotEqual(late.returncode, 0)
+        self.assertEqual(len([c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]]), 2)
+
+    def unconfirmed_new_session(self):
+        fake = self.env.bin / "tmux"
+        fake.write_text(fake.read_text() + (
+            "if sys.argv[1] == 'new-session' and os.environ.get('FAKE_LAUNCH_KILL'):\n"
+            "    import signal; os.kill(os.getpid(), signal.SIGTERM)\n"))
+
+    def test_a_dispatch_whose_launch_was_not_confirmed_keeps_its_record(self):
+        self.unconfirmed_new_session()
+
+        result = self.env.run("dispatch", "--host", "codex", "--task", str(self.env.task), "--cwd",
+                              str(self.env.cwd), "--report", str(self.env.report), env={"FAKE_LAUNCH_KILL": "1"})
+
+        self.assertNotEqual(result.returncode, 0)
+        [dispatch] = [line.split()[-1].strip(".;") for line in result.stderr.split() if line.startswith("d-")] or [None]
+        self.assertIsNotNone(dispatch, result.stderr)
+        self.env.report.write_text("# r1\n")
+        done = self.env.run("done", "--report", str(self.env.report), dispatch=dispatch)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_a_resume_whose_launch_was_not_confirmed_keeps_the_new_round(self):
+        dispatch = self.env.dispatch("claude")
+        self.env.report.write_text("# r1\n")
+        self.env.run("done", "--report", str(self.env.report), dispatch=dispatch)
+        self.env.end_session(dispatch)
+        self.unconfirmed_new_session()
+        task2 = self.env.task.with_name("r2.md")
+        task2.write_text("# r2\n")
+        report2 = self.env.report.with_name("r2.md")
+
+        result = self.env.run("resume", dispatch, "--task", str(task2), "--report", str(report2),
+                              env={"FAKE_LAUNCH_KILL": "1"})
+        report2.write_text("# r2\n")
+        done = self.env.run("done", "--report", str(report2), dispatch=dispatch)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

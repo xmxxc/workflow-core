@@ -148,8 +148,9 @@ def find_host_session(row):
         for rollout in sorted(root.rglob("rollout-*.jsonl")) if root.is_dir() else []:
             if rollout.stat().st_mtime < (row["created"] or 0) - 60:
                 continue  # last written before this dispatch existed
-            if codex_rollout_opens_with(rollout, opening):
-                return codex_rollout_opens_with(rollout, opening)
+            found = codex_rollout_opens_with(rollout, opening)
+            if found:
+                return found
         return None
     if row["host"] == "opencode":
         default = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "opencode/opencode.db"
@@ -272,21 +273,31 @@ def cmd_dispatch(args):
                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                (dispatch_id, args.host, str(cwd), str(task), time.time(), str(report.parent), str(report),
                 args.model, host_session))
-    if not launch(dispatch_id, cwd, command, extra_env):
+    launched = launch(dispatch_id, cwd, command, extra_env)
+    if launched == NOT_SENT:
         db.execute("DELETE FROM dispatch WHERE id = ?", (dispatch_id,))
         raise SystemExit("could not start the worker's tmux session; is tmux installed and on PATH?")
     db.execute("UPDATE dispatch SET started = ? WHERE id = ?", (time.time(), dispatch_id))
+    if launched == UNCERTAIN:
+        # Keep the record: a live worker must still be able to report. The watchdog reports
+        # `exited` if no session is there.
+        raise SystemExit(f"tmux did not confirm the worker's session for dispatch {dispatch_id}; it is kept. "
+                         f"Check `tmux ls`; `wait` reports it exited if it never started.")
     emit({"dispatch": dispatch_id, "host": args.host, "tmux": session_name(dispatch_id),
           **({"trustedBy": trusted_by} if trusted_by else {})})
 
 
 def launch(dispatch_id, cwd, command, extra_env):
+    """Start the worker's tmux session. Returns SENT, NOT_SENT (nothing started) or UNCERTAIN
+    (tmux ran but did not confirm: a session may exist)."""
     env = {"WFC_DISPATCH": dispatch_id, "WFC_STATE": str(state_dir()), **extra_env}
     started = tmux("new-session", "-d", "-s", session_name(dispatch_id), "-c", str(cwd),
                    *[arg for k, v in env.items() for arg in ("-e", f"{k}={v}")], *command)
-    if started.returncode != 0:
-        print(f"router: tmux new-session failed (exit {started.returncode}): {started.stderr.strip()}", file=sys.stderr)
-    return started.returncode == 0
+    if started.returncode == 0:
+        return SENT
+    print(f"router: tmux new-session failed (exit {started.returncode}): {started.stderr.strip()}", file=sys.stderr)
+    # Like typing: only a tmux that could not run at all certainly started nothing.
+    return NOT_SENT if getattr(started, "not_run", False) else UNCERTAIN
 
 
 def wait_for_quiet_screen(session, timeout=30):
@@ -324,7 +335,15 @@ def cmd_done(args):
     if not report.is_file():
         raise SystemExit(f"report not found: {report}")
     db = connect()
-    message_id = post(db, current_dispatch(db), "controller", "done", {"report": str(report)})
+    dispatch_id = current_dispatch(db)
+    db.execute("BEGIN IMMEDIATE")
+    current = db.execute("SELECT report FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()["report"]
+    # A retried `done` from an earlier round must not finish the round that followed it.
+    if current and str(report) != current:
+        db.execute("ROLLBACK")
+        raise SystemExit(f"{report} is the report of an earlier round; the current round reports to {current}")
+    message_id = post(db, dispatch_id, "controller", "done", {"report": str(report)})
+    db.execute("COMMIT")
     emit({"message": message_id})
 
 
@@ -432,6 +451,7 @@ def cmd_resume(args):
     row = db.execute("SELECT * FROM dispatch WHERE id = ? AND started IS NOT NULL", (args.dispatch,)).fetchone()
     if row is None:
         raise SystemExit(f"unknown dispatch {args.dispatch} in {state_dir()}")
+    mark = round_mark(db, args.dispatch)
     session = session_name(args.dispatch)
     if session_alive(session):
         raise SystemExit(f"tmux session {session} is still running; use `continue` or attach to it")
@@ -463,17 +483,27 @@ def cmd_resume(args):
     # Posted before launch so the new session's `done` sorts after it, and under the write lock the
     # watchdog also takes, so it cannot report the not-yet-started session as exited in between.
     db.execute("BEGIN IMMEDIATE")
+    # Everything above was decided without the lock: give up if the round moved on meanwhile
+    # (another resume, a continue, a done) or a session came back.
+    if round_mark(db, args.dispatch) != mark or session_alive(session):
+        db.execute("ROLLBACK")
+        raise SystemExit(f"dispatch {args.dispatch} changed while resuming (another resume, continue or done); "
+                         f"look at its state and run resume again if it is still needed")
     post(db, args.dispatch, "worker", "resumed", {"session": host_session})
     if args.task:
         post(db, args.dispatch, "worker", "continue", {"task": str(task), "report": str(report)})
     db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
-    if not launch(args.dispatch, row["cwd"], command, extra_env):
+    launched = launch(args.dispatch, row["cwd"], command, extra_env)
+    if launched == NOT_SENT:
         db.execute("ROLLBACK")
         raise SystemExit(f"could not start tmux session {session}")
-    # The session now runs this task: record it with the launch, before typing can fail.
+    # The session (possibly) runs this task: record it with the launch, before typing can fail.
     db.execute("UPDATE dispatch SET task = ?, report = ?, host_session = ? WHERE id = ?",
                (str(task), str(report), host_session, args.dispatch))
     db.execute("COMMIT")
+    if launched == UNCERTAIN:
+        raise SystemExit(f"tmux did not confirm {session}; the resumed round is recorded. Check `tmux ls`; "
+                         f"`wait` reports it exited if it never started.")
     if row["host"] == "opencode":
         brief = worker_brief(args.dispatch, task, report, opening=opening)
         typed = type_into(session, brief) if wait_for_quiet_screen(session) else NOT_SENT
@@ -495,6 +525,12 @@ def take_controller_messages(db):
 def answered(db, question_id):
     return db.execute("SELECT 1 FROM message WHERE type = 'reply' AND json_extract(body, '$.to') = ?",
                       (question_id,)).fetchone() is not None
+
+
+def round_mark(db, dispatch_id):
+    """The latest event that moves a dispatch's round on; a change means the round moved."""
+    return db.execute("SELECT MAX(id) FROM message WHERE dispatch = ? AND type IN ('continue', 'resumed', 'done')",
+                      (dispatch_id,)).fetchone()[0]
 
 
 def done_current_task(db, dispatch_id):

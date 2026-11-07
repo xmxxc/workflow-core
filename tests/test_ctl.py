@@ -230,6 +230,35 @@ class Checks(unittest.TestCase):
 
         self.assertIn("log\nsummary\n## exit=0", self.log.read_text())
 
+    def test_parallel_checks_on_one_snapshot_each_check_their_own_head(self):
+        import concurrent.futures
+        import shlex
+        import time
+        a = self.env.commit("a.txt", "alpha\n", "alpha")
+        b = self.env.commit("a.txt", "beta\n", "beta")
+        self.env.push()
+        marker, release = self.env.root / "ready", self.env.root / "release"
+        check = self.env.root / "check.py"
+        check.write_text("from pathlib import Path\nimport time\n"
+                         f"Path({str(marker)!r}).touch()\n"
+                         f"while not Path({str(release)!r}).exists(): time.sleep(.01)\n"
+                         "assert Path('a.txt').read_text().strip() == 'alpha'\n")
+        command = f"{shlex.quote(sys.executable)} {shlex.quote(str(check))}"
+        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+            first = pool.submit(self.env.run, "checks", "--cwd", str(self.snapshot), "--head", a, "--log",
+                                str(self.env.root / "a.log"), "--cmd", command)
+            for _ in range(1000):
+                if marker.exists():
+                    break
+                time.sleep(0.01)
+            second = pool.submit(self.env.run, "checks", "--cwd", str(self.snapshot), "--head", b, "--log",
+                                 str(self.env.root / "b.log"), "--cmd", "grep -q beta a.txt")
+            time.sleep(1)
+            release.touch()
+            results = [first.result(), second.result()]
+
+        self.assertEqual([r.returncode for r in results], [0, 0], [r.stdout for r in results])
+
     def test_a_snapshot_with_an_untracked_file_is_not_used(self):
         (self.snapshot / "extra.ts").write_text("export {}\n")
 
