@@ -8,6 +8,7 @@ SQLite database under $WFC_STATE (default ~/.local/state/workflow-core).
 """
 
 import argparse
+import fcntl
 import json
 import os
 import shlex
@@ -24,6 +25,18 @@ TIMED_OUT = 3
 
 def state_dir():
     return Path(os.environ.get("WFC_STATE") or Path.home() / ".local/state/workflow-core").expanduser().resolve()
+
+
+def tmux(*args):
+    """Run a tmux command; a missing tmux reads as a failed command (exit 127), not a traceback."""
+    try:
+        return subprocess.run(["tmux", *args], capture_output=True, text=True)
+    except OSError as err:
+        return subprocess.CompletedProcess(["tmux", *args], 127, "", f"cannot run tmux: {err}")
+
+
+def session_alive(session):
+    return tmux("has-session", "-t", session).returncode == 0
 
 
 def session_name(dispatch_id):
@@ -184,6 +197,22 @@ def trust_claude_worktree(cwd):
     A running Claude Code session rewrites this file from memory, so the new entry can be lost
     to a concurrent save; the worker then stops on the trust prompt and is reported `stalled`."""
     path = claude_config().resolve()  # write through a symlinked config to its real file
+    if not path.exists():
+        return None
+    # Serialise the router's own read-modify-write, so parallel dispatches keep each other's entries.
+    try:
+        lock = os.open(path.with_name(f".{path.name}.wfc.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as err:
+        print(f"router: not pre-trusting {cwd}: cannot lock {path}: {err}", file=sys.stderr)
+        return None
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _trust_locked(path, cwd)
+    finally:
+        os.close(lock)
+
+
+def _trust_locked(path, cwd):
     try:
         config = json.loads(path.read_text())
         projects = config.setdefault("projects", {})
@@ -203,9 +232,15 @@ def trust_claude_worktree(cwd):
         return None
     projects[str(cwd)] = {**projects.get(str(cwd), {}), "hasTrustDialogAccepted": True}
     tmp = path.with_name(f".{path.name}.wfc-{os.getpid()}.tmp")
+    mode = path.stat().st_mode & 0o777
     try:
-        tmp.write_text(json.dumps(config, indent=2, ensure_ascii=False))
-        os.chmod(tmp, path.stat().st_mode & 0o777)
+        # Created with the config's own mode (fchmod undoes the umask) before any content is written.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        with os.fdopen(fd, "w") as out:
+            os.fchmod(out.fileno(), mode)
+            out.write(json.dumps(config, indent=2, ensure_ascii=False))
+            out.flush()
+            os.fsync(out.fileno())
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
@@ -232,7 +267,7 @@ def cmd_dispatch(args):
                 args.model, host_session))
     if not launch(dispatch_id, cwd, command, extra_env):
         db.execute("DELETE FROM dispatch WHERE id = ?", (dispatch_id,))
-        raise SystemExit("could not start the worker's tmux session")
+        raise SystemExit("could not start the worker's tmux session; is tmux installed and on PATH?")
     db.execute("UPDATE dispatch SET started = ? WHERE id = ?", (time.time(), dispatch_id))
     emit({"dispatch": dispatch_id, "host": args.host, "tmux": session_name(dispatch_id),
           **({"trustedBy": trusted_by} if trusted_by else {})})
@@ -240,9 +275,11 @@ def cmd_dispatch(args):
 
 def launch(dispatch_id, cwd, command, extra_env):
     env = {"WFC_DISPATCH": dispatch_id, "WFC_STATE": str(state_dir()), **extra_env}
-    return subprocess.run(["tmux", "new-session", "-d", "-s", session_name(dispatch_id), "-c", str(cwd),
-                           *[arg for k, v in env.items() for arg in ("-e", f"{k}={v}")],
-                           *command]).returncode == 0
+    started = tmux("new-session", "-d", "-s", session_name(dispatch_id), "-c", str(cwd),
+                   *[arg for k, v in env.items() for arg in ("-e", f"{k}={v}")], *command)
+    if started.returncode != 0:
+        print(f"router: tmux new-session failed (exit {started.returncode}): {started.stderr.strip()}", file=sys.stderr)
+    return started.returncode == 0
 
 
 def wait_for_quiet_screen(session, timeout=30):
@@ -250,7 +287,7 @@ def wait_for_quiet_screen(session, timeout=30):
     same for a second. Returns False if the session ends or never settles."""
     last, deadline = None, time.monotonic() + timeout
     while time.monotonic() < deadline:
-        shot = subprocess.run(["tmux", "capture-pane", "-p", "-t", session], capture_output=True, text=True)
+        shot = tmux("capture-pane", "-p", "-t", session)
         if shot.returncode != 0:
             return False
         if shot.stdout.strip() and shot.stdout == last:
@@ -294,10 +331,10 @@ def cmd_ask(args):
 
 def type_into(session, text):
     """Type one line into a TUI and submit it. Returns False if tmux could not deliver it."""
-    if subprocess.run(["tmux", "send-keys", "-t", session, "-l", text]).returncode != 0:
+    if tmux("send-keys", "-t", session, "-l", text).returncode != 0:
         return False
     time.sleep(0.5)  # TUIs drop an Enter that arrives in the same burst as the text
-    return subprocess.run(["tmux", "send-keys", "-t", session, "Enter"]).returncode == 0
+    return tmux("send-keys", "-t", session, "Enter").returncode == 0
 
 
 def cmd_reply(args):
@@ -305,14 +342,19 @@ def cmd_reply(args):
     question = db.execute("SELECT * FROM message WHERE id = ? AND type = 'question'", (args.message,)).fetchone()
     if question is None:
         raise SystemExit(f"no question with id {args.message}")
-    if answered(db, question["id"]):
-        raise SystemExit(f"question {question['id']} was already answered")
     # A newline would submit a partial answer in the worker's TUI, so the answer travels as one line.
     answer = " ".join(args.answer.splitlines())
+    # Claim the question before typing, so two concurrent replies cannot both type an answer.
+    db.execute("BEGIN IMMEDIATE")
+    if answered(db, question["id"]):
+        db.execute("ROLLBACK")
+        raise SystemExit(f"question {question['id']} was already answered")
+    reply_id = post(db, question["dispatch"], "worker", "reply", {"to": question["id"], "answer": answer})
+    db.execute("COMMIT")
     session = session_name(question["dispatch"])
     if not type_into(session, f"[router] Answer to question {question['id']}: {answer}"):
+        db.execute("DELETE FROM message WHERE id = ?", (reply_id,))
         raise SystemExit(f"could not type the answer into tmux session {session}; is the worker still running?")
-    post(db, question["dispatch"], "worker", "reply", {"to": question["id"], "answer": answer})
     emit({"replied": question["id"], "dispatch": question["dispatch"]})
 
 
@@ -330,7 +372,7 @@ def cmd_continue(args):
     if watched(db, args.dispatch):
         raise SystemExit(f"dispatch {args.dispatch} has not done its current task yet")
     session = session_name(args.dispatch)
-    if subprocess.run(["tmux", "has-session", "-t", session], capture_output=True).returncode != 0:
+    if not session_alive(session):
         raise SystemExit(f"tmux session {session} has ended; dispatch a new worker instead")
     # Record first, so a `done` for the new task can never get an id below its `continue`.
     message_id = post(db, args.dispatch, "worker", "continue", {"task": str(task), "report": str(report)})
@@ -351,7 +393,7 @@ def cmd_resume(args):
     if row is None:
         raise SystemExit(f"unknown dispatch {args.dispatch} in {state_dir()}")
     session = session_name(args.dispatch)
-    if subprocess.run(["tmux", "has-session", "-t", session], capture_output=True).returncode == 0:
+    if session_alive(session):
         raise SystemExit(f"tmux session {session} is still running; use `continue` or attach to it")
     if bool(args.task) != bool(args.report):
         raise SystemExit("give both --task and --report, or neither")
@@ -444,15 +486,16 @@ def check_workers(db, stall_after):
         if not watched(db, dispatch_id):
             continue
         session = session_name(dispatch_id)
-        alive = subprocess.run(["tmux", "has-session", "-t", session], capture_output=True).returncode == 0
-        captured = subprocess.run(["tmux", "capture-pane", "-p", "-t", session],
-                                  capture_output=True, text=True) if alive else None
+        alive = session_alive(session)
+        captured = tmux("capture-pane", "-p", "-t", session) if alive else None
         now = time.time()
         # Decide and post under one write lock, re-checking state a worker's `done` may have changed.
         db.execute("BEGIN IMMEDIATE")
         try:
             if not watched(db, dispatch_id):
                 pass
+            elif not alive and session_alive(session):
+                pass  # a stale sample: `resume` relaunched it while we sampled; look again next pass
             elif not alive:
                 post(db, dispatch_id, "controller", "exited",
                      {"reason": f"tmux session {session} ended without done"})
@@ -496,17 +539,25 @@ def cmd_wait(args):
 
 
 def queue_into_codex(thread, messages):
-    """Deliver one batch as a new turn of the Codex controller session (open or closed)."""
+    """Deliver one batch as a new turn of the Codex controller session (open or closed).
+    Returns "delivered", "failed" (codex did not take it: safe to retry) or "uncertain"
+    (codex may have taken it: not retried, so a batch is never queued twice)."""
     text = "[router] Messages for the controller: " + json.dumps({"messages": messages}, ensure_ascii=False)
+    ids = [m["id"] for m in messages]
     try:
         result = subprocess.run(["codex", "queue", "--thread", thread, "--message", text, "--resume"],
-                                capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.TimeoutExpired) as err:
-        print(f"router relay: codex queue failed: {err}", flush=True)
-        return False
+                                capture_output=True, text=True, timeout=float(os.environ.get("WFC_QUEUE_TIMEOUT", 60)))
+    except OSError as err:
+        print(f"router relay: codex queue could not run: {err}", flush=True)
+        return "failed"
+    except subprocess.TimeoutExpired:
+        print(f"router relay: codex queue timed out; delivery of messages {ids} is uncertain and not retried. "
+              f"Check the controller session; the messages stay in router.db.", flush=True)
+        return "uncertain"
     if result.returncode != 0:
         print(f"router relay: codex queue exited {result.returncode}: {result.stderr.strip()}", flush=True)
-    return result.returncode == 0
+        return "failed"
+    return "delivered"
 
 
 def cmd_relay(args):
@@ -528,7 +579,7 @@ def cmd_relay(args):
     while deadline is None or time.monotonic() < deadline:
         check_workers(db, args.stall_after)
         messages = take_controller_messages(db)
-        if messages and not queue_into_codex(args.codex_thread, messages):
+        if messages and queue_into_codex(args.codex_thread, messages) == "failed":
             # Put the batch back so the next pass, or a `wait`, delivers it.
             db.executemany("UPDATE message SET delivered = 0 WHERE id = ?", [(m["id"],) for m in messages])
             time.sleep(5)

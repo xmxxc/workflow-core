@@ -779,5 +779,132 @@ class Resume(unittest.TestCase):
         self.assertEqual(len(self.launch(dispatch)), 1)
 
 
+
+class Races(unittest.TestCase):
+    """Interleavings found by the 2026-11-07 full review (W1, W2, W4, W7, W8)."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+
+    def pause_has_session(self):
+        """Make the fake tmux's has-session block on a marker and then report "gone",
+        so a test can act while the watchdog holds a stale sample."""
+        fake = self.env.bin / "tmux"
+        fake.write_text(fake.read_text().replace(
+            "    sys.exit(0 if os.path.exists",
+            "    if os.environ.get('WATCH_PAUSE') and not os.path.exists(os.environ['WATCH_PAUSE']):\n"
+            "        open(os.environ['WATCH_PAUSE'], 'w').close()\n"
+            "        while not os.path.exists(os.environ['WATCH_PAUSE'] + '.release'): time.sleep(.01)\n"
+            "        sys.exit(1)\n"
+            "    sys.exit(0 if os.path.exists", 1))
+        return self.env.bin.parent / "paused"
+
+    def test_a_stale_watchdog_sample_does_not_report_a_resumed_worker_as_exited(self):
+        dispatch = self.env.dispatch("claude")
+        self.env.end_session(dispatch)
+        marker = self.pause_has_session()
+        env = {**os.environ, "PATH": f"{self.env.bin}{os.pathsep}{os.environ['PATH']}",
+               "WFC_STATE": str(self.env.state), "WATCH_PAUSE": str(marker)}
+        waiter = subprocess.Popen([sys.executable, str(ROUTER), "wait", "--timeout", "0"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        self.addCleanup(lambda: waiter.poll() is None and waiter.kill())
+        for _ in range(500):
+            if marker.exists():
+                break
+            time.sleep(0.01)
+        self.env.json("resume", dispatch)
+        Path(f"{marker}.release").touch()
+        waiter.communicate(timeout=10)
+
+        db = sqlite3.connect(self.env.state / "router.db")
+        types = [t for (t,) in db.execute("SELECT type FROM message ORDER BY id")]
+        db.close()
+        self.assertEqual(types, ["resumed"])
+        self.env.end_session(dispatch)
+        [exited] = self.env.json("wait", "--timeout", "2", "--stall-after", "60")["messages"]
+        self.assertEqual(exited["type"], "exited")  # the resumed worker is still watched
+
+    def test_two_concurrent_replies_type_exactly_one_answer(self):
+        import concurrent.futures
+        dispatch = self.env.dispatch()
+        question = self.env.json("ask", "Red or blue?", dispatch=dispatch)["message"]
+
+        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+            results = list(pool.map(lambda a: self.env.run("reply", str(question), a), ["blue", "red"]))
+
+        self.assertEqual(sorted(r.returncode for r in results), [0, 1])
+        typed = [c for c in self.env.host_calls() if c[:2] == ["tmux", "send-keys"]]
+        self.assertEqual(len(typed), 2)  # one answer line and its Enter
+
+    def test_parallel_claude_dispatches_keep_every_trust_entry(self):
+        import concurrent.futures
+        root = self.env.bin.parent
+        config = root / "claude.json"
+        config.write_text(json.dumps({"projects": {str(root): {"hasTrustDialogAccepted": True}}}))
+        worktrees = [root / f"wt{i}" for i in range(6)]
+        for wt in worktrees:
+            wt.mkdir()
+        env = {"WFC_CLAUDE_CONFIG": str(config)}
+
+        def dispatch(wt):
+            return self.env.run("dispatch", "--host", "claude", "--task", str(self.env.task), "--cwd", str(wt),
+                                "--report", str(self.env.report), env=env)
+
+        with concurrent.futures.ThreadPoolExecutor(6) as pool:
+            results = list(pool.map(dispatch, worktrees))
+
+        self.assertTrue(all(r.returncode == 0 for r in results), [r.stderr for r in results])
+        projects = json.loads(config.read_text())["projects"]
+        self.assertTrue(all(projects.get(str(wt.resolve()), {}).get("hasTrustDialogAccepted") for wt in worktrees))
+
+    def test_dispatch_without_tmux_fails_cleanly_and_leaves_no_record(self):
+        python_only = self.env.bin.parent / "python-only"
+        python_only.mkdir()
+        (python_only / "python3").symlink_to(sys.executable)
+
+        result = self.env.run("dispatch", "--host", "codex", "--task", str(self.env.task), "--cwd",
+                              str(self.env.cwd), "--report", str(self.env.report), env={"PATH": str(python_only)})
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("tmux", result.stderr)
+        db = sqlite3.connect(self.env.state / "router.db")
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM dispatch").fetchone()[0], 0)
+        db.close()
+
+    def test_wait_without_tmux_reports_instead_of_crashing(self):
+        dispatch = self.env.dispatch()
+        python_only = self.env.bin.parent / "python-only"
+        python_only.mkdir()
+
+        result = self.env.run("wait", "--timeout", "1", env={"PATH": str(python_only)})
+
+        self.assertNotIn("Traceback", result.stderr)
+        [message] = json.loads(result.stdout)["messages"]
+        self.assertEqual((message["type"], message["dispatch"]), ("exited", dispatch))
+
+
+class RelayUncertainDelivery(unittest.TestCase):
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+
+    def test_a_timed_out_queue_is_not_retried(self):
+        fake = self.env.bin / "codex"
+        fake.write_text(fake.read_text() + "if sys.argv[1] == 'queue': time.sleep(5)\n")
+        dispatch = self.env.dispatch()
+        self.env.report.write_text("# r\n")
+        self.env.run("done", "--report", str(self.env.report), dispatch=dispatch)
+
+        result = self.env.run("relay", "--codex-thread", "t-1", "--for", "4", env={"WFC_QUEUE_TIMEOUT": "1"},
+                              timeout=20)
+
+        queued = [c for c in self.env.host_calls() if c[:2] == ["codex", "queue"]]
+        self.assertEqual(len(queued), 1)
+        self.assertIn("uncertain", result.stdout)
+        self.assertEqual(self.env.json("wait", "--timeout", "0.5")["messages"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

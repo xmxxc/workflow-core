@@ -158,6 +158,21 @@ class Candidate(unittest.TestCase):
         self.assertIn("no-secret", self.failed(json.loads(result.stdout)))
         self.assertNotIn("s3cr3t-value", result.stdout + result.stderr)
 
+    def test_a_failing_secret_scan_fails_closed(self):
+        head = self.env.commit("a.txt", "1\n", "one")
+        self.env.push()
+        real_git = subprocess.run(["which", "git"], capture_output=True, text=True).stdout.strip()
+        fake = self.env.bin / "git"
+        fake.write_text(f"#!{sys.executable}\nimport os, sys\n"
+                        f"if 'grep' in sys.argv[1:4]: sys.exit(128)\n"
+                        f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n")
+        fake.chmod(0o755)
+
+        result = self.check(head, ok=False)
+
+        self.assertFalse(result["checks"]["no-secret"]["ok"])
+        self.assertIn("128", result["checks"]["no-secret"]["detail"])
+
     def test_a_closing_keyword_in_a_commit_fails(self):
         head = self.env.commit("a.txt", "1\n", "one")
         self.env.push()
@@ -214,6 +229,15 @@ class Checks(unittest.TestCase):
                       "--cmd", "echo log >&2; echo log >&2; echo summary")
 
         self.assertIn("log\nsummary\n## exit=0", self.log.read_text())
+
+    def test_a_snapshot_with_an_untracked_file_is_not_used(self):
+        (self.snapshot / "extra.ts").write_text("export {}\n")
+
+        result = self.env.run("checks", "--cwd", str(self.snapshot), "--head", self.head, "--log", str(self.log),
+                              "--cmd", "true")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("local changes", result.stderr)
 
     def test_a_snapshot_with_local_changes_is_not_moved(self):
         (self.snapshot / "README.md").write_text("edited\n")

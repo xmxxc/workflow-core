@@ -44,8 +44,9 @@ def gh(*args):
 
 def cmd_checks(args):
     cwd = Path(args.cwd)
-    if git(cwd, "status", "--porcelain", "--untracked-files=no").stdout.strip():
-        raise SystemExit(f"{cwd} has local changes; a review snapshot must stay read-only")
+    # Untracked files count too: they would be checked as if they were part of the recorded tree.
+    if git(cwd, "status", "--porcelain").stdout.strip():
+        raise SystemExit(f"{cwd} has local changes or untracked files; a review snapshot must stay read-only")
     git(cwd, "fetch", "-q", "origin", check=False)  # offline is fine when the head is already here
     git(cwd, "checkout", "-q", "--detach", args.head)
     head = git(cwd, "rev-parse", "HEAD").stdout.strip()
@@ -88,8 +89,10 @@ def cmd_candidate(args):
         value = secret_value(args.secret_file, args.secret_key)
         found = git(repo, "grep", "-l", "-F", "-e", value, head, check=False)
         files = [line.split(":", 1)[-1] for line in found.stdout.splitlines()]
-        checks["no-secret"] = {"ok": found.returncode != 0,
-                               "detail": f"{args.secret_key} value found in: {', '.join(files)}" if files else "not committed"}
+        # git grep: 0 = found, 1 = not found, anything else = the scan itself failed (fail closed).
+        detail = {0: f"{args.secret_key} value found in: {', '.join(files)}", 1: "not committed"}.get(
+            found.returncode, f"git grep failed (exit {found.returncode}); scan not trusted")
+        checks["no-secret"] = {"ok": found.returncode == 1, "detail": detail}
     if args.pr:
         view = gh("pr", "view", str(args.pr), "--repo", args.repo, "--json", "body,commits")
         if view.returncode != 0:
