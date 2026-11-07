@@ -1193,5 +1193,44 @@ class RoundIdentity(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
 
 
+
+class ReportReuse(unittest.TestCase):
+    """W15 (round 7): every round reports to a path the dispatch has never used."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+        self.dispatch = self.env.dispatch("claude")
+        self.env.report.write_text("# r1\n")
+        self.env.run("done", "--report", str(self.env.report), dispatch=self.dispatch)
+        self.task2 = self.env.task.with_name("r2.md")
+        self.task2.write_text("# r2\n")
+
+    def test_continue_refuses_the_report_path_of_the_round_just_done(self):
+        result = self.env.run("continue", self.dispatch, "--task", str(self.task2), "--report", str(self.env.report))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("already used", result.stderr)
+
+    def test_continue_refuses_a_report_path_from_any_earlier_round(self):
+        report2 = self.env.report.with_name("r2.md")
+        self.env.json("continue", self.dispatch, "--task", str(self.task2), "--report", str(report2))
+        report2.write_text("# r2\n")
+        self.env.run("done", "--report", str(report2), dispatch=self.dispatch)
+
+        result = self.env.run("continue", self.dispatch, "--task", str(self.task2), "--report", str(self.env.report))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("already used", result.stderr)
+
+    def test_resume_with_a_task_refuses_a_used_report_path(self):
+        self.env.end_session(self.dispatch)
+
+        result = self.env.run("resume", self.dispatch, "--task", str(self.task2), "--report", str(self.env.report))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("already used", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

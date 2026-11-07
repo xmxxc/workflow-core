@@ -427,6 +427,7 @@ def cmd_continue(args):
     if watched(db, args.dispatch) or not done_current_task(db, args.dispatch):
         db.execute("ROLLBACK")
         raise SystemExit(f"dispatch {args.dispatch} has not done its current task yet")
+    refuse_used_report(db, args.dispatch, report)
     message_id = post(db, args.dispatch, "worker", "continue", {"task": str(task), "report": str(report)})
     db.execute("UPDATE dispatch SET task = ?, report = ? WHERE id = ?", (str(task), str(report), args.dispatch))
     db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
@@ -485,10 +486,16 @@ def cmd_resume(args):
     db.execute("BEGIN IMMEDIATE")
     # Everything above was decided without the lock: give up if the round moved on meanwhile
     # (another resume, a continue, a done) or a session came back.
-    if round_mark(db, args.dispatch) != mark or session_alive(session):
+    # The row read before the lock must still be the current one, as must the round mark: an old
+    # row paired with a newer mark would relaunch the wrong round.
+    now = db.execute("SELECT task, report, host_session FROM dispatch WHERE id = ?", (args.dispatch,)).fetchone()
+    if (round_mark(db, args.dispatch) != mark or session_alive(session)
+            or (now["task"], now["report"], now["host_session"]) != (row["task"], row["report"], row["host_session"])):
         db.execute("ROLLBACK")
         raise SystemExit(f"dispatch {args.dispatch} changed while resuming (another resume, continue or done); "
                          f"look at its state and run resume again if it is still needed")
+    if args.task:
+        refuse_used_report(db, args.dispatch, report)
     post(db, args.dispatch, "worker", "resumed", {"session": host_session})
     if args.task:
         post(db, args.dispatch, "worker", "continue", {"task": str(task), "report": str(report)})
@@ -525,6 +532,23 @@ def take_controller_messages(db):
 def answered(db, question_id):
     return db.execute("SELECT 1 FROM message WHERE type = 'reply' AND json_extract(body, '$.to') = ?",
                       (question_id,)).fetchone() is not None
+
+
+def used_reports(db, dispatch_id):
+    """Every report path this dispatch has been given: its current one and each finished round's.
+    (Every earlier round finished with `done`, since a next round needs one.)"""
+    current = db.execute("SELECT report FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()["report"]
+    finished = {json.loads(r["body"])["report"] for r in
+                db.execute("SELECT body FROM message WHERE dispatch = ? AND type = 'done'", (dispatch_id,))}
+    return finished | ({current} if current else set())
+
+
+def refuse_used_report(db, dispatch_id, report):
+    """A reused report path would let an earlier round's `done` finish the new round."""
+    if str(report) in used_reports(db, dispatch_id):
+        db.execute("ROLLBACK")
+        raise SystemExit(f"{report} was already used by an earlier round of {dispatch_id}; "
+                         f"give each round its own report file (for example r<N>.md)")
 
 
 def round_mark(db, dispatch_id):
