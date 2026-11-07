@@ -428,6 +428,8 @@ def cmd_continue(args):
         db.execute("ROLLBACK")
         raise SystemExit(f"dispatch {args.dispatch} has not done its current task yet")
     refuse_used_report(db, args.dispatch, report)
+    # What this claim replaces, read under the same lock: a failed send restores exactly this.
+    previous = db.execute("SELECT task, report FROM dispatch WHERE id = ?", (args.dispatch,)).fetchone()
     message_id = post(db, args.dispatch, "worker", "continue", {"task": str(task), "report": str(report)})
     db.execute("UPDATE dispatch SET task = ?, report = ? WHERE id = ?", (str(task), str(report), args.dispatch))
     db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
@@ -442,7 +444,7 @@ def cmd_continue(args):
         if round_mark(db, args.dispatch) == message_id and (current["task"], current["report"]) == (str(task), str(report)):
             db.execute("DELETE FROM message WHERE id = ?", (message_id,))
             db.execute("UPDATE dispatch SET task = ?, report = ? WHERE id = ?",
-                       (row["task"], row["report"], args.dispatch))
+                       (previous["task"], previous["report"], args.dispatch))
             db.execute("COMMIT")
             raise SystemExit(f"could not type the next task into tmux session {session}")
         db.execute("COMMIT")
