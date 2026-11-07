@@ -96,7 +96,10 @@ def opencode_command(brief, writable, cwd, model, conversation=None, resume=Fals
     # OpenCode's directory rules are tool prompts, not a sandbox (shell writes bypass them), and
     # git or pnpm reach into ~ constantly, so an unattended worker allows every external directory
     # (user decision 2026-11-05). "*" overrides any narrower rule merged in from the user's config.
-    config = {"permission": {"external_directory": {"*": "allow"}}}
+    # OpenCode asks before reading *.env by default; the user allowed it for these test
+    # environments (decision 2026-11-07), so an unattended worker is not stopped on that prompt.
+    config = {"permission": {"external_directory": {"*": "allow"},
+                             "read": {"*.env": "allow", "*.env.*": "allow"}}}
     models = ["-m", model] if model else []
     # OpenCode ignores --prompt when it reopens a session; `resume` types the brief in instead.
     start = ["-s", conversation] if resume else ["--prompt", brief]

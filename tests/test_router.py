@@ -192,6 +192,8 @@ class Delivery(unittest.TestCase):
         # (shell writes bypass them), and git/pnpm touch ~ constantly, so unattended workers allow all.
         # "*" overrides any narrower rule in the user's own config, which OpenCode merges in.
         self.assertEqual(config["permission"]["external_directory"], {"*": "allow"})
+        # Test environments only (user decision 2026-11-07): .env reads must not stop the worker either.
+        self.assertEqual(config["permission"]["read"], {"*.env": "allow", "*.env.*": "allow"})
         opencode = call[call.index("opencode"):]
         self.assertEqual(opencode[1], str(self.env.cwd))
         self.assertIn("done --report", opencode[opencode.index("--prompt") + 1])
