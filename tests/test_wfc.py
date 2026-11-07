@@ -17,7 +17,7 @@ class Build(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
-        cls.wfc = Path(cls.tmp.name) / "wfc"
+        cls.wfc = Path(cls.tmp.name).resolve() / "wfc"
         subprocess.run([sys.executable, str(ROOT / "build.py"), "--out", str(cls.wfc)], check=True,
                        capture_output=True)
 

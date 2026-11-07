@@ -19,7 +19,7 @@ class Env:
 
     def __init__(self):
         self.tmp = tempfile.TemporaryDirectory()
-        root = Path(self.tmp.name)
+        root = Path(self.tmp.name).resolve()  # macOS: /var is a symlink to /private/var
         self.state = root / "state"
         self.cwd = root / "worktree"
         self.cwd.mkdir()
@@ -600,8 +600,10 @@ class CodexRelay(unittest.TestCase):
         os.kill(pid, 0)  # still running after the launching command returned
         self.assertNotEqual(os.getsid(pid), os.getsid(0))
         self.assertEqual(Path(started["log"]).parent, self.env.state)
-        child_argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
-        self.assertNotIn(b"--detach", child_argv)
+        # `ps` reads a process's arguments on Linux and macOS alike (macOS has no /proc).
+        child_args = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True).stdout
+        self.assertIn("relay", child_args)
+        self.assertNotIn("--detach", child_args)
 
         self.env.run("done", "--report", str(self.env.report), dispatch=self.dispatch)
         deadline = time.monotonic() + 3

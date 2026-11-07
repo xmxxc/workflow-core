@@ -24,7 +24,7 @@ class Workspace:
 
     def __init__(self, controller=None):
         self.tmp = tempfile.TemporaryDirectory()
-        root = Path(self.tmp.name)
+        root = Path(self.tmp.name).resolve()  # macOS: /var is a symlink to /private/var
         self.worker = root / "worktree"
         self.events = root / "events"
         self.report = root / "reports" / "113-impl-r1.md"
