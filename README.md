@@ -24,6 +24,8 @@ Requirements: Linux or macOS (on Windows, use WSL2), python3 (3.9+), tmux, and t
 
 To build `wfc` from a checkout: `python3 build.py` writes `dist/wfc`.
 
+CI (`.github/workflows/ci.yml`) runs the tests and a build on Ubuntu and macOS with Python 3.9 and 3.12 for every push to main and every pull request. Releases (`.github/workflows/release.yml`): set `VERSION` in `wfc.py`, then push a matching tag (`v0.1.0`); the workflow tests, builds `wfc` with its SHA-256 and publishes them as a GitHub Release. Verify a download with `sha256sum -c wfc.sha256`.
+
 ## Layout
 
 - `wfc.py`: the single command; `build.py` packs it with `router.py`, `ctl.py` and `skills/` into the one-file `wfc` (a Python zip application). `tests/test_wfc.py` covers the build.

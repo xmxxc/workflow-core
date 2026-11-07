@@ -1,0 +1,32 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test
+        run: python -m unittest discover -s tests
+      - name: Check the tag matches wfc's version
+        run: |
+          version="$(python -c 'import wfc; print(wfc.VERSION)')"
+          test "v${version}" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != v${version}"; exit 1; }
+      - name: Build
+        run: |
+          python build.py --out dist/wfc
+          dist/wfc --version
+          (cd dist && sha256sum wfc > wfc.sha256)
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/wfc dist/wfc.sha256 --title "wfc ${GITHUB_REF_NAME}" --generate-notes

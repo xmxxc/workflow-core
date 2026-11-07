@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Test
+        # The tests put fake tmux and host CLIs on PATH; no real tmux, Codex, Claude Code or OpenCode is needed.
+        run: python -m unittest discover -s tests -v
+      - name: Build and smoke-test wfc
+        run: |
+          python build.py --out dist/wfc
+          dist/wfc --version
+          dist/wfc --help
