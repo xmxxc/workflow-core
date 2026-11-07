@@ -60,18 +60,22 @@ def connect():
         CREATE TABLE IF NOT EXISTS screen_watch (
             dispatch TEXT PRIMARY KEY, screen TEXT, since REAL, reported_screen TEXT);
     """)
-    # `started` is set once the worker's tmux session exists; the watchdog ignores rows without it.
-    columns = [c["name"] for c in db.execute("PRAGMA table_info(dispatch)")]
-    if "started" not in columns:
-        db.execute("ALTER TABLE dispatch ADD COLUMN started REAL")
-    # `report_dir` is the directory the worker was given write access to at launch.
-    if "report_dir" not in columns:
-        db.execute("ALTER TABLE dispatch ADD COLUMN report_dir TEXT")
-    # What `resume` needs to relaunch a worker into its own conversation: the current report,
-    # the model it was started with, and (Claude Code only, set at dispatch) the host session id.
-    for column in ("report", "model", "host_session"):
-        if column not in columns:
-            db.execute(f"ALTER TABLE dispatch ADD COLUMN {column} TEXT")
+    # Column upgrades: `started` is set once the worker's tmux session exists (the watchdog ignores
+    # rows without it); `report_dir` is the directory the worker may write; `report`, `model` and
+    # `host_session` are what `resume` needs (Claude Code's session id is set at dispatch).
+    # Read and alter under one write lock, so parallel first uses do not add a column twice.
+    wanted = {"started": "REAL", "report_dir": "TEXT", "report": "TEXT", "model": "TEXT", "host_session": "TEXT"}
+    if set(wanted) - {c["name"] for c in db.execute("PRAGMA table_info(dispatch)")}:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            columns = {c["name"] for c in db.execute("PRAGMA table_info(dispatch)")}
+            for column, kind in wanted.items():
+                if column not in columns:
+                    db.execute(f"ALTER TABLE dispatch ADD COLUMN {column} {kind}")
+            db.execute("COMMIT")
+        except BaseException:
+            db.execute("ROLLBACK")
+            raise
     return db
 
 
@@ -397,18 +401,27 @@ def cmd_continue(args):
     session = session_name(args.dispatch)
     if not session_alive(session):
         raise SystemExit(f"tmux session {session} has ended; dispatch a new worker instead")
-    # Record first, so a `done` for the new task can never get an id below its `continue`.
+    # Claim the next round under the write lock, re-checking that the current one is done, so two
+    # concurrent `continue`s cannot both type a task. Recording first also keeps the new task's
+    # `done` above its `continue`.
+    db.execute("BEGIN IMMEDIATE")
+    if watched(db, args.dispatch) or not done_current_task(db, args.dispatch):
+        db.execute("ROLLBACK")
+        raise SystemExit(f"dispatch {args.dispatch} has not done its current task yet")
     message_id = post(db, args.dispatch, "worker", "continue", {"task": str(task), "report": str(report)})
+    db.execute("UPDATE dispatch SET task = ?, report = ? WHERE id = ?", (str(task), str(report), args.dispatch))
     db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
+    db.execute("COMMIT")
     brief = worker_brief(args.dispatch, task, report, opening="[router] New task for you")
     typed = type_into(session, brief)
     if typed == NOT_SENT:
+        db.execute("BEGIN IMMEDIATE")
         db.execute("DELETE FROM message WHERE id = ?", (message_id,))
+        db.execute("UPDATE dispatch SET task = ?, report = ? WHERE id = ?", (row["task"], row["report"], args.dispatch))
+        db.execute("COMMIT")
         raise SystemExit(f"could not type the next task into tmux session {session}")
     if typed in (PARTIAL, UNCERTAIN):
-        db.execute("UPDATE dispatch SET task = ?, report = ? WHERE id = ?", (str(task), str(report), args.dispatch))
         raise typing_error(session, "The next task", typed)
-    db.execute("UPDATE dispatch SET task = ?, report = ? WHERE id = ?", (str(task), str(report), args.dispatch))
     emit({"continued": args.dispatch, "message": message_id})
 
 

@@ -1030,5 +1030,72 @@ class RelayUncertainDelivery(unittest.TestCase):
         self.assertEqual(self.env.json("wait", "--timeout", "0.5")["messages"], [])
 
 
+
+class ParallelState(unittest.TestCase):
+    """W10, W11 from the 2026-11-07 final review: parallel commands on one state database."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+
+    def test_parallel_first_use_of_an_old_state_database_upgrades_it_once(self):
+        import concurrent.futures
+        import threading
+        self.env.state.mkdir()
+        db = sqlite3.connect(self.env.state / "router.db")
+        db.executescript(
+            "CREATE TABLE dispatch(id TEXT PRIMARY KEY, host TEXT, cwd TEXT, task TEXT, created REAL);"
+            "CREATE TABLE message(id INTEGER PRIMARY KEY AUTOINCREMENT, dispatch TEXT, recipient TEXT,"
+            " type TEXT, body TEXT, created REAL, delivered INTEGER DEFAULT 0);"
+            "CREATE TABLE screen_watch(dispatch TEXT PRIMARY KEY, screen TEXT, since REAL, reported_screen TEXT);")
+        db.execute("BEGIN")
+        db.execute("SELECT * FROM dispatch").fetchall()  # a held read lock lines both commands up
+        gate = threading.Barrier(2)
+
+        def dispatch(_):
+            gate.wait()
+            return self.env.run("dispatch", "--host", "codex", "--task", str(self.env.task), "--cwd",
+                                str(self.env.cwd), "--report", str(self.env.report), timeout=40)
+
+        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+            futures = [pool.submit(dispatch, i) for i in range(2)]
+            time.sleep(1)
+            db.rollback()
+            db.close()
+            results = [f.result() for f in futures]
+
+        self.assertEqual([r.returncode for r in results], [0, 0], [r.stderr for r in results])
+
+    def test_two_concurrent_continues_give_the_next_task_once(self):
+        import concurrent.futures
+        dispatch = self.env.dispatch()
+        self.env.report.write_text("# r1\n")
+        self.env.run("done", "--report", str(self.env.report), dispatch=dispatch)
+        barrier = self.env.bin.parent / "barrier"
+        barrier.mkdir()
+        fake = self.env.bin / "tmux"
+        # Both continues pass their has-session check before either records the new round.
+        fake.write_text(fake.read_text().replace(
+            "    sys.exit(0 if os.path.exists",
+            f"    if os.environ.get('CONTINUE_BARRIER'):\n"
+            f"        open(os.path.join({str(barrier)!r}, str(os.getpid())), 'w').close()\n"
+            f"        while len(os.listdir({str(barrier)!r})) < 2: time.sleep(.01)\n"
+            f"    sys.exit(0 if os.path.exists", 1))
+        task = self.env.task.with_name("r2.md")
+        task.write_text("# r2\n")
+        report = self.env.report.with_name("r2.md")
+
+        def next_round(_):
+            return self.env.run("continue", dispatch, "--task", str(task), "--report", str(report),
+                                env={"CONTINUE_BARRIER": "1"}, timeout=20)
+
+        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+            results = list(pool.map(next_round, range(2)))
+
+        self.assertEqual(sorted(r.returncode for r in results), [0, 1])
+        texts = [c for c in self.env.host_calls() if c[:2] == ["tmux", "send-keys"] and "-l" in c]
+        self.assertEqual(len(texts), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
