@@ -329,12 +329,22 @@ def cmd_ask(args):
     emit({"message": message_id, "next": "End your turn now; the answer arrives as your next message."})
 
 
+SENT, NOT_SENT, PARTIAL = "sent", "not-sent", "partial"
+
+
 def type_into(session, text):
-    """Type one line into a TUI and submit it. Returns False if tmux could not deliver it."""
+    """Type one line into a TUI and submit it. Returns SENT; NOT_SENT when tmux took nothing
+    (safe to type again); or PARTIAL when the text arrived but its Enter was not confirmed, so
+    typing it again would double the line: someone has to look at the session."""
     if tmux("send-keys", "-t", session, "-l", text).returncode != 0:
-        return False
+        return NOT_SENT
     time.sleep(0.5)  # TUIs drop an Enter that arrives in the same burst as the text
-    return tmux("send-keys", "-t", session, "Enter").returncode == 0
+    return SENT if tmux("send-keys", "-t", session, "Enter").returncode == 0 else PARTIAL
+
+
+def partial_typing_error(session, what):
+    return SystemExit(f"{what} was typed into tmux session {session} but its Enter was not confirmed. "
+                      f"Attach (tmux attach -t {session}) and press Enter or clear the line; do not send it again.")
 
 
 def cmd_reply(args):
@@ -352,9 +362,12 @@ def cmd_reply(args):
     reply_id = post(db, question["dispatch"], "worker", "reply", {"to": question["id"], "answer": answer})
     db.execute("COMMIT")
     session = session_name(question["dispatch"])
-    if not type_into(session, f"[router] Answer to question {question['id']}: {answer}"):
+    typed = type_into(session, f"[router] Answer to question {question['id']}: {answer}")
+    if typed == NOT_SENT:
         db.execute("DELETE FROM message WHERE id = ?", (reply_id,))
         raise SystemExit(f"could not type the answer into tmux session {session}; is the worker still running?")
+    if typed == PARTIAL:
+        raise partial_typing_error(session, f"The answer to question {question['id']}")  # the claim stays
     emit({"replied": question["id"], "dispatch": question["dispatch"]})
 
 
@@ -378,9 +391,13 @@ def cmd_continue(args):
     message_id = post(db, args.dispatch, "worker", "continue", {"task": str(task), "report": str(report)})
     db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
     brief = worker_brief(args.dispatch, task, report, opening="[router] New task for you")
-    if not type_into(session, brief):
+    typed = type_into(session, brief)
+    if typed == NOT_SENT:
         db.execute("DELETE FROM message WHERE id = ?", (message_id,))
         raise SystemExit(f"could not type the next task into tmux session {session}")
+    if typed == PARTIAL:
+        db.execute("UPDATE dispatch SET task = ?, report = ? WHERE id = ?", (str(task), str(report), args.dispatch))
+        raise partial_typing_error(session, "The next task")
     db.execute("UPDATE dispatch SET task = ?, report = ? WHERE id = ?", (str(task), str(report), args.dispatch))
     emit({"continued": args.dispatch, "message": message_id})
 
@@ -433,7 +450,10 @@ def cmd_resume(args):
     db.execute("COMMIT")
     if row["host"] == "opencode":
         brief = worker_brief(args.dispatch, task, report, opening=opening)
-        if not (wait_for_quiet_screen(session) and type_into(session, brief)):
+        typed = type_into(session, brief) if wait_for_quiet_screen(session) else NOT_SENT
+        if typed == PARTIAL:
+            raise partial_typing_error(session, "The brief")
+        if typed == NOT_SENT:
             raise SystemExit(f"resumed {session} but could not type the brief into it; attach and paste it: {brief}")
     db.execute("UPDATE dispatch SET task = ?, report = ?, host_session = ? WHERE id = ?",
                (str(task), str(report), host_session, args.dispatch))
@@ -540,8 +560,9 @@ def cmd_wait(args):
 
 def queue_into_codex(thread, messages):
     """Deliver one batch as a new turn of the Codex controller session (open or closed).
-    Returns "delivered", "failed" (codex did not take it: safe to retry) or "uncertain"
-    (codex may have taken it: not retried, so a batch is never queued twice)."""
+    Returns "delivered", "failed" (codex could not even start: safe to retry) or "uncertain"
+    (codex ran but did not confirm, e.g. a timeout or a non-zero exit that may follow
+    acceptance: not retried, so a batch is never queued twice)."""
     text = "[router] Messages for the controller: " + json.dumps({"messages": messages}, ensure_ascii=False)
     ids = [m["id"] for m in messages]
     try:
@@ -555,8 +576,10 @@ def queue_into_codex(thread, messages):
               f"Check the controller session; the messages stay in router.db.", flush=True)
         return "uncertain"
     if result.returncode != 0:
-        print(f"router relay: codex queue exited {result.returncode}: {result.stderr.strip()}", flush=True)
-        return "failed"
+        print(f"router relay: codex queue exited {result.returncode}: {result.stderr.strip()}; delivery of "
+              f"messages {ids} is uncertain and not retried. Check the controller session; the messages stay "
+              f"in router.db.", flush=True)
+        return "uncertain"
     return "delivered"
 
 

@@ -558,13 +558,16 @@ class CodexRelay(unittest.TestCase):
         self.assertIn('"type": "done"', message)
         self.assertIn(self.dispatch, message)
 
-    def test_messages_whose_queueing_failed_stay_waiting(self):
+    def test_a_queue_that_exited_non_zero_is_not_retried(self):
+        # A non-zero exit does not prove codex did not take the batch (it may die after accepting),
+        # so the batch is logged as uncertain instead of being queued again.
         self.env.run("done", "--report", str(self.env.report), dispatch=self.dispatch)
 
-        self.relay(env={"FAKE_FAIL": "queue"})
-        [message] = self.env.json("wait", "--timeout", "1")["messages"]
+        result = self.relay(env={"FAKE_FAIL": "queue"})
 
-        self.assertEqual(message["type"], "done")
+        self.assertEqual(len([c for c in self.env.host_calls() if c[:2] == ["codex", "queue"]]), 1)
+        self.assertIn("uncertain", result.stdout)
+        self.assertEqual(self.env.json("wait", "--timeout", "0.5")["messages"], [])
 
     def test_messages_stay_waiting_when_codex_is_not_installed(self):
         self.env.run("done", "--report", str(self.env.report), dispatch=self.dispatch)
@@ -883,6 +886,47 @@ class Races(unittest.TestCase):
         self.assertNotIn("Traceback", result.stderr)
         [message] = json.loads(result.stdout)["messages"]
         self.assertEqual((message["type"], message["dispatch"]), ("exited", dispatch))
+
+
+class PartialTyping(unittest.TestCase):
+    """The answer text reached the TUI but its Enter did not: typing it again would double it."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+        fake = self.env.bin / "tmux"
+        # The first Enter fails; everything else works.
+        fake.write_text(fake.read_text().replace(
+            "if os.environ.get('FAKE_FAIL') == sys.argv[1]:",
+            "flag = os.path.join(os.path.dirname(sys.argv[0]), '.enter-failed')\n"
+            "if sys.argv[1] == 'send-keys' and sys.argv[-1] == 'Enter' and os.environ.get('FAKE_ENTER_FAIL') and not os.path.exists(flag):\n"
+            "    open(flag, 'w').close()\n"
+            "    sys.exit(1)\n"
+            "if os.environ.get('FAKE_FAIL') == sys.argv[1]:", 1))
+
+    def test_a_reply_whose_enter_failed_is_not_typed_again(self):
+        dispatch = self.env.dispatch()
+        question = self.env.json("ask", "Red or blue?", dispatch=dispatch)["message"]
+        env = {"FAKE_ENTER_FAIL": "1"}
+
+        first = self.env.run("reply", str(question), "blue", env=env)
+        second = self.env.run("reply", str(question), "blue", env=env)
+
+        self.assertNotEqual(first.returncode, 0)
+        self.assertIn("attach", first.stderr)
+        self.assertNotEqual(second.returncode, 0)
+        texts = [c for c in self.env.host_calls() if c[:2] == ["tmux", "send-keys"] and "-l" in c]
+        self.assertEqual(len(texts), 1)
+
+    def test_a_reply_whose_text_never_arrived_can_be_retried(self):
+        dispatch = self.env.dispatch()
+        question = self.env.json("ask", "Red or blue?", dispatch=dispatch)["message"]
+
+        first = self.env.run("reply", str(question), "blue", env={"FAKE_FAIL": "send-keys"})
+        second = self.env.run("reply", str(question), "blue")
+
+        self.assertNotEqual(first.returncode, 0)
+        self.assertEqual(second.returncode, 0, second.stderr)
 
 
 class RelayUncertainDelivery(unittest.TestCase):
