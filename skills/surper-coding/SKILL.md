@@ -6,14 +6,14 @@ disable-model-invocation: true
 
 # 开发总控（router 版）
 
-你是本范围唯一的总控。范围、依赖、候选、证据、留痕、标签和放行都按原型 [ai-coding](../ai-coding/SKILL.md) 的规则执行，包括它的"按场景读取"、完成标准和全部 reference。本技能只替换派发方式：所有实施者和审查者都通过 workflow-core 的 router 派发，你在它们工作时睡眠，由它们的消息唤醒。
+你是本范围唯一的总控。范围、依赖、候选、证据、留痕、标签和放行都按原型 [ai-coding](../ai-coding/SKILL.md) 的规则执行，包括它的"按场景读取"、完成标准和全部 reference。本技能只替换派发方式：所有实施者和审查者都通过 `wfc`（workflow-core 的调度器）派发，你在它们工作时睡眠，由它们的消息唤醒。
 
 用户手动调用并指定仓库和范围，授权范围与 ai-coding 相同，worker 的授权见 [router 派发](references/router.md)。正式合并、部署和真实验收另行授权，交给 `live-verify`。
 
 ## 你在哪个宿主
 
-- **Claude Code**：每次派发或回复之后，后台挂一个 `router.py wait`，然后结束当前回复。
-- **Codex**：启动一次 `router.py relay --detach`，消息会作为新的一轮送到你这里。总控会话用 `danger-full-access` 启动。
+- **Claude Code**：每次派发或回复之后，后台挂一个 `wfc wait`，然后结束当前回复。
+- **Codex**：启动一次 `wfc relay --detach`，消息会作为新的一轮送到你这里。总控会话用 `danger-full-access` 启动。
 
 两种做法的具体命令和恢复步骤，都在 [router 派发](references/router.md)。
 

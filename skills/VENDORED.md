@@ -3,7 +3,7 @@
 `ai-coding` and `live-verify` are byte-for-byte copies of the user's skills repository (`/path/to/skills-repo`, commit `9d38b84`). This repository keeps them so that `surper-coding` and its shared rules can be used on their own: `surper-coding` follows the ledger, review, release and label rules of `ai-coding`, and hands formal merge and live acceptance to `live-verify`.
 
 - Do not edit these copies here. Workflow changes go into `surper-coding` (or `router.py`). Changes to the prototypes go to the skills repository first, and then get re-copied here with a new pin.
-- Only `surper-coding` is installed from this repository. `ai-coding` and `live-verify` stay installed from the skills repository, so the two copies never compete for the same skill name.
+- `wfc install-skills` always installs `surper-coding`, and installs `ai-coding` and `live-verify` only where the user has none of their own, so a user's own copies are never replaced and the two never compete for the same skill name.
 - Other skills these depend on (`code-review`, `implement`, `tdd` and so on) come from the skills repository and are prerequisites.
 
 SHA-256 at pin time:

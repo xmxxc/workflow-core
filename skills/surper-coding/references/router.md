@@ -1,10 +1,10 @@
 # router 派发
 
-用 workflow-core 的 `router.py` 把 worker 和审查者派到各自宿主的 tmux 会话里，然后你去睡眠，等它们发来消息再醒。账本、交接、审查、验证和放行的规则见 [ai-coding 的 references](../../ai-coding/references/)。
+用 `wfc` 命令把 worker 和审查者派到各自宿主的 tmux 会话里，然后你去睡眠，等它们发来消息再醒。账本、交接、审查、验证和放行的规则见 [ai-coding 的 references](../../ai-coding/references/)。
 
 ## 前提
 
-- **router 位置**：先用用户本次给的 `router.py` 路径；没给就用账本里记录的；两处都没有，就问用户一次。
+- **wfc 命令**：先运行 `wfc --version` 确认它在 PATH 上，并把版本号记进 `state.md`。如果没有，请用户从 xmxxc/workflow-core 的 Releases 下载 `wfc`，放进 PATH（例如 `~/.local/bin`）。系统要求：Linux 或 macOS（Windows 请用 WSL2），装有 python3 和 tmux。
 - **状态目录**：每个范围用一个独立的 `WFC_STATE`，例如 `~/.local/state/workflow-core/<仓库>-<范围>`。对这个范围执行的每条 router 命令都要带上它，并把它写进 `state.md`。
 - **同一个 tmux 服务**：每个 worker 在名为 `wfc-<dispatch id>` 的 tmux 会话里运行。总控、worker，以及用户执行 `tmux attach` 时，都要连到同一个 tmux 服务（同一个用户、同一个 `TMUX_TMPDIR`）。看门狗找不到会话，就会报 `exited`。
 - **信任**：
@@ -15,7 +15,7 @@
 ## 派发
 
 ```sh
-WFC_STATE=<状态目录> python3 <router.py> dispatch --host <codex|opencode|claude> [--model <模型>] \
+WFC_STATE=<状态目录> wfc dispatch --host <codex|opencode|claude> [--model <模型>] \
   --task <prompts/ 中任务文件的绝对路径> --cwd <工作树> --report <reports/<票>-<角色>/r<N>.md>
 ```
 
@@ -39,22 +39,22 @@ WFC_STATE=<状态目录> python3 <router.py> dispatch --host <codex|opencode|cla
 
 断网审查者在报告里列出的"限制"（例如没法核实上游字段的业务含义），由你联网关闭：抓取真实上游数据，和权威来源交叉比对。发现缺陷时，以总控核验记录的形式发到 PR，再走修复和增量复核。修复任务里遇到故障分支，要事先定好原则（宁可不可用，不给错值），不要交给实施者自选。
 
-### 总控例行检查：ctl.py
+### 总控例行检查
 
-每一轮都要做的四件事，统一用 router 旁边的 `ctl.py` 执行，不要每次临时拼命令。每条命令都输出一份 JSON，任何一项检查不通过时退出码为 1。
+每一轮都要做的四件事，统一用 `wfc` 的这四个子命令执行，不要每次临时拼命令。每条命令都输出一份 JSON，任何一项检查不通过时退出码为 1。
 
 ```sh
 # 1. 把审查快照切到新 head，跑全量检查，日志记录每条命令真实的退出码（用 pipefail）
-python3 <ctl.py> checks --cwd <审查快照> --head <sha> --log <reports/…/verification-rN.log> \
+wfc checks --cwd <审查快照> --head <sha> --log <reports/…/verification-rN.log> \
   --cmd "pnpm install --frozen-lockfile" --cmd "pnpm typecheck" --cmd "pnpm test" …
 # 2. 回读候选：远端 head、tree、未 force-push、密钥没有提交、没有关闭关键词、留痕评论存在、端口已释放
-python3 <ctl.py> candidate --git <仓库克隆> --repo <owner/name> --branch <分支> --head <sha> \
+wfc candidate --git <仓库克隆> --repo <owner/name> --branch <分支> --head <sha> \
   [--since <上次获审候选>] [--pr <N>] [--secret-file <.env> --secret-key PGPASSWORD] [--comment <id> …] [--port <端口>]
 # 3. 把断网审查者的报告段落转录到 PR（带原作者说明，正文不改）
-python3 <ctl.py> transcribe --repo <owner/name> --pr <N> --report <r2.md> --start "## 独立复核记录" \
+wfc transcribe --repo <owner/name> --pr <N> --report <r2.md> --start "## 独立复核记录" \
   [--end "## 最终完整审查状态"] --author "Codex 审查者（router dispatch `d-…`）"
 # 4. 切换生命周期标签并回读
-python3 <ctl.py> label --repo <owner/name> --issue <N> --from in-review --to changes-requested
+wfc label --repo <owner/name> --issue <N> --from in-review --to changes-requested
 ```
 
 `checks` 在快照有本地改动时会拒绝执行。`candidate` 不会打印密钥的值。`transcribe` 失败时，先到 PR 上看评论是否其实已经发出，再决定要不要重试，因为 GitHub 偶尔会返回 502 或 EOF。
@@ -72,7 +72,7 @@ python3 <ctl.py> label --repo <owner/name> --issue <N> --from in-review --to cha
 ## 续派：修复与增量复核
 
 ```sh
-WFC_STATE=<状态目录> python3 <router.py> continue <dispatch> --task <下一轮任务文件> --report <同一回报目录中的 r<N+1>.md>
+WFC_STATE=<状态目录> wfc continue <dispatch> --task <下一轮任务文件> --report <同一回报目录中的 r<N+1>.md>
 ```
 
 - **修复**：审查有阻塞时，用 `continue` 把修复任务交给原来的实施者。任务文件里写明审查记录的链接、要修的各项、当前 head，以及"在现有提交上追加，不要 force-push"。
@@ -85,7 +85,7 @@ WFC_STATE=<状态目录> python3 <router.py> continue <dispatch> --task <下一�
 ## 恢复会话：resume
 
 ```sh
-WFC_STATE=<状态目录> python3 <router.py> resume <dispatch> [--task <下一轮任务文件> --report <同一回报目录中的 r<N+1>.md>]
+WFC_STATE=<状态目录> wfc resume <dispatch> [--task <下一轮任务文件> --report <同一回报目录中的 r<N+1>.md>]
 ```
 
 - 不带 `--task`：worker 回到原会话，接着做没做完的当前任务。
@@ -104,7 +104,7 @@ WFC_STATE=<状态目录> python3 <router.py> resume <dispatch> [--task <下一�
 **Claude Code 总控**：每次派发、续派或回复之后，在后台挂上
 
 ```sh
-WFC_STATE=<状态目录> python3 <router.py> wait --timeout <秒> [--stall-after <秒>]
+WFC_STATE=<状态目录> wfc wait --timeout <秒> [--stall-after <秒>]
 ```
 
 然后结束当前回复。同一时刻只保留一个 `wait`。用户在窗口里发言也会唤醒你；回应完用户后，确认后台的 `wait` 还在。`wait` 以退出码 3 返回，表示超时：回读各任务的现场，有进展就重新挂 `wait`，没有进展的任务记为 `blocked`。
@@ -112,7 +112,7 @@ WFC_STATE=<状态目录> python3 <router.py> wait --timeout <秒> [--stall-after
 **Codex 总控**：总控会话用 `danger-full-access` 启动。接管后执行一次
 
 ```sh
-WFC_STATE=<状态目录> python3 <router.py> relay --codex-thread <你的会话 UUID> --detach [--stall-after <秒>]
+WFC_STATE=<状态目录> wfc relay --codex-thread <你的会话 UUID> --detach [--stall-after <秒>]
 ```
 
 它会输出进程号和日志路径，把它们写进 `state.md`。会话 UUID 的找法：在 `~/.codex/sessions/` 下找包含本会话启动提示原文的 rollout 文件，取第一行的 `id`。每次派发或回复之后结束当前回复，worker 的消息会作为一条以 `[router] Messages for the controller:` 开头的新消息送到你这里。全程不要运行 `wait`：`wait` 和 relay 同时运行，会抢同一批消息。另外，`codex queue` 对不存在的会话 UUID 也会返回成功，所以 relay 启动后，要确认它投递的第一条消息确实到了你这里。如果派发后迟迟没有动静，先在 `relay.log` 和 `router.db` 里看消息是否已经标为送达。
@@ -122,7 +122,7 @@ WFC_STATE=<状态目录> python3 <router.py> relay --codex-thread <你的会话 
 | 消息 | 处理 |
 | --- | --- |
 | `done` | 完成 `returned` 的回读核对。缺留痕的，按账本补发转录，或者交回 worker 补发 |
-| `question`（由 `ask` 发出） | 在已固定的范围、验收条件和授权内能回答的，直接执行 `router.py reply <消息 id> "<答案>"`。需要用户决定的，把原问题和选项原样转给用户。问题和答案都记入账本 |
+| `question`（由 `ask` 发出） | 在已固定的范围、验收条件和授权内能回答的，直接执行 `wfc reply <消息 id> "<答案>"`。需要用户决定的，把原问题和选项原样转给用户。问题和答案都记入账本 |
 | `stalled` | 先读附带的画面。<br>停在信任或权限提示上：请用户执行 `tmux attach -t wfc-<id>` 处理，该任务记为 `blocked`。同时告诉用户怎么离开：按 Ctrl-b 再按 d；如果终端截获了 Ctrl-b（例如 VS Code 的终端），就在另一个终端执行 `tmux detach-client -s wfc-<id>`，或者让总控代为执行。千万不要按 Ctrl-C，那会直接退出 worker。<br>停下了，但没报告也没提问（例如模型调用遇到网络错误）：回读现场，然后用 `tmux send-keys -t wfc-<id> -l "<提醒>"` 打一行提醒，隔半秒再发 `Enter`，并把这次介入记入账本。提醒之后再次报 `stalled` 的，记为 `blocked` |
 | `exited` | 先检查 worker 退出前是否已经提交或推送，再用 `resume <dispatch>` 让它回到原会话，接着做当前任务，并记入账本。`resume` 找不到会话或者再次 `exited` 时，按账本的失效规则处理：记为 `stale`，保留现场，用下一轮编号新派，在新任务文件里写明真实起点，以及旧现场是续用还是放弃 |
 

@@ -19,7 +19,9 @@ import time
 import uuid
 from pathlib import Path
 
-ROUTER = Path(__file__).resolve()
+_HERE = Path(__file__).resolve()
+# The program workers call back: this file, or the single-file `wfc` build it is packed into.
+PROGRAM = _HERE.parent if _HERE.parent.is_file() else _HERE
 TIMED_OUT = 3
 
 
@@ -87,7 +89,7 @@ FIRST_BRIEF = "You are a worker dispatched by the controller"
 
 
 def worker_brief(dispatch_id, task, report, opening=FIRST_BRIEF):
-    router = f"{shlex.quote(sys.executable)} {shlex.quote(str(ROUTER))}"
+    router = f"{shlex.quote(sys.executable)} {shlex.quote(str(PROGRAM))}"
     return (f"{opening} (dispatch {dispatch_id}). "
             f"Read and do the task in {shlex.quote(str(task))}. "
             f"Stop any server or background process you started before you report. "
@@ -687,7 +689,7 @@ def cmd_relay(args):
         argv = ["relay", "--codex-thread", args.codex_thread, "--stall-after", str(args.stall_after),
                 *(["--for", str(args.for_seconds)] if args.for_seconds else [])]
         with open(log, "a") as out:
-            child = subprocess.Popen([sys.executable, str(ROUTER), *argv], stdin=subprocess.DEVNULL,
+            child = subprocess.Popen([sys.executable, str(PROGRAM), *argv], stdin=subprocess.DEVNULL,
                                      stdout=out, stderr=out, start_new_session=True)
         emit({"pid": child.pid, "log": str(log)})
         return 0
