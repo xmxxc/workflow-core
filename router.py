@@ -435,11 +435,19 @@ def cmd_continue(args):
     brief = worker_brief(args.dispatch, task, report, opening="[router] New task for you")
     typed = type_into(session, brief)
     if typed == NOT_SENT:
+        # Undo the claim only while it is still the latest round event and its task is still the
+        # current one: a `resume` may have taken the new round over in between.
         db.execute("BEGIN IMMEDIATE")
-        db.execute("DELETE FROM message WHERE id = ?", (message_id,))
-        db.execute("UPDATE dispatch SET task = ?, report = ? WHERE id = ?", (row["task"], row["report"], args.dispatch))
+        current = db.execute("SELECT task, report FROM dispatch WHERE id = ?", (args.dispatch,)).fetchone()
+        if round_mark(db, args.dispatch) == message_id and (current["task"], current["report"]) == (str(task), str(report)):
+            db.execute("DELETE FROM message WHERE id = ?", (message_id,))
+            db.execute("UPDATE dispatch SET task = ?, report = ? WHERE id = ?",
+                       (row["task"], row["report"], args.dispatch))
+            db.execute("COMMIT")
+            raise SystemExit(f"could not type the next task into tmux session {session}")
         db.execute("COMMIT")
-        raise SystemExit(f"could not type the next task into tmux session {session}")
+        raise SystemExit(f"could not type the next task into tmux session {session}, but dispatch {args.dispatch} "
+                         f"moved on meanwhile (a resume took the round over); its current state is kept")
     if typed in (PARTIAL, UNCERTAIN):
         raise typing_error(session, "The next task", typed)
     emit({"continued": args.dispatch, "message": message_id})
