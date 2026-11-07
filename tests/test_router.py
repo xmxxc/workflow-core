@@ -943,15 +943,32 @@ class PartialTyping(unittest.TestCase):
         texts = [c for c in self.env.host_calls() if c[:2] == ["tmux", "send-keys"] and "-l" in c]
         self.assertEqual(len(texts), 1)
 
+    def test_a_failed_send_is_uncertain_even_when_the_session_probe_fails_too(self):
+        # Both the text send and any follow-up probe fail: nothing proves the text did not arrive.
+        dispatch = self.env.dispatch()
+        question = self.env.json("ask", "Red or blue?", dispatch=dispatch)["message"]
+        env = {"FAKE_FAIL": "send-keys"}
+        fake = self.env.bin / "tmux"
+        fake.write_text(fake.read_text().replace(
+            "if os.environ.get('FAKE_FAIL') == sys.argv[1]:",
+            "if os.environ.get('FAKE_PROBE_FAIL') and sys.argv[1] == 'has-session':\n"
+            "    sys.exit(1)\n"
+            "if os.environ.get('FAKE_FAIL') == sys.argv[1]:", 1))
+
+        first = self.env.run("reply", str(question), "blue", env={**env, "FAKE_PROBE_FAIL": "1"})
+        second = self.env.run("reply", str(question), "blue")
+
+        self.assertIn("may or may not", first.stderr)
+        self.assertNotEqual(second.returncode, 0)
+
     def test_a_reply_whose_text_never_arrived_can_be_retried(self):
         dispatch = self.env.dispatch()
         question = self.env.json("ask", "Red or blue?", dispatch=dispatch)["message"]
 
-        # The session is gone, so the text certainly did not arrive; once it is back, the reply can go.
-        session_file = self.env.sessions / f"wfc-{dispatch}"
-        session_file.rename(session_file.with_suffix(".away"))
-        first = self.env.run("reply", str(question), "blue", env={"FAKE_FAIL": "send-keys"})
-        session_file.with_suffix(".away").rename(session_file)
+        # tmux could not be run at all, so the text certainly did not arrive; once it can, the reply can go.
+        python_only = self.env.bin.parent / "python-only"
+        python_only.mkdir()
+        first = self.env.run("reply", str(question), "blue", env={"PATH": str(python_only)})
         second = self.env.run("reply", str(question), "blue")
 
         self.assertNotEqual(first.returncode, 0)

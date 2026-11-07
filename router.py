@@ -28,11 +28,14 @@ def state_dir():
 
 
 def tmux(*args):
-    """Run a tmux command; a missing tmux reads as a failed command (exit 127), not a traceback."""
+    """Run a tmux command; a tmux that cannot be run reads as a failed command marked
+    `not_run` (it certainly did nothing), not a traceback."""
     try:
         return subprocess.run(["tmux", *args], capture_output=True, text=True)
     except OSError as err:
-        return subprocess.CompletedProcess(["tmux", *args], 127, "", f"cannot run tmux: {err}")
+        result = subprocess.CompletedProcess(["tmux", *args], 127, "", f"cannot run tmux: {err}")
+        result.not_run = True
+        return result
 
 
 def session_alive(session):
@@ -335,14 +338,14 @@ SENT, NOT_SENT, UNCERTAIN, PARTIAL = "sent", "not-sent", "uncertain", "partial"
 def type_into(session, text):
     """Type one line into a TUI and submit it. Returns
     SENT;
-    NOT_SENT when the text certainly did not arrive (tmux could not run, or the session is gone):
-      safe to type again;
-    UNCERTAIN when the text command ran but failed (it may have been killed after handing over);
+    NOT_SENT when the text certainly did not arrive (tmux could not be run at all): safe to type again;
+    UNCERTAIN when the text command ran but did not confirm (it may have handed the text over
+      before failing, and a follow-up probe could fail the same way, so none is trusted);
     PARTIAL when the text arrived but its Enter was not confirmed.
     After UNCERTAIN or PARTIAL, typing again could double the line: someone has to look."""
     sent = tmux("send-keys", "-t", session, "-l", text)
     if sent.returncode != 0:
-        return NOT_SENT if sent.returncode == 127 or not session_alive(session) else UNCERTAIN
+        return NOT_SENT if getattr(sent, "not_run", False) else UNCERTAIN
     time.sleep(0.5)  # TUIs drop an Enter that arrives in the same burst as the text
     return SENT if tmux("send-keys", "-t", session, "Enter").returncode == 0 else PARTIAL
 
