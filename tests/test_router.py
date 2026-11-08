@@ -65,6 +65,7 @@ class Env:
                     "WFC_CLAUDE_CONFIG": str(self.bin.parent / "no-claude-config.json"),
                     "CODEX_HOME": str(self.bin.parent / "codex-home"),
                     "WFC_OPENCODE_DB": str(self.bin.parent / "opencode.db"),
+                    "CLAUDE_CONFIG_DIR": str(self.bin.parent / "claude-home"),
                     "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}", **(env or {})}
         full_env.pop("WFC_DISPATCH", None)
         if dispatch:
@@ -1328,6 +1329,178 @@ class OpenCodeRelay(unittest.TestCase):
         self.assertNotEqual(both.returncode, 0)
         self.assertNotEqual(neither.returncode, 0)
         self.assertNotEqual(half.returncode, 0)
+
+
+def utc_now():
+    now = time.time()
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)) + f".{int(now % 1 * 1000):03d}Z"
+
+
+class HostErrors(unittest.TestCase):
+    """A worker whose turn ended on a host error (quota, overload) is reported `blocked` with the
+    host's own error, read from its conversation record, without waiting for a stall."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+        self.env.screen.write_text("■ You've hit your usage limit.\n")
+        self.still = {"FAKE_SCREEN": str(self.env.screen)}
+
+    def wait(self, timeout="4", stall_after="60"):
+        return self.env.json("wait", "--timeout", timeout, "--stall-after", stall_after, env=self.still)
+
+    def codex_rollout(self, dispatch, events):
+        day = self.env.bin.parent / "codex-home" / "sessions" / "2026" / "11" / "08"
+        day.mkdir(parents=True, exist_ok=True)
+        meta = {"type": "session_meta", "payload": {"id": "s-1", "source": "cli"}}
+        prompt = {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": f"You are a worker dispatched by the controller (dispatch {dispatch}). Read"}]}}
+        lines = [meta, prompt] + [{"timestamp": utc_now(), "type": "event_msg", "payload": e} for e in events]
+        (day / "rollout-2026-11-08T00-00-00-s-1.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+
+    def codex_quota(self, turn="t-1"):
+        return {"type": "task_complete", "turn_id": turn, "last_agent_message": None,
+                "error": {"message": "You've hit your usage limit. Try again at 3:00 PM.",
+                          "codex_error_info": "usage_limit_exceeded"}}
+
+    def test_codex_quota_error_is_reported_once_with_the_raw_message(self):
+        dispatch = self.env.dispatch("codex")
+        self.codex_rollout(dispatch, [{"type": "task_started", "turn_id": "t-1"}, self.codex_quota()])
+
+        [message] = self.wait()["messages"]
+        self.assertEqual((message["type"], message["dispatch"], message["host"], message["kind"]),
+                         ("blocked", dispatch, "codex", "usage_limit_exceeded"))
+        self.assertIn("Try again at 3:00 PM", message["message"])
+        # Neither reported again nor followed by a stall on the same screen.
+        self.assertTrue(self.wait(timeout="2.5", stall_after="0.3")["timedOut"])
+
+    def test_claude_rate_limit_is_reported_as_blocked(self):
+        dispatch = self.env.dispatch("claude")
+        [launch] = [c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]]
+        session_id = launch[launch.index("--session-id") + 1]
+        project = self.env.bin.parent / "claude-home" / "projects" / "-tmp-worktree"
+        project.mkdir(parents=True)
+        entries = [{"type": "user", "uuid": "u1", "timestamp": utc_now(), "message": {"content": "brief"}},
+                   {"type": "assistant", "uuid": "a1", "timestamp": utc_now(), "error": "rate_limit",
+                    "isApiErrorMessage": True,
+                    "message": {"content": [{"type": "text", "text": "You've hit your 5-hour limit · resets 3am"}]}}]
+        (project / f"{session_id}.jsonl").write_text("".join(json.dumps(e) + "\n" for e in entries))
+
+        [message] = self.wait()["messages"]
+        self.assertEqual((message["type"], message["kind"], message["message"]),
+                         ("blocked", "rate_limit", "You've hit your 5-hour limit · resets 3am"))
+
+    def test_opencode_error_is_reported_as_blocked(self):
+        dispatch = self.env.dispatch("opencode")
+        db = sqlite3.connect(self.env.bin.parent / "opencode.db")
+        db.executescript("CREATE TABLE session (id TEXT, parent_id TEXT, time_created INTEGER);"
+                         "CREATE TABLE part (id TEXT, session_id TEXT, data TEXT);"
+                         "CREATE TABLE message (id TEXT, session_id TEXT, time_created INTEGER, data TEXT);")
+        brief = f"You are a worker dispatched by the controller (dispatch {dispatch}). Read"
+        db.execute("INSERT INTO session VALUES ('ses_w', NULL, 1)")
+        db.execute("INSERT INTO part VALUES ('p1', 'ses_w', ?)", (json.dumps({"type": "text", "text": brief}),))
+        now = int(time.time() * 1000)
+        db.execute("INSERT INTO message VALUES ('msg_1', 'ses_w', ?, ?)", (now, json.dumps({"role": "user"})))
+        db.execute("INSERT INTO message VALUES ('msg_2', 'ses_w', ?, ?)", (now + 1, json.dumps(
+            {"role": "assistant", "error": {"name": "APIError", "data": {"message": "Insufficient balance"}}})))
+        db.commit()
+        db.close()
+
+        [message] = self.wait()["messages"]
+        self.assertEqual((message["type"], message["kind"], message["message"]),
+                         ("blocked", "APIError", "Insufficient balance"))
+
+    def test_a_turn_that_started_again_after_the_error_is_not_reported(self):
+        dispatch = self.env.dispatch("codex")
+        self.codex_rollout(dispatch, [self.codex_quota(), {"type": "task_started", "turn_id": "t-2"}])
+
+        self.assertTrue(self.wait(timeout="2.5")["timedOut"])
+
+    def test_an_error_from_before_the_latest_nudge_is_not_reported(self):
+        dispatch = self.env.dispatch("codex")
+        self.codex_rollout(dispatch, [self.codex_quota()])
+        time.sleep(1.1)  # the nudge comes after the error
+        self.env.json("nudge", dispatch, "--text", "continue")
+
+        self.assertTrue(self.wait(timeout="2.5")["timedOut"])
+
+
+class Nudge(unittest.TestCase):
+    """nudge types a line into a worker still on its task, and records it."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+        self.dispatch = self.env.dispatch()
+
+    def test_the_line_is_typed_into_the_worker_and_recorded(self):
+        result = self.env.json("nudge", self.dispatch, "--text", "Quota is back.\nContinue the task.")
+
+        typed = [c for c in self.env.host_calls() if c[:2] == ["tmux", "send-keys"] and "-l" in c]
+        self.assertEqual(typed[-1][-1], "[router] Message from the controller: Quota is back. Continue the task.")
+        status = self.env.json("status", "--dispatch", self.dispatch)
+        self.assertEqual([m["type"] for m in status["dispatches"][0]["messages"]], ["nudge"])
+        self.assertEqual(result["nudged"], self.dispatch)
+
+    def test_a_finished_worker_is_given_its_next_task_with_continue_instead(self):
+        self.env.report.write_text("# report\n")
+        self.env.run("done", "--report", str(self.env.report), dispatch=self.dispatch)
+
+        result = self.env.run("nudge", self.dispatch, "--text", "hi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("continue", result.stderr)
+
+    def test_a_worker_whose_session_ended_is_resumed_instead(self):
+        self.env.end_session(self.dispatch)
+
+        result = self.env.run("nudge", self.dispatch, "--text", "hi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("resume", result.stderr)
+
+
+class Status(unittest.TestCase):
+    """status shows every dispatch and the undelivered messages without taking them."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+
+    def test_dispatch_states_and_undelivered_messages_are_shown_without_delivering_them(self):
+        working = self.env.dispatch("codex", extra_args=("--model", "gpt-x"))
+        finished = self.env.dispatch("claude")
+        self.env.report.write_text("# report\n")
+        self.env.run("done", "--report", str(self.env.report), dispatch=finished)
+
+        status = self.env.json("status")
+
+        states = {d["dispatch"]: (d["host"], d["state"], d["tmuxAlive"]) for d in status["dispatches"]}
+        self.assertEqual(states, {working: ("codex", "working", True), finished: ("claude", "done", True)})
+        self.assertEqual([(m["type"], m["dispatch"]) for m in status["undelivered"]], [("done", finished)])
+        [done] = self.env.json("wait", "--timeout", "2")["messages"]
+        self.assertEqual(done["type"], "done")  # status did not take it
+        self.assertEqual(self.env.json("status")["undelivered"], [])
+
+    def test_a_running_wait_is_listed(self):
+        self.env.dispatch()
+        env = {**os.environ, "WFC_STATE": str(self.env.state), "PATH": f"{self.env.bin}{os.pathsep}{os.environ['PATH']}"}
+        waiting = subprocess.Popen([sys.executable, str(ROUTER), "wait", "--timeout", "30"],
+                                   stdout=subprocess.DEVNULL, env=env)
+        self.addCleanup(waiting.kill)
+        time.sleep(1)
+
+        waiters = self.env.json("status")["waiters"]
+        self.assertEqual([(w["pid"], w["kind"]) for w in waiters], [(waiting.pid, "wait")])
+        waiting.kill()
+        waiting.wait()
+        self.assertEqual(self.env.json("status")["waiters"], [])
+
+    def test_an_exited_worker_is_shown_as_exited(self):
+        dispatch = self.env.dispatch()
+        self.env.end_session(dispatch)
+        self.env.json("wait", "--timeout", "2")
+
+        [view] = self.env.json("status")["dispatches"]
+        self.assertEqual((view["state"], view["tmuxAlive"], view["last"]["type"]), ("exited", False, "exited"))
 
 
 def socket_free_port():

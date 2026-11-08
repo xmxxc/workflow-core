@@ -8,6 +8,7 @@ SQLite database under $WFC_STATE (default ~/.local/state/workflow-core).
 """
 
 import argparse
+import calendar
 import fcntl
 import json
 import os
@@ -63,6 +64,8 @@ def connect():
             type TEXT, body TEXT, created REAL, delivered INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS screen_watch (
             dispatch TEXT PRIMARY KEY, screen TEXT, since REAL, reported_screen TEXT);
+        CREATE TABLE IF NOT EXISTS host_error (dispatch TEXT PRIMARY KEY, turn TEXT);
+        CREATE TABLE IF NOT EXISTS waiter (pid INTEGER PRIMARY KEY, kind TEXT, since REAL);
     """)
     # Column upgrades: `started` is set once the worker's tmux session exists (the watchdog ignores
     # rows without it); `report_dir` is the directory the worker may write; `report`, `model` and
@@ -148,7 +151,7 @@ def find_host_session(row):
     if row["host"] == "codex":
         # Codex records each conversation as a rollout whose first line names it. A reviewer's
         # sub-agents inherit the brief, so their rollouts (source.subagent) are skipped.
-        root = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser() / "sessions"
+        root = codex_sessions()
         for rollout in sorted(root.rglob("rollout-*.jsonl")) if root.is_dir() else []:
             if rollout.stat().st_mtime < (row["created"] or 0) - 60:
                 continue  # last written before this dispatch existed
@@ -157,8 +160,7 @@ def find_host_session(row):
                 return found
         return None
     if row["host"] == "opencode":
-        default = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "opencode/opencode.db"
-        path = Path(os.environ.get("WFC_OPENCODE_DB") or default).expanduser()
+        path = opencode_db()
         if not path.is_file():
             return None
         try:
@@ -175,6 +177,128 @@ def find_host_session(row):
             return None
         return found[0] if found else None
     return None
+
+
+def codex_sessions():
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser() / "sessions"
+
+
+def opencode_db():
+    default = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "opencode/opencode.db"
+    return Path(os.environ.get("WFC_OPENCODE_DB") or default).expanduser()
+
+
+def claude_projects():
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser() / "projects"
+
+
+def iso_time(text):
+    """Epoch seconds of a UTC ISO timestamp like 2026-11-08T07:49:19.522Z (Python 3.9 safe)."""
+    whole, _, rest = text.partition(".")
+    fraction = "".join(c for c in rest.split("Z")[0].split("+")[0] if c.isdigit())
+    return calendar.timegm(time.strptime(whole[:19], "%Y-%m-%dT%H:%M:%S")) + float(f"0.{fraction or 0}")
+
+
+# The host's own record of how a worker's latest turn ended, read from its conversation store
+# (internal formats, not public interfaces: anything unreadable counts as no record, and the
+# screen watchdog stays the fallback). A turn end is {"turn", "at", "error"}; error is None for a
+# turn that ended normally, else {"kind", "message"}. A newer user turn clears it (None).
+
+def codex_turn_end(line, last):
+    event = json.loads(line)
+    payload = event.get("payload") or {}
+    if event.get("type") != "event_msg":
+        return last
+    if payload.get("type") == "task_started":
+        return None
+    if payload.get("type") != "task_complete":
+        return last
+    error = payload.get("error")
+    return {"turn": payload.get("turn_id"), "at": iso_time(event["timestamp"]),
+            "error": {"kind": error.get("codex_error_info"), "message": error.get("message")} if error else None}
+
+
+def claude_turn_end(line, last):
+    entry = json.loads(line)
+    if entry.get("type") == "user":
+        return None
+    if entry.get("type") != "assistant":
+        return last
+    error = None
+    if entry.get("isApiErrorMessage"):
+        content = (entry.get("message") or {}).get("content") or [{}]
+        error = {"kind": entry.get("error"), "message": content[0].get("text")}
+    return {"turn": entry.get("uuid"), "at": iso_time(entry["timestamp"]), "error": error}
+
+
+class TurnWatch:
+    """Follows one worker's conversation file, reading only what was appended since the last look."""
+
+    LOOKUP_EVERY, CHECK_EVERY = 15, 2
+
+    def __init__(self):
+        self.source, self.offset, self.last, self.next_lookup, self.next_check = None, 0, None, 0, 0
+
+    def latest(self, row, now):
+        if now < self.next_check:
+            return self.last
+        self.next_check = now + self.CHECK_EVERY
+        if self.source is None and now >= self.next_lookup:
+            self.next_lookup = now + self.LOOKUP_EVERY
+            self.source = conversation_source(row)
+        if self.source is None:
+            return None
+        try:
+            if row["host"] == "opencode":
+                self.last = opencode_turn_end(self.source)
+            else:
+                self.last = self.follow(codex_turn_end if row["host"] == "codex" else claude_turn_end)
+        except (OSError, sqlite3.Error):
+            pass  # the record is unreadable just now; keep the last view
+        return self.last
+
+    def follow(self, parse):
+        with open(self.source, "rb") as f:
+            f.seek(self.offset)
+            chunk = f.read()
+        complete = chunk[:chunk.rfind(b"\n") + 1]  # a half-written last line waits for the next look
+        self.offset += len(complete)
+        for line in complete.decode(errors="replace").splitlines():
+            try:
+                self.last = parse(line, self.last)
+            except (ValueError, KeyError, TypeError, AttributeError, IndexError):
+                continue
+        return self.last
+
+
+def conversation_source(row):
+    """Where a worker's conversation is recorded: a Codex rollout or Claude Code transcript file, or
+    an OpenCode session id. None until the host has written it."""
+    if row["host"] == "opencode":
+        return find_host_session(row)
+    if row["host"] == "claude":
+        found = sorted(claude_projects().glob(f"*/{row['host_session']}.jsonl")) if row["host_session"] else []
+        return found[0] if found else None
+    session = find_host_session(row)
+    found = sorted(codex_sessions().rglob(f"rollout-*{session}.jsonl")) if session else []
+    return found[0] if found else None
+
+
+def opencode_turn_end(session):
+    db = sqlite3.connect(f"file:{opencode_db()}?mode=ro", uri=True)
+    try:
+        found = db.execute("SELECT id, time_created, data FROM message WHERE session_id = ? "
+                           "ORDER BY time_created DESC, id DESC LIMIT 1", (session,)).fetchone()
+    finally:
+        db.close()
+    if found is None:
+        return None
+    data = json.loads(found[2])
+    if data.get("role") != "assistant":
+        return None
+    error = data.get("error")
+    return {"turn": found[0], "at": found[1] / 1000,
+            "error": {"kind": error.get("name"), "message": (error.get("data") or {}).get("message")} if error else None}
 
 
 def codex_rollout_opens_with(rollout, opening):
@@ -459,6 +583,103 @@ def cmd_continue(args):
     emit({"continued": args.dispatch, "message": message_id})
 
 
+def cmd_nudge(args):
+    """Type a line into a worker that has not finished its task (stopped on a quota error, say),
+    recorded in router.db."""
+    db = connect()
+    row = db.execute("SELECT * FROM dispatch WHERE id = ? AND started IS NOT NULL", (args.dispatch,)).fetchone()
+    if row is None:
+        raise SystemExit(f"unknown dispatch {args.dispatch} in {state_dir()}")
+    session = session_name(args.dispatch)
+    if not session_alive(session):
+        raise SystemExit(f"tmux session {session} has ended; use `resume` instead")
+    text = " ".join(args.text.splitlines())  # a newline would submit half the line
+    db.execute("BEGIN IMMEDIATE")
+    if done_current_task(db, args.dispatch):
+        db.execute("ROLLBACK")
+        raise SystemExit(f"dispatch {args.dispatch} already finished its task; give the next one with `continue`")
+    message_id = post(db, args.dispatch, "worker", "nudge", {"text": text})
+    db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
+    db.execute("COMMIT")
+    typed = type_into(session, f"[router] Message from the controller: {text}")
+    if typed == NOT_SENT:
+        db.execute("DELETE FROM message WHERE id = ?", (message_id,))
+        raise SystemExit(f"could not type the message into tmux session {session}")
+    if typed in (PARTIAL, UNCERTAIN):
+        raise typing_error(session, "The message", typed)
+    emit({"nudged": args.dispatch, "message": message_id})
+
+
+def local_time(epoch):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch)) if epoch else None
+
+
+def message_view(r):
+    return {"id": r["id"], "dispatch": r["dispatch"], "type": r["type"], "to": r["recipient"], "at": local_time(r["created"]),
+            **({"delivered": bool(r["delivered"])} if r["recipient"] == "controller" else {}), **json.loads(r["body"])}
+
+
+def dispatch_state(db, dispatch_id):
+    if done_current_task(db, dispatch_id):
+        return "done"
+    if not watched(db, dispatch_id):
+        return "exited"
+    return "asking" if awaiting_answer(db, dispatch_id) else "working"
+
+
+def cmd_status(args):
+    """Read-only view of the scope: every dispatch, undelivered messages and the running waiters."""
+    db = connect()
+    query = "SELECT * FROM dispatch WHERE started IS NOT NULL" + (" AND id = ?" if args.dispatch else "") + " ORDER BY created"
+    rows = db.execute(query, (args.dispatch,) if args.dispatch else ()).fetchall()
+    if args.dispatch and not rows:
+        raise SystemExit(f"unknown dispatch {args.dispatch} in {state_dir()}")
+    now, dispatches = time.time(), []
+    for row in rows:
+        last = db.execute("SELECT * FROM message WHERE dispatch = ? ORDER BY id DESC LIMIT 1", (row["id"],)).fetchone()
+        watch = db.execute("SELECT since FROM screen_watch WHERE dispatch = ?", (row["id"],)).fetchone()
+        view = {"dispatch": row["id"], "host": row["host"], "model": row["model"], "state": dispatch_state(db, row["id"]),
+                "tmux": session_name(row["id"]), "tmuxAlive": session_alive(session_name(row["id"])),
+                "cwd": row["cwd"], "task": row["task"], "report": row["report"], "started": local_time(row["started"]),
+                "last": message_view(last) if last else None,
+                **({"screenIdleSeconds": int(now - watch["since"])} if watch else {})}
+        if args.dispatch:
+            view["messages"] = [message_view(m) for m in
+                                db.execute("SELECT * FROM message WHERE dispatch = ? ORDER BY id", (row["id"],))]
+        dispatches.append(view)
+    undelivered = db.execute("SELECT * FROM message WHERE recipient = 'controller' AND delivered = 0 "
+                             + ("AND dispatch = ? " if args.dispatch else "") + "ORDER BY id",
+                             (args.dispatch,) if args.dispatch else ()).fetchall()
+    waiters = [{"pid": w["pid"], "kind": w["kind"], "since": local_time(w["since"])}
+               for w in db.execute("SELECT * FROM waiter ORDER BY since") if process_alive(w["pid"])]
+    emit({"state": str(state_dir()), "dispatches": dispatches,
+          "undelivered": [message_view(m) for m in undelivered], "waiters": waiters})
+
+
+def process_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+class registered_waiter:
+    """Records a running `wait` or `relay` in router.db for `status`, and removes it on exit."""
+
+    def __init__(self, db, kind):
+        self.db, self.kind = db, kind
+
+    def __enter__(self):
+        self.db.execute("INSERT OR REPLACE INTO waiter (pid, kind, since) VALUES (?, ?, ?)",
+                        (os.getpid(), self.kind, time.time()))
+
+    def __exit__(self, *exc):
+        self.db.execute("DELETE FROM waiter WHERE pid = ?", (os.getpid(),))
+
+
 def cmd_resume(args):
     """Relaunch a worker whose tmux session ended into its own host conversation, either to finish
     its current task or, once that is done, to start the next one (like `continue`)."""
@@ -599,14 +820,16 @@ def check_workers(db, stall_after):
     """Report workers whose tmux session ended, or whose screen stopped changing,
     without `done` or a pending question. A busy TUI redraws a timer or spinner;
     an idle prompt, a crash message or an approval dialog stays still."""
-    candidates = [r["id"] for r in db.execute("SELECT id FROM dispatch WHERE started IS NOT NULL")]
-    for dispatch_id in candidates:
+    candidates = db.execute("SELECT * FROM dispatch WHERE started IS NOT NULL").fetchall()
+    for row in candidates:
+        dispatch_id = row["id"]
         if not watched(db, dispatch_id):
             continue
         session = session_name(dispatch_id)
         alive = session_alive(session)
         captured = tmux("capture-pane", "-p", "-t", session) if alive else None
         now = time.time()
+        turn_end = TURN_WATCHES.setdefault(dispatch_id, TurnWatch()).latest(row, now) if alive else None
         # Decide and post under one write lock, re-checking state a worker's `done` may have changed.
         db.execute("BEGIN IMMEDIATE")
         try:
@@ -619,12 +842,40 @@ def check_workers(db, stall_after):
                      {"reason": f"tmux session {session} ended without done"})
             elif awaiting_answer(db, dispatch_id):
                 db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (dispatch_id,))
+            elif blocked_turn(db, dispatch_id, turn_end):
+                post(db, dispatch_id, "controller", "blocked", {"host": row["host"], **turn_end["error"]})
+                db.execute("INSERT OR REPLACE INTO host_error (dispatch, turn) VALUES (?, ?)",
+                           (dispatch_id, turn_end["turn"]))
+                if captured.returncode == 0:  # the stall that follows on this screen is the same news
+                    db.execute("INSERT OR REPLACE INTO screen_watch (dispatch, screen, since, reported_screen) "
+                               "VALUES (?, ?, ?, ?)", (dispatch_id, captured.stdout, now, captured.stdout))
             elif captured.returncode == 0:
                 watch_screen(db, dispatch_id, captured.stdout, now, stall_after)
             db.execute("COMMIT")
         except BaseException:
             db.execute("ROLLBACK")
             raise
+
+
+TURN_WATCHES = {}
+
+
+def blocked_turn(db, dispatch_id, turn_end):
+    """The worker's latest turn ended on a host error (quota, overload, policy) in its current
+    round, not yet reported."""
+    if not turn_end or not turn_end["error"]:
+        return False
+    reported = db.execute("SELECT turn FROM host_error WHERE dispatch = ?", (dispatch_id,)).fetchone()
+    return (reported is None or reported["turn"] != turn_end["turn"]) and turn_end["at"] > round_started(db, dispatch_id)
+
+
+def round_started(db, dispatch_id):
+    """When the worker last got input from the router: its dispatch, or its latest continue,
+    resume or nudge. A host error from before that belongs to an earlier turn."""
+    latest = db.execute("SELECT MAX(created) FROM message WHERE dispatch = ? AND type IN ('continue', 'resumed', 'nudge')",
+                        (dispatch_id,)).fetchone()[0]
+    started = db.execute("SELECT started FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()[0]
+    return max(latest or 0, started or 0)
 
 
 def watch_screen(db, dispatch_id, screen, now, stall_after):
@@ -643,17 +894,18 @@ def watch_screen(db, dispatch_id, screen, now, stall_after):
 def cmd_wait(args):
     db = connect()
     deadline = time.monotonic() + args.timeout
-    while True:
-        check_workers(db, args.stall_after)
-        # At-most-once: messages are marked delivered before they are printed; the ledger is the backstop.
-        messages = take_controller_messages(db)
-        if messages:
-            emit({"messages": messages})
-            return 0
-        if time.monotonic() >= deadline:
-            emit({"messages": [], "timedOut": True})
-            return TIMED_OUT
-        time.sleep(0.5)  # ponytail: polls SQLite; switch to a FIFO/inotify wake if 0.5 s latency matters
+    with registered_waiter(db, "wait"):
+        while True:
+            check_workers(db, args.stall_after)
+            # At-most-once: messages are marked delivered before they are printed; `status` shows them again.
+            messages = take_controller_messages(db)
+            if messages:
+                emit({"messages": messages})
+                return 0
+            if time.monotonic() >= deadline:
+                emit({"messages": [], "timedOut": True})
+                return TIMED_OUT
+            time.sleep(0.5)  # ponytail: polls SQLite; switch to a FIFO/inotify wake if 0.5 s latency matters
 
 
 def queue_into_codex(thread, messages):
@@ -749,14 +1001,15 @@ def cmd_relay(args):
         return 0
     db = connect()
     deadline = time.monotonic() + args.for_seconds if args.for_seconds else None
-    while deadline is None or time.monotonic() < deadline:
-        check_workers(db, args.stall_after)
-        messages = take_controller_messages(db)
-        if messages and deliver(messages) == "failed":
-            # Put the batch back so the next pass, or a `wait`, delivers it.
-            db.executemany("UPDATE message SET delivered = 0 WHERE id = ?", [(m["id"],) for m in messages])
-            time.sleep(5)
-        time.sleep(0.5)
+    with registered_waiter(db, "relay"):
+        while deadline is None or time.monotonic() < deadline:
+            check_workers(db, args.stall_after)
+            messages = take_controller_messages(db)
+            if messages and deliver(messages) == "failed":
+                # Put the batch back so the next pass, or a `wait`, delivers it.
+                db.executemany("UPDATE message SET delivered = 0 WHERE id = ?", [(m["id"],) for m in messages])
+                time.sleep(5)
+            time.sleep(0.5)
     return 0
 
 
@@ -793,6 +1046,13 @@ def main(argv):
     p.add_argument("--task", help="the next task, for a worker that already finished its current one")
     p.add_argument("--report", help="the next report; must be in the dispatch's report directory")
     p.set_defaults(func=cmd_resume)
+    p = sub.add_parser("nudge", help="type a line into a worker that has not finished its task")
+    p.add_argument("dispatch")
+    p.add_argument("--text", required=True)
+    p.set_defaults(func=cmd_nudge)
+    p = sub.add_parser("status", help="show every dispatch, undelivered messages and running waiters")
+    p.add_argument("--dispatch", help="one dispatch, with its whole message history")
+    p.set_defaults(func=cmd_status)
     p = sub.add_parser("wait")
     p.add_argument("--timeout", type=float, default=3600)
     p.add_argument("--stall-after", type=float, default=300,

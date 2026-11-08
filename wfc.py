@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """wfc: the workflow dispatcher's single command.
 
-  wfc dispatch | done | ask | reply | continue | resume | wait | relay
+  wfc dispatch | done | ask | reply | continue | nudge | resume | status | wait | relay
   wfc --version
 
 `build.py` packs this file and router.py into one executable file. The controller skill that
@@ -12,7 +12,7 @@ import sys
 
 import router
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 
 def main(argv=None):
