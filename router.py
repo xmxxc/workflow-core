@@ -238,6 +238,7 @@ class TurnWatch:
 
     def __init__(self):
         self.source, self.offset, self.last, self.next_lookup, self.next_check = None, 0, None, 0, 0
+        self.identity = None  # (device, inode) of the file read so far
 
     def latest(self, row, now):
         if now < self.next_check:
@@ -253,12 +254,18 @@ class TurnWatch:
                 self.last = opencode_turn_end(self.source)
             else:
                 self.last = self.follow(codex_turn_end if row["host"] == "codex" else claude_turn_end)
-        except (OSError, sqlite3.Error):
-            pass  # the record is unreadable just now; keep the last view
+        except FileNotFoundError:
+            self.source, self.offset, self.last = None, 0, None  # moved away: look it up again
+        except (OSError, sqlite3.Error, ValueError, KeyError, TypeError, AttributeError, IndexError):
+            pass  # unreadable or malformed just now: no new view, and the screen watchdog still runs
         return self.last
 
     def follow(self, parse):
         with open(self.source, "rb") as f:
+            identity = os.fstat(f.fileno())
+            if (identity.st_dev, identity.st_ino) != self.identity or identity.st_size < self.offset:
+                # A replaced or truncated file is read again from its start.
+                self.identity, self.offset, self.last = (identity.st_dev, identity.st_ino), 0, None
             f.seek(self.offset)
             chunk = f.read()
         complete = chunk[:chunk.rfind(b"\n") + 1]  # a half-written last line waits for the next look
@@ -464,6 +471,11 @@ def cmd_done(args):
         raise SystemExit(f"report not found: {report}")
     db = connect()
     dispatch_id = current_dispatch(db)
+    with input_lock(dispatch_id):  # a nudge being typed lands before this done, as recorded
+        return finish_round(db, dispatch_id, report)
+
+
+def finish_round(db, dispatch_id, report):
     db.execute("BEGIN IMMEDIATE")
     current = db.execute("SELECT report FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()["report"]
     # A retried `done` from an earlier round must not finish the round that followed it.
@@ -508,6 +520,32 @@ def typing_error(session, what, typed):
                       f"line, and press Enter or clear it yourself; do not send it again.")
 
 
+class input_lock:
+    """Serialises everything that types into one worker's session (continue and nudge from their
+    round check to their last keystroke; reply and an OpenCode resume while they type), so two inputs never interleave and a round check
+    still holds when the text arrives. The worker's own `done` takes it too, so it cannot slip in
+    between a nudge's check and its typing."""
+
+    def __init__(self, dispatch_id):
+        self.path = state_dir() / f"input-{dispatch_id}.lock"
+
+    def __enter__(self):
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+
+    def __exit__(self, *exc):
+        os.close(self.fd)
+
+
+def holding_input_lock(command):
+    def locked(args):
+        connect()  # the state directory exists before its lock file is made
+        with input_lock(args.dispatch):
+            return command(args)
+    locked.__doc__ = command.__doc__
+    return locked
+
+
 def cmd_reply(args):
     db = connect()
     question = db.execute("SELECT * FROM message WHERE id = ? AND type = 'question'", (args.message,)).fetchone()
@@ -523,7 +561,8 @@ def cmd_reply(args):
     reply_id = post(db, question["dispatch"], "worker", "reply", {"to": question["id"], "answer": answer})
     db.execute("COMMIT")
     session = session_name(question["dispatch"])
-    typed = type_into(session, f"[router] Answer to question {question['id']}: {answer}")
+    with input_lock(question["dispatch"]):
+        typed = type_into(session, f"[router] Answer to question {question['id']}: {answer}")
     if typed == NOT_SENT:
         db.execute("DELETE FROM message WHERE id = ?", (reply_id,))
         raise SystemExit(f"could not type the answer into tmux session {session}; is the worker still running?")
@@ -532,6 +571,7 @@ def cmd_reply(args):
     emit({"replied": question["id"], "dispatch": question["dispatch"]})
 
 
+@holding_input_lock
 def cmd_continue(args):
     """Give a worker its next task (a fix round, an incremental review) in the same session."""
     db = connect()
@@ -583,6 +623,7 @@ def cmd_continue(args):
     emit({"continued": args.dispatch, "message": message_id})
 
 
+@holding_input_lock
 def cmd_nudge(args):
     """Type a line into a worker that has not finished its task (stopped on a quota error, say),
     recorded in router.db."""
@@ -748,7 +789,8 @@ def cmd_resume(args):
                          f"`wait` reports it exited if it never started.")
     if row["host"] == "opencode":
         brief = worker_brief(args.dispatch, task, report, opening=opening)
-        typed = type_into(session, brief) if wait_for_quiet_screen(session) else NOT_SENT
+        with input_lock(args.dispatch):
+            typed = type_into(session, brief) if wait_for_quiet_screen(session) else NOT_SENT
         if typed in (PARTIAL, UNCERTAIN):
             raise typing_error(session, "The brief", typed)
         if typed == NOT_SENT:
@@ -829,7 +871,10 @@ def check_workers(db, stall_after):
         alive = session_alive(session)
         captured = tmux("capture-pane", "-p", "-t", session) if alive else None
         now = time.time()
-        turn_end = TURN_WATCHES.setdefault(dispatch_id, TurnWatch()).latest(row, now) if alive else None
+        # A resume starts a fresh watch: the host may record the reopened conversation elsewhere.
+        watch_key = (dispatch_id, db.execute("SELECT MAX(id) FROM message WHERE dispatch = ? AND type = 'resumed'",
+                                             (dispatch_id,)).fetchone()[0])
+        turn_end = TURN_WATCHES.setdefault(watch_key, TurnWatch()).latest(row, now) if alive else None
         # Decide and post under one write lock, re-checking state a worker's `done` may have changed.
         db.execute("BEGIN IMMEDIATE")
         try:

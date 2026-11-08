@@ -1077,12 +1077,14 @@ class ParallelState(unittest.TestCase):
         barrier = self.env.bin.parent / "barrier"
         barrier.mkdir()
         fake = self.env.bin / "tmux"
-        # Both continues pass their has-session check before either records the new round.
+        # Both continues try to pass their has-session check before either records the new round;
+        # the input lock lets only one in, so the barrier gives up waiting for the other after 2 s.
         fake.write_text(fake.read_text().replace(
             "    sys.exit(0 if os.path.exists",
             f"    if os.environ.get('CONTINUE_BARRIER'):\n"
             f"        open(os.path.join({str(barrier)!r}, str(os.getpid())), 'w').close()\n"
-            f"        while len(os.listdir({str(barrier)!r})) < 2: time.sleep(.01)\n"
+            f"        give_up = time.time() + 2\n"
+            f"        while len(os.listdir({str(barrier)!r})) < 2 and time.time() < give_up: time.sleep(.01)\n"
             f"    sys.exit(0 if os.path.exists", 1))
         task = self.env.task.with_name("r2.md")
         task.write_text("# r2\n")
@@ -1425,6 +1427,58 @@ class HostErrors(unittest.TestCase):
         self.assertTrue(self.wait(timeout="2.5")["timedOut"])
 
 
+    def test_a_replaced_or_truncated_record_is_read_again_from_its_start(self):
+        dispatch = self.env.dispatch("codex")
+        self.codex_rollout(dispatch, [{"type": "task_started", "turn_id": "t-1"}, self.codex_quota("t-1"),
+                                      {"type": "token_count", "info": {"padding": "x" * 4000}}])
+        self.assertEqual([m["type"] for m in self.relay_wait()], ["blocked"])
+        time.sleep(1.1)
+        self.env.json("nudge", dispatch, "--text", "continue")
+        self.codex_rollout(dispatch, [self.codex_quota("t-2")])  # shorter than what was read
+
+        [again] = self.relay_wait()
+        self.assertEqual((again["type"], again["kind"]), ("blocked", "usage_limit_exceeded"))
+
+    def relay_wait(self):
+        """Messages from one long-running relay pass, so the same TurnWatch sees the file change."""
+        if not hasattr(self, "relay"):
+            self.relay = subprocess.Popen(
+                [sys.executable, str(ROUTER), "relay", "--codex-thread", "t", "--stall-after", "60"],
+                env={**os.environ, "WFC_STATE": str(self.env.state), "CODEX_HOME": str(self.env.bin.parent / "codex-home"),
+                     "WFC_CLAUDE_CONFIG": str(self.env.bin.parent / "none.json"),
+                     "PATH": f"{self.env.bin}{os.pathsep}{os.environ['PATH']}", **self.still},
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.addCleanup(self.relay.wait)
+            self.addCleanup(self.relay.kill)
+            self.seen = 0
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            queued = [c for c in self.env.host_calls() if c[:2] == ["codex", "queue"]]
+            if len(queued) > self.seen:
+                batch = json.loads(queued[-1][queued[-1].index("--message") + 1].split(": ", 1)[1])["messages"]
+                self.seen = len(queued)
+                return batch
+            time.sleep(0.2)
+        return []
+
+    def test_a_malformed_opencode_record_does_not_stop_the_wait(self):
+        dispatch = self.env.dispatch("opencode")
+        db = sqlite3.connect(self.env.bin.parent / "opencode.db")
+        db.executescript("CREATE TABLE session (id TEXT, parent_id TEXT, time_created INTEGER);"
+                         "CREATE TABLE part (id TEXT, session_id TEXT, data TEXT);"
+                         "CREATE TABLE message (id TEXT, session_id TEXT, time_created INTEGER, data TEXT);")
+        brief = f"You are a worker dispatched by the controller (dispatch {dispatch}). Read"
+        db.execute("INSERT INTO session VALUES ('ses_w', NULL, 1)")
+        db.execute("INSERT INTO part VALUES ('p1', 'ses_w', ?)", (json.dumps({"type": "text", "text": brief}),))
+        db.execute("INSERT INTO message VALUES ('msg_1', 'ses_w', ?, ?)", (int(time.time() * 1000), "{not json"))
+        db.commit()
+        db.close()
+
+        # The screen watchdog still reports the stall.
+        [message] = self.wait(stall_after="1")["messages"]
+        self.assertEqual(message["type"], "stalled")
+
+
 class Nudge(unittest.TestCase):
     """nudge types a line into a worker still on its task, and records it."""
 
@@ -1441,6 +1495,25 @@ class Nudge(unittest.TestCase):
         status = self.env.json("status", "--dispatch", self.dispatch)
         self.assertEqual([m["type"] for m in status["dispatches"][0]["messages"]], ["nudge"])
         self.assertEqual(result["nudged"], self.dispatch)
+
+    def test_a_nudge_waits_for_input_already_being_typed_into_the_worker(self):
+        import fcntl
+        lock = os.open(self.env.state / f"input-{self.dispatch}.lock", os.O_RDWR | os.O_CREAT)
+        self.addCleanup(os.close, lock)
+        fcntl.flock(lock, fcntl.LOCK_EX)  # as a continue or reply typing into this session would
+        env = {**os.environ, "WFC_STATE": str(self.env.state), "PATH": f"{self.env.bin}{os.pathsep}{os.environ['PATH']}"}
+        nudging = subprocess.Popen([sys.executable, str(ROUTER), "nudge", self.dispatch, "--text", "hi"],
+                                   stdout=subprocess.DEVNULL, env=env)
+        self.addCleanup(nudging.wait)
+        self.addCleanup(nudging.kill)
+        time.sleep(1)
+        typed = lambda: [c for c in self.env.host_calls() if c[:2] == ["tmux", "send-keys"] and "-l" in c]
+        self.assertEqual(typed(), [])
+        self.assertIsNone(nudging.poll())
+
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        self.assertEqual(nudging.wait(timeout=10), 0)
+        self.assertEqual(typed()[-1][-1], "[router] Message from the controller: hi")
 
     def test_a_finished_worker_is_given_its_next_task_with_continue_instead(self):
         self.env.report.write_text("# report\n")
