@@ -1461,6 +1461,15 @@ class HostErrors(unittest.TestCase):
             time.sleep(0.2)
         return []
 
+    def test_a_rollout_that_vanishes_during_the_lookup_does_not_stop_the_wait(self):
+        dispatch = self.env.dispatch("codex")
+        self.codex_rollout(dispatch, [self.codex_quota()])
+        day = self.env.bin.parent / "codex-home" / "sessions" / "2026" / "11" / "08"
+        (day / "rollout-2026-11-07T00-00-00-gone.jsonl").symlink_to(day / "removed.jsonl")  # listed, then stat fails
+
+        [message] = self.wait()["messages"]
+        self.assertEqual((message["type"], message["kind"]), ("blocked", "usage_limit_exceeded"))
+
     def test_a_malformed_opencode_record_does_not_stop_the_wait(self):
         dispatch = self.env.dispatch("opencode")
         db = sqlite3.connect(self.env.bin.parent / "opencode.db")
@@ -1529,6 +1538,31 @@ class Nudge(unittest.TestCase):
         result = self.env.run("nudge", self.dispatch, "--text", "hi")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("resume", result.stderr)
+
+
+class ResumeInputLock(unittest.TestCase):
+    def test_a_resume_waits_for_input_being_typed_before_it_launches(self):
+        import fcntl
+        env = Env()
+        self.addCleanup(env.close)
+        dispatch = env.dispatch("claude")
+        env.end_session(dispatch)
+        lock = os.open(env.state / f"input-{dispatch}.lock", os.O_RDWR | os.O_CREAT)
+        self.addCleanup(os.close, lock)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        resuming = subprocess.Popen([sys.executable, str(ROUTER), "resume", dispatch], stdout=subprocess.DEVNULL,
+                                    env={**os.environ, "WFC_STATE": str(env.state),
+                                         "WFC_CLAUDE_CONFIG": str(env.bin.parent / "none.json"),
+                                         "PATH": f"{env.bin}{os.pathsep}{os.environ['PATH']}"})
+        self.addCleanup(resuming.wait)
+        self.addCleanup(resuming.kill)
+        launches = lambda: [c for c in env.host_calls() if c[:2] == ["tmux", "new-session"]]
+        time.sleep(1)
+        self.assertEqual(len(launches()), 1)  # only the dispatch
+
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        self.assertEqual(resuming.wait(timeout=10), 0)
+        self.assertEqual(len(launches()), 2)
 
 
 class Status(unittest.TestCase):

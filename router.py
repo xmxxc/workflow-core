@@ -153,8 +153,11 @@ def find_host_session(row):
         # sub-agents inherit the brief, so their rollouts (source.subagent) are skipped.
         root = codex_sessions()
         for rollout in sorted(root.rglob("rollout-*.jsonl")) if root.is_dir() else []:
-            if rollout.stat().st_mtime < (row["created"] or 0) - 60:
-                continue  # last written before this dispatch existed
+            try:
+                if rollout.stat().st_mtime < (row["created"] or 0) - 60:
+                    continue  # last written before this dispatch existed
+            except OSError:
+                continue  # removed or rotated since it was listed
             found = codex_rollout_opens_with(rollout, opening)
             if found:
                 return found
@@ -244,12 +247,12 @@ class TurnWatch:
         if now < self.next_check:
             return self.last
         self.next_check = now + self.CHECK_EVERY
-        if self.source is None and now >= self.next_lookup:
-            self.next_lookup = now + self.LOOKUP_EVERY
-            self.source = conversation_source(row)
-        if self.source is None:
-            return None
         try:
+            if self.source is None and now >= self.next_lookup:
+                self.next_lookup = now + self.LOOKUP_EVERY
+                self.source = conversation_source(row)
+            if self.source is None:
+                return None
             if row["host"] == "opencode":
                 self.last = opencode_turn_end(self.source)
             else:
@@ -521,8 +524,8 @@ def typing_error(session, what, typed):
 
 
 class input_lock:
-    """Serialises everything that types into one worker's session (continue and nudge from their
-    round check to their last keystroke; reply and an OpenCode resume while they type), so two inputs never interleave and a round check
+    """Serialises everything that types into one worker's session (continue, nudge and resume from
+    their locked round check to their last keystroke; reply while it types), so two inputs never interleave and a round check
     still holds when the text arrives. The worker's own `done` takes it too, so it cannot slip in
     between a nudge's check and its typing."""
 
@@ -757,44 +760,46 @@ def cmd_resume(args):
     command, extra_env = LAUNCHERS[row["host"]](worker_brief(args.dispatch, task, report, opening=opening),
                                                 [state_dir(), Path(row["report_dir"])], Path(row["cwd"]),
                                                 row["model"], host_session, resume=True)
-    # Posted before launch so the new session's `done` sorts after it, and under the write lock the
-    # watchdog also takes, so it cannot report the not-yet-started session as exited in between.
-    db.execute("BEGIN IMMEDIATE")
-    # Everything above was decided without the lock: give up if the round moved on meanwhile
-    # (another resume, a continue, a done) or a session came back.
-    # The row read before the lock must still be the current one, as must the round mark: an old
-    # row paired with a newer mark would relaunch the wrong round.
-    now = db.execute("SELECT task, report, host_session FROM dispatch WHERE id = ?", (args.dispatch,)).fetchone()
-    if (round_mark(db, args.dispatch) != mark or session_alive(session)
-            or (now["task"], now["report"], now["host_session"]) != (row["task"], row["report"], row["host_session"])):
-        db.execute("ROLLBACK")
-        raise SystemExit(f"dispatch {args.dispatch} changed while resuming (another resume, continue or done); "
-                         f"look at its state and run resume again if it is still needed")
-    if args.task:
-        refuse_used_report(db, args.dispatch, report)
-    post(db, args.dispatch, "worker", "resumed", {"session": host_session})
-    if args.task:
-        post(db, args.dispatch, "worker", "continue", {"task": str(task), "report": str(report)})
-    db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
-    launched = launch(args.dispatch, row["cwd"], command, extra_env)
-    if launched == NOT_SENT:
-        db.execute("ROLLBACK")
-        raise SystemExit(f"could not start tmux session {session}")
-    # The session (possibly) runs this task: record it with the launch, before typing can fail.
-    db.execute("UPDATE dispatch SET task = ?, report = ?, host_session = ? WHERE id = ?",
-               (str(task), str(report), host_session, args.dispatch))
-    db.execute("COMMIT")
-    if launched == UNCERTAIN:
-        raise SystemExit(f"tmux did not confirm {session}; the resumed round is recorded. Check `tmux ls`; "
-                         f"`wait` reports it exited if it never started.")
-    if row["host"] == "opencode":
-        brief = worker_brief(args.dispatch, task, report, opening=opening)
-        with input_lock(args.dispatch):
+    # From the locked re-check to the last keystroke under the input lock (taken before the SQLite
+    # lock, as everywhere), so no nudge, done or continue can come between the launch and the brief.
+    with input_lock(args.dispatch):
+        # Posted before launch so the new session's `done` sorts after it, and under the write lock the
+        # watchdog also takes, so it cannot report the not-yet-started session as exited in between.
+        db.execute("BEGIN IMMEDIATE")
+        # Everything above was decided without the lock: give up if the round moved on meanwhile
+        # (another resume, a continue, a done) or a session came back.
+        # The row read before the lock must still be the current one, as must the round mark: an old
+        # row paired with a newer mark would relaunch the wrong round.
+        now = db.execute("SELECT task, report, host_session FROM dispatch WHERE id = ?", (args.dispatch,)).fetchone()
+        if (round_mark(db, args.dispatch) != mark or session_alive(session)
+                or (now["task"], now["report"], now["host_session"]) != (row["task"], row["report"], row["host_session"])):
+            db.execute("ROLLBACK")
+            raise SystemExit(f"dispatch {args.dispatch} changed while resuming (another resume, continue or done); "
+                             f"look at its state and run resume again if it is still needed")
+        if args.task:
+            refuse_used_report(db, args.dispatch, report)
+        post(db, args.dispatch, "worker", "resumed", {"session": host_session})
+        if args.task:
+            post(db, args.dispatch, "worker", "continue", {"task": str(task), "report": str(report)})
+        db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
+        launched = launch(args.dispatch, row["cwd"], command, extra_env)
+        if launched == NOT_SENT:
+            db.execute("ROLLBACK")
+            raise SystemExit(f"could not start tmux session {session}")
+        # The session (possibly) runs this task: record it with the launch, before typing can fail.
+        db.execute("UPDATE dispatch SET task = ?, report = ?, host_session = ? WHERE id = ?",
+                   (str(task), str(report), host_session, args.dispatch))
+        db.execute("COMMIT")
+        if launched == UNCERTAIN:
+            raise SystemExit(f"tmux did not confirm {session}; the resumed round is recorded. Check `tmux ls`; "
+                             f"`wait` reports it exited if it never started.")
+        if row["host"] == "opencode":
+            brief = worker_brief(args.dispatch, task, report, opening=opening)
             typed = type_into(session, brief) if wait_for_quiet_screen(session) else NOT_SENT
-        if typed in (PARTIAL, UNCERTAIN):
-            raise typing_error(session, "The brief", typed)
-        if typed == NOT_SENT:
-            raise SystemExit(f"resumed {session} but could not type the brief into it; attach and paste it: {brief}")
+            if typed in (PARTIAL, UNCERTAIN):
+                raise typing_error(session, "The brief", typed)
+            if typed == NOT_SENT:
+                raise SystemExit(f"resumed {session} but could not type the brief into it; attach and paste it: {brief}")
     emit({"resumed": args.dispatch, "session": host_session, "tmux": session})
 
 
