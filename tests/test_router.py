@@ -128,6 +128,71 @@ class MessageRoundTrip(unittest.TestCase):
         self.assertEqual(enter_call, ["tmux", "send-keys", "-t", f"wfc-{dispatch}", "Enter"])
 
 
+class DoneHead(unittest.TestCase):
+    """done records the worker's HEAD and whether its worktree is dirty, read in the dispatch's cwd."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+        self.env.report.write_text("# report\n")
+
+    def git(self, *args):
+        return subprocess.run(["git", "-C", str(self.env.cwd), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                               *args], capture_output=True, text=True, check=True).stdout.strip()
+
+    def done(self, dispatch, **kw):
+        # Run from elsewhere: the dispatch's cwd counts, not the directory `done` runs in.
+        result = self.env.run("done", "--report", str(self.env.report), dispatch=dispatch,
+                              cwd=self.env.state.parent, **kw)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [message] = self.env.json("wait", "--timeout", "2")["messages"]
+        return message
+
+    def test_head_of_a_clean_worktree_is_recorded_and_shown_by_status(self):
+        self.git("init", "-q")
+        self.git("commit", "-q", "--allow-empty", "-m", "one")
+        dispatch = self.env.dispatch()
+
+        message = self.done(dispatch)
+
+        self.assertEqual((message["head"], message["dirty"]), (self.git("rev-parse", "HEAD"), False))
+        [view] = self.env.json("status")["dispatches"]
+        self.assertEqual((view["last"]["head"], view["last"]["dirty"]), (message["head"], False))
+
+    def test_an_untracked_file_makes_the_worktree_dirty(self):
+        self.git("init", "-q")
+        self.git("commit", "-q", "--allow-empty", "-m", "one")
+        (self.env.cwd / "new.txt").write_text("x\n")
+        dispatch = self.env.dispatch()
+
+        self.assertEqual(self.done(dispatch)["dirty"], True)
+
+    def test_outside_a_git_repository_both_are_null(self):
+        dispatch = self.env.dispatch()
+
+        message = self.done(dispatch, env={"GIT_CEILING_DIRECTORIES": str(self.env.cwd.parent)})
+
+        self.assertEqual((message["head"], message["dirty"]), (None, None))
+
+    def test_a_git_that_fails_or_hangs_does_not_stop_done(self):
+        self.git("init", "-q")
+        self.git("commit", "-q", "--allow-empty", "-m", "one")
+        dispatch = self.env.dispatch()
+        fakes = self.env.bin.parent / "fake-git"
+        fakes.mkdir()
+        for mode in ("fail", "hang"):
+            with self.subTest(mode=mode):
+                fake = fakes / "git"
+                fake.write_text(f"#!{sys.executable}\nimport sys, time\n"
+                                + ("sys.exit(128)\n" if mode == "fail" else "time.sleep(60)\n"))
+                fake.chmod(0o755)
+                path = f"{fakes}{os.pathsep}{self.env.bin}{os.pathsep}{os.environ['PATH']}"
+
+                message = self.done(dispatch, env={"PATH": path}, timeout=30)
+
+                self.assertEqual((message["head"], message["dirty"]), (None, None))
+
+
 class Delivery(unittest.TestCase):
     def setUp(self):
         self.env = Env()

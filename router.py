@@ -524,18 +524,38 @@ def cmd_done(args):
         raise SystemExit(f"report not found: {report}")
     db = connect()
     dispatch_id = current_dispatch(db)
+    # Read before any lock: git may be slow, and it reads the worktree, not router.db.
+    head = worktree_head(db.execute("SELECT cwd FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()["cwd"])
     with input_lock(dispatch_id):  # a nudge being typed lands before this done, as recorded
-        return finish_round(db, dispatch_id, report)
+        return finish_round(db, dispatch_id, report, head)
 
 
-def finish_round(db, dispatch_id, report):
+GIT_TIMEOUT = 5
+
+
+def worktree_head(cwd):
+    """{"head": commit, "dirty": bool} of the worker's worktree, for the controller to compare with
+    the head its report names. Both are None when git fails, times out or cwd is not a repository."""
+    def git(*args):
+        # GIT_OPTIONAL_LOCKS=0: `status` must not refresh the index, so done never writes the repo.
+        return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=GIT_TIMEOUT,
+                              env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"}, check=True).stdout
+    try:
+        head = git("rev-parse", "--verify", "HEAD").strip()
+        dirty = bool(git("status", "--porcelain", "--untracked-files=normal").strip())
+    except (OSError, subprocess.SubprocessError):
+        return {"head": None, "dirty": None}
+    return {"head": head, "dirty": dirty}
+
+
+def finish_round(db, dispatch_id, report, head):
     db.execute("BEGIN IMMEDIATE")
     current = db.execute("SELECT report FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()["report"]
     # A retried `done` from an earlier round must not finish the round that followed it.
     if current and str(report) != current:
         db.execute("ROLLBACK")
         raise SystemExit(f"{report} is the report of an earlier round; the current round reports to {current}")
-    message_id = post(db, dispatch_id, "controller", "done", {"report": str(report)})
+    message_id = post(db, dispatch_id, "controller", "done", {"report": str(report), **head})
     db.execute("COMMIT")
     emit({"message": message_id})
 
