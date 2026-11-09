@@ -205,8 +205,7 @@ def find_host_session(row):
     if row["host"] == "codex":
         # Codex records each conversation as a rollout whose first line names it. A reviewer's
         # sub-agents inherit the brief, so their rollouts (source.subagent) are skipped.
-        root = codex_sessions()
-        for rollout in sorted(root.rglob("rollout-*.jsonl")) if root.is_dir() else []:
+        for rollout in codex_rollouts():
             try:
                 if rollout.stat().st_mtime < (row["created"] or 0) - 60:
                     continue  # last written before this dispatch existed
@@ -238,6 +237,20 @@ def find_host_session(row):
 
 def codex_sessions():
     return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser() / "sessions"
+
+
+def codex_rollouts(pattern="rollout-*.jsonl"):
+    root = codex_sessions()
+    return sorted(root.rglob(pattern)) if root.is_dir() else []
+
+
+def codex_rollout_meta(lines):
+    """The session_meta payload on a rollout's first line: `id` names the conversation."""
+    return json.loads(next(lines))["payload"]
+
+
+def codex_subagent(meta):
+    return isinstance(meta.get("source"), dict) and "subagent" in meta["source"]
 
 
 def opencode_db():
@@ -370,8 +383,8 @@ def codex_rollout_opens_with(rollout, opening):
     with `opening`, else None. Reads only up to that message."""
     try:
         with open(rollout, errors="replace") as lines:
-            meta = json.loads(next(lines))["payload"]
-            if isinstance(meta.get("source"), dict) and "subagent" in meta["source"]:
+            meta = codex_rollout_meta(lines)
+            if codex_subagent(meta):
                 return None
             for line in lines:
                 if opening not in line:
@@ -1119,8 +1132,9 @@ def cmd_wait(args):
 
 def queue_into_codex(thread, messages):
     """Deliver one batch as a new turn of the Codex controller session (open or closed).
-    Returns "delivered", "failed" (codex could not even start: safe to retry) or "uncertain"
-    (codex ran but did not confirm, e.g. a timeout or a non-zero exit that may follow
+    Returns "delivered", "failed" (codex could not even start: safe to retry), "missing" (codex
+    found no rollout for the thread: certainly not delivered, and retrying cannot help) or
+    "uncertain" (codex ran but did not confirm, e.g. a timeout or a non-zero exit that may follow
     acceptance: not retried, so a batch is never queued twice)."""
     text = "[router] Messages for the controller: " + json.dumps({"messages": messages}, ensure_ascii=False)
     ids = [m["id"] for m in messages]
@@ -1134,6 +1148,11 @@ def queue_into_codex(thread, messages):
         print(f"router relay: codex queue timed out; delivery of messages {ids} is uncertain and not retried. "
               f"Check the controller session; the messages stay in router.db.", flush=True)
         return "uncertain"
+    if result.returncode != 0 and "no rollout found for thread" in result.stdout + result.stderr:
+        print(f"router relay: codex queue found no conversation for thread {thread}: "
+              f"{(result.stderr or result.stdout).strip()}; messages {ids} stay waiting. Relay stopped.",
+              file=sys.stderr, flush=True)
+        return "missing"
     if result.returncode != 0:
         print(f"router relay: codex queue exited {result.returncode}: {result.stderr.strip()}; delivery of "
               f"messages {ids} is uncertain and not retried. Check the controller session; the messages stay "
@@ -1180,15 +1199,52 @@ def post_into_opencode(url, session, messages):
     return "uncertain"
 
 
+def checked_codex_thread(thread):
+    """`thread` as a lower-case UUID, once a top-level Codex rollout names it; exits otherwise.
+    `codex queue` accepts any thread, so a wrong id would deliver nothing and still look delivered.
+    Codex names each rollout `rollout-<time>-<id>.jsonl`, so only that file is opened."""
+    try:
+        thread = str(uuid.UUID(thread))
+    except ValueError:
+        raise SystemExit(f"--codex-thread {thread!r} is not a session UUID; give the controller's UUID "
+                         f"(a thread name cannot be checked) or run `relay --codex` inside the controller")
+    for rollout in codex_rollouts(f"rollout-*-{thread}.jsonl"):
+        try:
+            with open(rollout, errors="replace") as lines:
+                meta = codex_rollout_meta(lines)
+        except (OSError, ValueError, KeyError, TypeError, StopIteration):
+            continue
+        if not isinstance(meta, dict) or meta.get("id") != thread:
+            continue
+        if codex_subagent(meta):
+            raise SystemExit(f"Codex thread {thread} is a sub-agent ({rollout}); relay to the controller's "
+                             f"own thread")
+        current = os.environ.get("CODEX_THREAD_ID")
+        if current and current.lower() != thread:
+            raise SystemExit(f"--codex-thread {thread} is not this Codex session's thread (CODEX_THREAD_ID="
+                             f"{current}); use `relay --codex`, or unset CODEX_THREAD_ID to relay into another "
+                             f"session")
+        return thread
+    raise SystemExit(f"no rollout for Codex thread {thread} under {codex_sessions()}; check the id "
+                     f"(codex queue silently accepts a thread that does not exist)")
+
+
 def relay_target(args):
     """The controller to push into: a Codex thread, or an OpenCode session at a URL."""
     opencode = bool(args.opencode_url) or bool(args.opencode_session)
-    if bool(args.codex_thread) == opencode or (opencode and not (args.opencode_url and args.opencode_session)):
-        raise SystemExit("give either --codex-thread, or both --opencode-url and --opencode-session")
+    codex = args.codex or bool(args.codex_thread)
+    if args.codex and args.codex_thread:
+        raise SystemExit("give --codex or --codex-thread, not both")
+    if codex == opencode or (opencode and not (args.opencode_url and args.opencode_session)):
+        raise SystemExit("give either --codex, --codex-thread, or both --opencode-url and --opencode-session")
     if opencode and not args.opencode_url.startswith(("http://", "https://")):
         raise SystemExit("--opencode-url must be an http(s) URL, e.g. http://127.0.0.1:4096")
-    if args.codex_thread:
-        return ["--codex-thread", args.codex_thread], lambda batch: queue_into_codex(args.codex_thread, batch)
+    if codex:
+        if args.codex and not os.environ.get("CODEX_THREAD_ID"):
+            raise SystemExit("--codex needs CODEX_THREAD_ID, which Codex sets for its shell commands; "
+                             "outside Codex give --codex-thread <session-uuid>")
+        thread = checked_codex_thread(args.codex_thread or os.environ["CODEX_THREAD_ID"])
+        return ["--codex-thread", thread], lambda batch: queue_into_codex(thread, batch)
     return (["--opencode-url", args.opencode_url, "--opencode-session", args.opencode_session],
             lambda batch: post_into_opencode(args.opencode_url, args.opencode_session, batch))
 
@@ -1214,9 +1270,12 @@ def cmd_relay(args):
         while deadline is None or time.monotonic() < deadline:
             check_workers(db, args.stall_after)
             messages = take_controller_messages(db)
-            if messages and deliver(messages) == "failed":
+            outcome = deliver(messages) if messages else None
+            if outcome in ("failed", "missing"):
                 # Put the batch back so the next pass, or a `wait`, delivers it.
                 db.executemany("UPDATE message SET delivered = 0 WHERE id = ?", [(m["id"],) for m in messages])
+                if outcome == "missing":
+                    return 1  # the thread is gone or wrong: every later batch would be lost too
                 time.sleep(5)
             time.sleep(0.5)
     return 0
@@ -1277,7 +1336,9 @@ def main(argv):
                    help="seconds a worker's screen may stay unchanged before it is reported as stalled")
     p.set_defaults(func=cmd_wait)
     p = sub.add_parser("relay", help="push controller messages into a Codex or OpenCode controller session")
-    p.add_argument("--codex-thread", help="the Codex controller's session UUID or name")
+    p.add_argument("--codex", action="store_true",
+                   help="relay into the Codex session this runs in ($CODEX_THREAD_ID)")
+    p.add_argument("--codex-thread", help="the Codex controller's session UUID, checked against its rollout")
     p.add_argument("--opencode-url", help="the OpenCode controller's server, e.g. http://127.0.0.1:4096")
     p.add_argument("--opencode-session", help="the OpenCode controller's session id (ses_...)")
     p.add_argument("--stall-after", type=float, default=300)

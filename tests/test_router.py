@@ -68,6 +68,8 @@ class Env:
                     "CLAUDE_CONFIG_DIR": str(self.bin.parent / "claude-home"),
                     "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}", **(env or {})}
         full_env.pop("WFC_DISPATCH", None)
+        if "CODEX_THREAD_ID" not in (env or {}):
+            full_env.pop("CODEX_THREAD_ID", None)  # set when the tests themselves run inside Codex
         if dispatch:
             full_env["WFC_DISPATCH"] = dispatch
         return subprocess.run([sys.executable, str(ROUTER), *args], capture_output=True,
@@ -90,6 +92,16 @@ class Env:
 
     def close(self):
         self.tmp.cleanup()
+
+    def codex_controller(self, thread, subagent=False, meta_id=None):
+        """A Codex controller's rollout, named the way Codex names it, so relay accepts `thread`."""
+        day = self.bin.parent / "codex-home" / "sessions" / "2026" / "11" / "09"
+        day.mkdir(parents=True, exist_ok=True)
+        source = {"subagent": {"thread_spawn": {"parent_thread_id": "p", "depth": 1}}} if subagent else "cli"
+        meta = {"type": "session_meta", "payload": {"id": meta_id or thread, "source": source}}
+        rollout = day / f"rollout-2026-11-09T06-25-37-{thread}.jsonl"
+        rollout.write_text(json.dumps(meta) + "\n")
+        return rollout
 
 
 class MessageRoundTrip(unittest.TestCase):
@@ -842,6 +854,7 @@ class CodexRelay(unittest.TestCase):
         self.addCleanup(self.env.close)
         self.dispatch = self.env.dispatch()
         self.env.report.write_text("# report\n")
+        self.env.codex_controller(self.THREAD)
 
     def relay(self, seconds="1.5", env=None):
         return self.env.run("relay", "--codex-thread", self.THREAD, "--for", seconds, env=env)
@@ -916,6 +929,115 @@ class CodexRelay(unittest.TestCase):
         [call] = self.queued()
         self.assertIn('"type": "done"', call[call.index("--message") + 1])
 
+
+
+class CodexRelayThread(unittest.TestCase):
+    """relay checks the Codex thread before it starts: `codex queue` also succeeds for a thread
+    that does not exist, so a wrong id would silently deliver nothing."""
+
+    THREAD = CodexRelay.THREAD
+    OTHER = "01a1c045-6cbc-7130-9daa-d087275fb216"
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+
+    def relay(self, *args, env=None):
+        return self.env.run("relay", *args, "--for", "0.5", env=env)
+
+    def queued(self):
+        return [c for c in self.env.host_calls() if c[:2] == ["codex", "queue"]]
+
+    def assert_refused(self, result, *words):
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        for word in words:
+            self.assertIn(word, result.stderr)
+        self.assertEqual(self.queued(), [])
+
+    def test_codex_flag_relays_to_the_current_codex_thread(self):
+        self.env.codex_controller(self.THREAD)
+        dispatch = self.env.dispatch()
+        self.env.report.write_text("# r\n")
+        self.env.run("done", "--report", str(self.env.report), dispatch=dispatch)
+
+        result = self.relay("--codex", env={"CODEX_THREAD_ID": self.THREAD})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [call] = self.queued()
+        self.assertEqual(call[2:4], ["--thread", self.THREAD])
+
+    def test_codex_flag_outside_codex_is_refused(self):
+        self.assert_refused(self.relay("--codex"), "CODEX_THREAD_ID")
+
+    def test_a_thread_without_a_rollout_is_refused(self):
+        self.env.codex_controller(self.OTHER)
+        self.assert_refused(self.relay("--codex-thread", self.THREAD), self.THREAD, "no rollout")
+
+    def test_a_sub_agent_thread_is_refused(self):
+        self.env.codex_controller(self.THREAD, subagent=True)
+        self.assert_refused(self.relay("--codex-thread", self.THREAD), "sub-agent")
+        self.assert_refused(self.relay("--codex", env={"CODEX_THREAD_ID": self.THREAD}), "sub-agent")
+
+    def test_a_rollout_whose_first_line_names_another_thread_is_refused(self):
+        self.env.codex_controller(self.THREAD, meta_id=self.OTHER)
+        self.assert_refused(self.relay("--codex-thread", self.THREAD), "no rollout")
+
+    def test_a_thread_name_is_refused(self):
+        self.assert_refused(self.relay("--codex-thread", "controller"), "UUID")
+
+    def test_an_explicit_thread_other_than_the_current_codex_thread_is_refused(self):
+        self.env.codex_controller(self.THREAD)
+        self.env.codex_controller(self.OTHER)
+
+        self.assert_refused(self.relay("--codex-thread", self.THREAD, env={"CODEX_THREAD_ID": self.OTHER}),
+                            self.THREAD, self.OTHER)
+        same = self.relay("--codex-thread", self.THREAD.upper(), env={"CODEX_THREAD_ID": self.THREAD})
+        self.assertEqual(same.returncode, 0, same.stderr)
+
+    def test_codex_flag_and_an_explicit_thread_together_are_refused(self):
+        self.env.codex_controller(self.THREAD)
+        self.assert_refused(self.relay("--codex", "--codex-thread", self.THREAD,
+                                       env={"CODEX_THREAD_ID": self.THREAD}))
+
+    def test_a_detached_relay_with_a_bad_thread_starts_no_child(self):
+        result = self.env.run("relay", "--codex-thread", self.THREAD, "--detach", "--for", "2")
+        if '"pid"' in result.stdout:  # a regression must not leave a relay running
+            self.addCleanup(lambda: subprocess.run(["kill", str(json.loads(result.stdout)["pid"])],
+                                                   capture_output=True))
+
+        self.assert_refused(result, "no rollout")
+        self.assertEqual(result.stdout, "")
+        self.assertFalse((self.env.state / "relay.log").exists())
+
+    def test_a_queue_that_finds_no_rollout_stops_the_relay_and_keeps_the_batch(self):
+        # codex queue fails outright for a thread it has no rollout for (seen on Codex 0.167 when
+        # the rollout lies outside its own CODEX_HOME): the batch certainly did not arrive.
+        self.env.codex_controller(self.THREAD)
+        fake = self.env.bin / "codex"
+        fake.write_text(fake.read_text() + "if sys.argv[1] == 'queue':\n"
+                        "    print('Error: no rollout found for thread id ' + sys.argv[3], file=sys.stderr)\n"
+                        "    sys.exit(1)\n")
+        dispatch = self.env.dispatch()
+        self.env.report.write_text("# r\n")
+        self.env.run("done", "--report", str(self.env.report), dispatch=dispatch)
+
+        result = self.env.run("relay", "--codex-thread", self.THREAD, "--for", "3")
+        [message] = self.env.json("wait", "--timeout", "1")["messages"]
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no rollout found", result.stderr)
+        self.assertNotIn("uncertain", result.stdout + result.stderr)
+        self.assertEqual(len(self.queued()), 1)
+        self.assertEqual(message["type"], "done")
+
+    def test_the_check_opens_only_the_rollout_named_by_the_thread(self):
+        # Every other rollout is left unread: a FIFO here would block any reader forever.
+        os.mkfifo(self.env.codex_controller(self.THREAD).with_name(f"rollout-2026-11-09T07-00-00-{self.OTHER}.jsonl"))
+
+        result = self.relay("--codex-thread", self.THREAD)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class Resume(unittest.TestCase):
@@ -1339,7 +1461,8 @@ class RelayUncertainDelivery(unittest.TestCase):
         self.env.report.write_text("# r\n")
         self.env.run("done", "--report", str(self.env.report), dispatch=dispatch)
 
-        result = self.env.run("relay", "--codex-thread", "t-1", "--for", "4", env={"WFC_QUEUE_TIMEOUT": "1"},
+        self.env.codex_controller(CodexRelay.THREAD)
+        result = self.env.run("relay", "--codex-thread", CodexRelay.THREAD, "--for", "4", env={"WFC_QUEUE_TIMEOUT": "1"},
                               timeout=20)
 
         queued = [c for c in self.env.host_calls() if c[:2] == ["codex", "queue"]]
@@ -1639,12 +1762,15 @@ class OpenCodeRelay(unittest.TestCase):
         self.assertEqual(self.env.json("wait", "--timeout", "0.5")["messages"], [])
 
     def test_relay_needs_exactly_one_controller(self):
-        both = self.env.run("relay", "--codex-thread", "t", "--opencode-url", self.url, "--opencode-session",
+        both = self.env.run("relay", "--codex-thread", CodexRelay.THREAD, "--opencode-url", self.url, "--opencode-session",
                             self.SESSION, "--for", "0.1")
+        current = self.env.run("relay", "--codex", "--opencode-url", self.url, "--opencode-session",
+                               self.SESSION, "--for", "0.1", env={"CODEX_THREAD_ID": CodexRelay.THREAD})
         neither = self.env.run("relay", "--for", "0.1")
         half = self.env.run("relay", "--opencode-url", self.url, "--for", "0.1")
 
         self.assertNotEqual(both.returncode, 0)
+        self.assertNotEqual(current.returncode, 0)
         self.assertNotEqual(neither.returncode, 0)
         self.assertNotEqual(half.returncode, 0)
 
@@ -1758,9 +1884,11 @@ class HostErrors(unittest.TestCase):
     def relay_wait(self):
         """Messages from one long-running relay pass, so the same TurnWatch sees the file change."""
         if not hasattr(self, "relay"):
+            self.env.codex_controller(CodexRelay.THREAD)
+            env = {k: v for k, v in os.environ.items() if k != "CODEX_THREAD_ID"}
             self.relay = subprocess.Popen(
-                [sys.executable, str(ROUTER), "relay", "--codex-thread", "t", "--stall-after", "60"],
-                env={**os.environ, "WFC_STATE": str(self.env.state), "CODEX_HOME": str(self.env.bin.parent / "codex-home"),
+                [sys.executable, str(ROUTER), "relay", "--codex-thread", CodexRelay.THREAD, "--stall-after", "60"],
+                env={**env, "WFC_STATE": str(self.env.state), "CODEX_HOME": str(self.env.bin.parent / "codex-home"),
                      "WFC_CLAUDE_CONFIG": str(self.env.bin.parent / "none.json"),
                      "PATH": f"{self.env.bin}{os.pathsep}{os.environ['PATH']}", **self.still},
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
