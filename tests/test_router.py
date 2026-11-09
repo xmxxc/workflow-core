@@ -128,6 +128,17 @@ class MessageRoundTrip(unittest.TestCase):
         self.assertEqual(enter_call, ["tmux", "send-keys", "-t", f"wfc-{dispatch}", "Enter"])
 
 
+def make_non_utf8_path(parent, name=b"caf\xe9"):
+    """Create a directory whose name is not valid UTF-8 (POSIX: any bytes but / and NUL),
+    or skip the test where the file system refuses one (macOS APFS does: EILSEQ)."""
+    path = os.path.join(os.fsencode(parent), name)
+    try:
+        os.mkdir(path)
+    except OSError as err:
+        raise unittest.SkipTest(f"this file system cannot create a non-UTF-8 file name: {err}")
+    return path
+
+
 class Labels(unittest.TestCase):
     """Each dispatch has a label, `<project> | <ticket> | <role>`, shown in status, as the tmux window
     name and, for Claude Code, as the session name."""
@@ -176,6 +187,24 @@ class Labels(unittest.TestCase):
         [call] = self.launches()
         self.assertEqual(self.window_name(call), "app | 7 | design")
         self.assertEqual(self.env.json("status")["dispatches"][0]["label"], "app | 7 | design")
+
+    def test_a_main_repository_with_a_non_utf8_name_still_gives_a_default_label(self):
+        root = self.env.cwd.parent
+        main = make_non_utf8_path(root)  # git prints it raw: the common dir of a linked worktree is absolute
+        git = lambda *a: subprocess.run([b"git", b"-C", main, b"-c", b"user.name=t", b"-c",
+                                         b"user.email=t@example.invalid", *a], check=True, capture_output=True)
+        git(b"init", b"-q")
+        git(b"commit", b"-q", b"--allow-empty", b"-m", b"one")
+        self.env.cwd = root / "trees" / "v1"
+        git(b"worktree", b"add", b"-q", os.fsencode(self.env.cwd))
+        self.env.report = root / "reports" / "113-impl" / "r1.md"
+
+        out = self.env.json("dispatch", "--host", "codex", "--task", str(self.env.task), "--cwd",
+                            str(self.env.cwd), "--report", str(self.env.report))
+
+        self.assertEqual(out["label"], "caf\ufffd | 113 | impl")  # undecodable bytes read as U+FFFD
+        [call] = self.launches()
+        self.assertEqual(self.window_name(call), "caf\ufffd | 113 | impl")
 
     def test_resume_keeps_the_label(self):
         dispatch = self.env.dispatch("claude", extra_args=("--label", "p | 9 | review"))
@@ -234,6 +263,18 @@ class DoneHead(unittest.TestCase):
         message = self.done(dispatch, env={"GIT_CEILING_DIRECTORIES": str(self.env.cwd.parent)})
 
         self.assertEqual((message["head"], message["dirty"]), (None, None))
+
+    def test_an_untracked_non_utf8_file_name_printed_raw_makes_the_worktree_dirty(self):
+        self.git("init", "-q")
+        self.git("config", "core.quotePath", "false")  # git status prints the name's bytes as they are
+        self.git("commit", "-q", "--allow-empty", "-m", "one")
+        make_non_utf8_path(self.env.cwd, b"r\xe9sum\xe9")
+        open(os.path.join(make_non_utf8_path(self.env.cwd, b"\xff\xfe"), b"f"), "wb").close()
+        dispatch = self.env.dispatch()
+
+        message = self.done(dispatch)
+
+        self.assertEqual((message["head"], message["dirty"]), (self.git("rev-parse", "HEAD"), True))
 
     def test_a_git_that_fails_or_hangs_does_not_stop_done(self):
         self.git("init", "-q")

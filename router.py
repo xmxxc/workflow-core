@@ -492,12 +492,19 @@ def default_label(cwd, report):
     the worktree's git common dir; the worktree's own name outside git), and the ticket and role
     come from the report directory, `reports/<ticket>-<role>/`, split at its last `-`."""
     try:
-        common = git(cwd, "rev-parse", "--git-common-dir").strip()
+        common = os.fsdecode(git(cwd, "rev-parse", "--git-common-dir").rstrip(b"\n"))
         project = (Path(cwd) / common).resolve().parent.name
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, UnicodeError):
         project = Path(cwd).name
-    ticket, _, role = Path(report).parent.name.rpartition("-")
+    ticket, _, role = readable(Path(report).parent.name).rpartition("-")
+    project = readable(project)
     return clean_label(" | ".join(part for part in (project, ticket, role) if part))
+
+
+def readable(name):
+    """A file name as text that can be stored and printed: bytes that are not valid UTF-8 (kept by
+    os.fsdecode as surrogates) read as U+FFFD."""
+    return os.fsencode(name).decode("utf-8", "replace")
 
 
 def launch(dispatch_id, cwd, command, extra_env, label=None):
@@ -561,10 +568,12 @@ GIT_TIMEOUT = 5
 
 
 def git(cwd, *args):
-    """Run git in cwd and return its output; raises OSError or SubprocessError when it cannot run,
-    fails or takes longer than GIT_TIMEOUT. GIT_OPTIONAL_LOCKS=0: `status` must not refresh the
-    index, so the router never writes the worker's repository."""
-    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=GIT_TIMEOUT,
+    """Run git in cwd and return its output as bytes; raises OSError or SubprocessError when it
+    cannot run, fails or takes longer than GIT_TIMEOUT. Bytes, because git prints file and directory
+    names raw (core.quotePath=false, or any path it prints), and they need not be valid UTF-8; stderr
+    is never decoded. GIT_OPTIONAL_LOCKS=0: `status` must not refresh the index, so the router never
+    writes the worker's repository."""
+    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, timeout=GIT_TIMEOUT,
                           env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"}, check=True).stdout
 
 
@@ -572,9 +581,9 @@ def worktree_head(cwd):
     """{"head": commit, "dirty": bool} of the worker's worktree, for the controller to compare with
     the head its report names. Both are None when git fails, times out or cwd is not a repository."""
     try:
-        head = git(cwd, "rev-parse", "--verify", "HEAD").strip()
+        head = git(cwd, "rev-parse", "--verify", "HEAD").strip().decode("ascii")  # a hex object name
         dirty = bool(git(cwd, "status", "--porcelain", "--untracked-files=normal").strip())
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, UnicodeError):
         return {"head": None, "dirty": None}
     return {"head": head, "dirty": dirty}
 
