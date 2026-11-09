@@ -51,39 +51,76 @@ def session_name(dispatch_id):
     return f"wfc-{dispatch_id}"
 
 
+# Each table's columns as a fresh database creates them.
+TABLES = {
+    "dispatch": "id TEXT PRIMARY KEY, host TEXT, cwd TEXT, task TEXT, created REAL",
+    "message": "id INTEGER PRIMARY KEY AUTOINCREMENT, dispatch TEXT, recipient TEXT, "
+               "type TEXT, body TEXT, created REAL, delivered INTEGER DEFAULT 0",
+    "screen_watch": "dispatch TEXT PRIMARY KEY, screen TEXT, since REAL, reported_screen TEXT",
+    "host_error": "dispatch TEXT PRIMARY KEY, turn TEXT",
+    "waiter": "pid INTEGER PRIMARY KEY, kind TEXT, since REAL",
+}
+# Column upgrades: `started` is set once the worker's tmux session exists (the watchdog ignores
+# rows without it); `report_dir` is the directory the worker may write; `report`, `model` and
+# `host_session` are what `resume` needs (Claude Code's session id is set at dispatch).
+# `process_start` tells a waiter's own process from a later one that reuses its pid.
+ADDED_COLUMNS = {
+    "dispatch": {"started": "REAL", "report_dir": "TEXT", "report": "TEXT", "model": "TEXT", "host_session": "TEXT"},
+    "waiter": {"process_start": "TEXT"},
+}
+
+
+def missing_columns(db):
+    """{table: [column, ...]} for every existing table that lacks an added column."""
+    missing = {}
+    for table, added in ADDED_COLUMNS.items():
+        columns = {c["name"] for c in db.execute(f"PRAGMA main.table_info({table})")}
+        if columns and set(added) - columns:
+            missing[table] = [column for column in added if column not in columns]
+    return missing
+
+
 def connect():
+    """Open router.db for a command that writes, creating or upgrading its schema first."""
     state = state_dir()
     state.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(state / "router.db", timeout=30, isolation_level=None)
     db.row_factory = sqlite3.Row
-    db.executescript("""
-        CREATE TABLE IF NOT EXISTS dispatch (
-            id TEXT PRIMARY KEY, host TEXT, cwd TEXT, task TEXT, created REAL);
-        CREATE TABLE IF NOT EXISTS message (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, dispatch TEXT, recipient TEXT,
-            type TEXT, body TEXT, created REAL, delivered INTEGER DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS screen_watch (
-            dispatch TEXT PRIMARY KEY, screen TEXT, since REAL, reported_screen TEXT);
-        CREATE TABLE IF NOT EXISTS host_error (dispatch TEXT PRIMARY KEY, turn TEXT);
-        CREATE TABLE IF NOT EXISTS waiter (pid INTEGER PRIMARY KEY, kind TEXT, since REAL);
-    """)
-    # Column upgrades: `started` is set once the worker's tmux session exists (the watchdog ignores
-    # rows without it); `report_dir` is the directory the worker may write; `report`, `model` and
-    # `host_session` are what `resume` needs (Claude Code's session id is set at dispatch).
+    db.executescript("".join(f"CREATE TABLE IF NOT EXISTS {t} ({cols});" for t, cols in TABLES.items()))
     # Read and alter under one write lock, so parallel first uses do not add a column twice.
-    wanted = {"started": "REAL", "report_dir": "TEXT", "report": "TEXT", "model": "TEXT", "host_session": "TEXT"}
-    if set(wanted) - {c["name"] for c in db.execute("PRAGMA table_info(dispatch)")}:
+    if missing_columns(db):
         db.execute("BEGIN IMMEDIATE")
         try:
-            columns = {c["name"] for c in db.execute("PRAGMA table_info(dispatch)")}
-            for column, kind in wanted.items():
-                if column not in columns:
-                    db.execute(f"ALTER TABLE dispatch ADD COLUMN {column} {kind}")
+            for table, columns in missing_columns(db).items():
+                for column in columns:
+                    db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ADDED_COLUMNS[table][column]}")
             db.execute("COMMIT")
         except BaseException:
             db.execute("ROLLBACK")
             raise
     return db
+
+
+def connect_read_only():
+    """Open router.db without creating or upgrading anything, or None if it does not exist.
+    What an older schema lacks reads as empty: a missing table as a TEMP table with no rows, a
+    missing column as NULL through a TEMP view (TEMP objects live outside router.db and shadow
+    its own). Also returns whether the schema was older than this version."""
+    path = state_dir() / "router.db"
+    if not path.is_file():
+        return None, False
+    db = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=30)
+    db.row_factory = sqlite3.Row
+    existing = {r["name"] for r in db.execute("SELECT name FROM main.sqlite_master WHERE type = 'table'")}
+    missing = missing_columns(db)
+    for table, cols in TABLES.items():
+        if table not in existing:
+            added = "".join(f", {column} {kind}" for column, kind in ADDED_COLUMNS.get(table, {}).items())
+            db.execute(f"CREATE TEMP TABLE {table} ({cols}{added})")
+        elif table in missing:
+            nulls = "".join(f", NULL AS {column}" for column in missing[table])
+            db.execute(f"CREATE TEMP VIEW {table} AS SELECT *{nulls} FROM main.{table}")
+    return db, bool(set(TABLES) - existing or missing)
 
 
 def emit(obj):
@@ -672,8 +709,14 @@ def dispatch_state(db, dispatch_id):
 
 
 def cmd_status(args):
-    """Read-only view of the scope: every dispatch, undelivered messages and the running waiters."""
-    db = connect()
+    """Read-only view of the scope: every dispatch, undelivered messages and the running waiters.
+    It never creates, upgrades or changes router.db; write commands do that."""
+    db, outdated = connect_read_only()
+    if db is None:
+        if args.dispatch:
+            raise SystemExit(f"unknown dispatch {args.dispatch} in {state_dir()}")
+        emit({"state": str(state_dir()), "dispatches": [], "undelivered": [], "waiters": []})
+        return
     query = "SELECT * FROM dispatch WHERE started IS NOT NULL" + (" AND id = ?" if args.dispatch else "") + " ORDER BY created"
     rows = db.execute(query, (args.dispatch,) if args.dispatch else ()).fetchall()
     if args.dispatch and not rows:
@@ -695,9 +738,29 @@ def cmd_status(args):
                              + ("AND dispatch = ? " if args.dispatch else "") + "ORDER BY id",
                              (args.dispatch,) if args.dispatch else ()).fetchall()
     waiters = [{"pid": w["pid"], "kind": w["kind"], "since": local_time(w["since"])}
-               for w in db.execute("SELECT * FROM waiter ORDER BY since") if process_alive(w["pid"])]
+               for w in db.execute("SELECT * FROM waiter ORDER BY since") if waiter_alive(w)]
     emit({"state": str(state_dir()), "dispatches": dispatches,
-          "undelivered": [message_view(m) for m in undelivered], "waiters": waiters})
+          "undelivered": [message_view(m) for m in undelivered], "waiters": waiters,
+          **({"schema": "router.db is older than this wfc and is shown as far as it goes; "
+                        "the next write command (wait, dispatch, ...) upgrades it"} if outdated else {})})
+
+
+def waiter_alive(row):
+    """A row registered with its process start names that one process; an older row has only its pid."""
+    if row["process_start"]:
+        return process_start(row["pid"]) == row["process_start"]
+    return process_alive(row["pid"])
+
+
+def process_start(pid):
+    """When process `pid` started, as `ps` prints it, or None when there is no such process.
+    With the pid it names one process, so a reused pid does not pass for a gone one."""
+    try:
+        result = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                                env={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
+    except OSError:
+        return None
+    return result.stdout.strip() or None
 
 
 def process_alive(pid):
@@ -717,8 +780,8 @@ class registered_waiter:
         self.db, self.kind = db, kind
 
     def __enter__(self):
-        self.db.execute("INSERT OR REPLACE INTO waiter (pid, kind, since) VALUES (?, ?, ?)",
-                        (os.getpid(), self.kind, time.time()))
+        self.db.execute("INSERT OR REPLACE INTO waiter (pid, kind, since, process_start) VALUES (?, ?, ?, ?)",
+                        (os.getpid(), self.kind, time.time(), process_start(os.getpid())))
 
     def __exit__(self, *exc):
         self.db.execute("DELETE FROM waiter WHERE pid = ?", (os.getpid(),))

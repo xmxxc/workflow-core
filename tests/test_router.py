@@ -1268,6 +1268,7 @@ class OpenCodeRelay(unittest.TestCase):
 
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)  # cleanups run last-in first-out: shutdown, then close
         self.addCleanup(self.server.shutdown)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
 
@@ -1608,6 +1609,57 @@ class Status(unittest.TestCase):
 
         [view] = self.env.json("status")["dispatches"]
         self.assertEqual((view["state"], view["tmuxAlive"], view["last"]["type"]), ("exited", False, "exited"))
+
+    def test_status_without_a_state_database_is_empty_and_creates_nothing(self):
+        status = self.env.json("status")
+
+        self.assertEqual((status["dispatches"], status["undelivered"], status["waiters"]), ([], [], []))
+        self.assertFalse(self.env.state.exists())
+
+    def test_status_reads_an_old_state_database_without_upgrading_it(self):
+        self.env.state.mkdir()
+        path = self.env.state / "router.db"
+        db = sqlite3.connect(path)
+        db.executescript(
+            "CREATE TABLE dispatch(id TEXT PRIMARY KEY, host TEXT, cwd TEXT, task TEXT, created REAL);"
+            "CREATE TABLE message(id INTEGER PRIMARY KEY AUTOINCREMENT, dispatch TEXT, recipient TEXT,"
+            " type TEXT, body TEXT, created REAL, delivered INTEGER DEFAULT 0);"
+            "INSERT INTO dispatch VALUES ('old1', 'codex', '/w', '/t.md', 1);"
+            "INSERT INTO message (dispatch, recipient, type, body, created) VALUES"
+            " ('old1', 'controller', 'done', '{\"report\": \"/r.md\"}', 2);")
+        db.close()
+        before = path.read_bytes()
+
+        status = self.env.json("status")
+
+        self.assertEqual([(m["type"], m["dispatch"], m["report"]) for m in status["undelivered"]],
+                         [("done", "old1", "/r.md")])
+        self.assertIn("upgrade", status["schema"])
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(sorted(p.name for p in self.env.state.iterdir()), ["router.db"])
+
+    def test_a_write_command_adds_the_process_start_to_an_older_waiter_table(self):
+        self.env.state.mkdir()
+        db = sqlite3.connect(self.env.state / "router.db")
+        db.execute("CREATE TABLE waiter (pid INTEGER PRIMARY KEY, kind TEXT, since REAL)")
+        db.close()
+
+        self.env.json("wait", "--timeout", "0")
+
+        db = sqlite3.connect(self.env.state / "router.db")
+        self.assertIn("process_start", [c[1] for c in db.execute("PRAGMA table_info(waiter)")])
+        db.close()
+
+    def test_a_waiter_row_whose_pid_now_belongs_to_another_process_is_not_listed(self):
+        self.env.dispatch()
+        db = sqlite3.connect(self.env.state / "router.db")
+        # This test's own pid is alive, but it is not the process that registered the row.
+        db.execute("INSERT INTO waiter (pid, kind, since, process_start) VALUES (?, 'wait', ?, 'an earlier process')",
+                   (os.getpid(), time.time()))
+        db.commit()
+        db.close()
+
+        self.assertEqual(self.env.json("status")["waiters"], [])
 
 
 def socket_free_port():
