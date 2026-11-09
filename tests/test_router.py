@@ -219,6 +219,43 @@ class Delivery(unittest.TestCase):
                 command = call[call.index(host):]
                 self.assertEqual(command[command.index(flag) + 1], "some/model")
 
+    def test_effort_is_passed_to_each_host_in_its_own_flag(self):
+        for host, flag, value in (("codex", "-c", "model_reasoning_effort=high"), ("claude", "--effort", "high"),
+                                  ("opencode", "--variant", "high")):
+            with self.subTest(host=host):
+                self.env.calls.unlink(missing_ok=True)
+                self.env.dispatch(host, extra_args=["--effort", "high"])
+
+                [call] = self.env.host_calls()
+                command = call[call.index(host):]
+                self.assertEqual(command[command.index(flag) + 1], value)
+
+    def test_network_opens_the_codex_sandbox_to_the_network(self):
+        self.env.dispatch("codex")
+        self.env.calls.unlink()
+        self.env.dispatch("codex", extra_args=["--network"])
+
+        [call] = self.env.host_calls()
+        codex = call[call.index("codex"):]
+        self.assertEqual(codex[codex.index("-c") + 1], "sandbox_workspace_write.network_access=true")
+
+    def test_without_effort_or_network_codex_gets_no_config_override(self):
+        self.env.dispatch("codex")
+
+        [call] = self.env.host_calls()
+        self.assertNotIn("-c", call[call.index("codex"):])
+
+    def test_network_is_ignored_with_a_note_for_hosts_that_are_online_anyway(self):
+        for host in ("claude", "opencode"):
+            with self.subTest(host=host):
+                self.env.calls.unlink(missing_ok=True)
+                out = self.env.json("dispatch", "--host", host, "--task", str(self.env.task), "--cwd",
+                                    str(self.env.cwd), "--report", str(self.env.report), "--network")
+
+                [call] = self.env.host_calls()
+                self.assertNotIn("network", " ".join(call[call.index(host):-1]))
+                self.assertIn("--network", out["ignored"][0])
+
     def test_dispatch_requires_a_report_path(self):
         result = self.env.run("dispatch", "--host", "codex", "--task", str(self.env.task),
                               "--cwd", str(self.env.cwd))
@@ -679,6 +716,18 @@ class Resume(unittest.TestCase):
         self.assertIn("main-2222", codex)
         self.assertNotIn("sub-1111", codex)
         self.assertEqual(codex[codex.index("-s") + 1], "workspace-write")
+
+    def test_resume_keeps_the_effort_and_network_given_at_dispatch(self):
+        dispatch = self.env.dispatch("codex", extra_args=("--effort", "xhigh", "--network"))
+        self.codex_rollout(dispatch, "main-3333")
+        self.env.end_session(dispatch)
+
+        self.env.json("resume", dispatch)
+
+        [_, again] = self.launch(dispatch)
+        codex = again[again.index("codex"):]
+        overrides = [codex[i + 1] for i, arg in enumerate(codex) if arg == "-c"]
+        self.assertEqual(overrides, ["model_reasoning_effort=xhigh", "sandbox_workspace_write.network_access=true"])
 
     def test_opencode_worker_is_resumed_into_its_session_with_its_model(self):
         self.env.screen.write_text("> ready\n")

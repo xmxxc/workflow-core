@@ -62,10 +62,12 @@ TABLES = {
 }
 # Column upgrades: `started` is set once the worker's tmux session exists (the watchdog ignores
 # rows without it); `report_dir` is the directory the worker may write; `report`, `model` and
-# `host_session` are what `resume` needs (Claude Code's session id is set at dispatch).
+# `host_session` are what `resume` needs (Claude Code's session id is set at dispatch), and so are
+# `effort` and `network`, the dispatch's reasoning effort and Codex network access.
 # `process_start` tells a waiter's own process from a later one that reuses its pid.
 ADDED_COLUMNS = {
-    "dispatch": {"started": "REAL", "report_dir": "TEXT", "report": "TEXT", "model": "TEXT", "host_session": "TEXT"},
+    "dispatch": {"started": "REAL", "report_dir": "TEXT", "report": "TEXT", "model": "TEXT", "host_session": "TEXT",
+                 "effort": "TEXT", "network": "INTEGER"},
     "waiter": {"process_start": "TEXT"},
 }
 
@@ -145,18 +147,22 @@ def worker_brief(dispatch_id, task, report, opening=FIRST_BRIEF):
 # Each launcher returns (argv, extra environment) for an unattended worker that may write only
 # its cwd plus the `writable` directories (router state and the report's directory). `conversation`
 # is the host conversation to resume, or None for a new one (Claude Code: the id to give it).
+# `effort` goes to the host's own reasoning-effort option; `network` opens Codex's sandbox to the
+# network (the other hosts are not network-sandboxed; see IGNORED_OPTIONS).
 
-def codex_command(brief, writable, cwd, model, conversation=None, resume=False):
+def codex_command(brief, writable, cwd, model, conversation=None, resume=False, effort=None, network=False):
     # --no-alt-screen keeps the transcript in the tmux scrollback, so `tmux attach` shows history.
     extra = [arg for d in writable for arg in ("--add-dir", str(d))]
     models = ["-m", model] if model else []
-    flags = ["--no-alt-screen", "-s", "workspace-write", "-a", "never", *models, *extra]
+    overrides = [*(["-c", f"model_reasoning_effort={effort}"] if effort else []),
+                 *(["-c", "sandbox_workspace_write.network_access=true"] if network else [])]
+    flags = ["--no-alt-screen", "-s", "workspace-write", "-a", "never", *models, *overrides, *extra]
     if resume:
         return ["codex", "resume", *flags, conversation, brief], {}
     return ["codex", *flags, brief], {}
 
 
-def opencode_command(brief, writable, cwd, model, conversation=None, resume=False):
+def opencode_command(brief, writable, cwd, model, conversation=None, resume=False, effort=None, network=False):
     # OpenCode's directory rules are tool prompts, not a sandbox (shell writes bypass them), and
     # git or pnpm reach into ~ constantly, so an unattended worker allows every external directory
     # (user decision 2026-11-05). "*" overrides any narrower rule merged in from the user's config.
@@ -165,16 +171,18 @@ def opencode_command(brief, writable, cwd, model, conversation=None, resume=Fals
     config = {"permission": {"external_directory": {"*": "allow"},
                              "read": {"*.env": "allow", "*.env.*": "allow"}}}
     models = ["-m", model] if model else []
+    variant = ["--variant", effort] if effort else []  # OpenCode's provider-specific reasoning effort
     # OpenCode ignores --prompt when it reopens a session; `resume` types the brief in instead.
     start = ["-s", conversation] if resume else ["--prompt", brief]
-    return (["opencode", str(cwd), *models, *start], {"OPENCODE_CONFIG_CONTENT": json.dumps(config)})
+    return (["opencode", str(cwd), *models, *variant, *start], {"OPENCODE_CONFIG_CONTENT": json.dumps(config)})
 
 
-def claude_command(brief, writable, cwd, model, conversation=None, resume=False):
+def claude_command(brief, writable, cwd, model, conversation=None, resume=False, effort=None, network=False):
     # The brief goes first: --add-dir is variadic and would swallow a trailing prompt.
     models = ["--model", model] if model else []
+    efforts = ["--effort", effort] if effort else []
     sessions = ["--resume" if resume else "--session-id", conversation] if conversation else []
-    return ["claude", brief, "--permission-mode", "auto", *models, *sessions,
+    return ["claude", brief, "--permission-mode", "auto", *models, *efforts, *sessions,
             "--add-dir", *map(str, writable)], {}
 
 
@@ -431,6 +439,9 @@ def _trust_locked(path, cwd):
 
 
 LAUNCHERS = {"codex": codex_command, "opencode": opencode_command, "claude": claude_command}
+# Dispatch options a host does not need: dispatch accepts them and says so in its output.
+IGNORED_OPTIONS = {"opencode": {"network": "--network: OpenCode is not network-sandboxed; ignored"},
+                   "claude": {"network": "--network: Claude Code is not network-sandboxed; ignored"}}
 
 
 def cmd_dispatch(args):
@@ -442,12 +453,14 @@ def cmd_dispatch(args):
     report.parent.mkdir(parents=True, exist_ok=True)  # hosts grant access to existing directories
     host_session = str(uuid.uuid4()) if args.host == "claude" else None
     command, extra_env = LAUNCHERS[args.host](worker_brief(dispatch_id, task, report),
-                                              [state_dir(), report.parent], cwd, args.model, host_session)
+                                              [state_dir(), report.parent], cwd, args.model, host_session,
+                                              effort=args.effort, network=args.network)
+    ignored = [note for option, note in IGNORED_OPTIONS.get(args.host, {}).items() if getattr(args, option)]
     trusted_by = trust_claude_worktree(cwd) if args.host == "claude" else None
-    db.execute("INSERT INTO dispatch (id, host, cwd, task, created, report_dir, report, model, host_session) "
-               "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    db.execute("INSERT INTO dispatch (id, host, cwd, task, created, report_dir, report, model, host_session, "
+               "effort, network) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                (dispatch_id, args.host, str(cwd), str(task), time.time(), str(report.parent), str(report),
-                args.model, host_session))
+                args.model, host_session, args.effort, int(args.network)))
     launched = launch(dispatch_id, cwd, command, extra_env)
     if launched == NOT_SENT:
         db.execute("DELETE FROM dispatch WHERE id = ?", (dispatch_id,))
@@ -459,7 +472,7 @@ def cmd_dispatch(args):
         raise SystemExit(f"tmux did not confirm the worker's session for dispatch {dispatch_id}; it is kept. "
                          f"Check `tmux ls`; `wait` reports it exited if it never started.")
     emit({"dispatch": dispatch_id, "host": args.host, "tmux": session_name(dispatch_id),
-          **({"trustedBy": trusted_by} if trusted_by else {})})
+          **({"trustedBy": trusted_by} if trusted_by else {}), **({"ignored": ignored} if ignored else {})})
 
 
 def launch(dispatch_id, cwd, command, extra_env):
@@ -822,7 +835,8 @@ def cmd_resume(args):
                "already did, then continue" if not args.task else "[router] Resumed with a new task for you")
     command, extra_env = LAUNCHERS[row["host"]](worker_brief(args.dispatch, task, report, opening=opening),
                                                 [state_dir(), Path(row["report_dir"])], Path(row["cwd"]),
-                                                row["model"], host_session, resume=True)
+                                                row["model"], host_session, resume=True,
+                                                effort=row["effort"], network=bool(row["network"]))
     # From the locked re-check to the last keystroke under the input lock (taken before the SQLite
     # lock, as everywhere), so no nudge, done or continue can come between the launch and the brief.
     with input_lock(args.dispatch):
@@ -1137,6 +1151,10 @@ def main(argv):
     p.add_argument("--cwd", required=True)
     p.add_argument("--report", required=True, help="report path; its directory is made writable for the worker")
     p.add_argument("--model", help="model for the worker; passed to the host's own model flag")
+    p.add_argument("--effort", help="reasoning effort, passed to the host's own option "
+                                    "(Codex model_reasoning_effort, Claude Code --effort, OpenCode --variant)")
+    p.add_argument("--network", action="store_true",
+                   help="let a Codex worker's sandbox reach the network (other hosts are not sandboxed)")
     p.set_defaults(func=cmd_dispatch)
     p = sub.add_parser("done")
     p.add_argument("--report", required=True)
