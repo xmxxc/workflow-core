@@ -128,6 +128,98 @@ class MessageRoundTrip(unittest.TestCase):
         self.assertEqual(enter_call, ["tmux", "send-keys", "-t", f"wfc-{dispatch}", "Enter"])
 
 
+def make_repo(main, worktree=None):
+    """A git repository at `main` with one commit and, if given, a linked worktree at `worktree`."""
+    git = lambda *a: subprocess.run(["git", "-C", str(main), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                                     *a], check=True, capture_output=True)
+    subprocess.run(["git", "init", "-q", str(main)], check=True, capture_output=True)
+    git("commit", "-q", "--allow-empty", "-m", "one")
+    if worktree:
+        git("worktree", "add", "-q", str(worktree))
+
+
+class GitOption(unittest.TestCase):
+    """dispatch --git adds the worktree's git directories to a Codex worker's writable dirs, so it
+    can commit in its sandbox (docs/probes-20261109-codex-git.md)."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+
+    def launches(self):
+        return [c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]]
+
+    def added(self, call):
+        return [call[i + 1] for i, arg in enumerate(call) if arg == "--add-dir"]
+
+    def test_a_linked_worktree_gets_its_git_dir_and_the_common_dir(self):
+        main = self.env.cwd.parent / "main"
+        self.env.cwd = self.env.cwd.parent / "trees" / "v1"
+        make_repo(main, self.env.cwd)
+
+        self.env.dispatch("codex", extra_args=["--git"])
+
+        [call] = self.launches()
+        added = self.added(call[call.index("codex"):])
+        self.assertIn(str(main / ".git" / "worktrees" / "v1"), added)
+        self.assertIn(str(main / ".git"), added)
+        self.assertTrue(self.env.json("status")["dispatches"][0]["git"])
+
+    def test_a_main_checkout_gets_its_git_dir_once_as_an_absolute_path(self):
+        make_repo(self.env.cwd)
+
+        self.env.dispatch("codex", extra_args=["--git"])
+
+        [call] = self.launches()
+        added = self.added(call[call.index("codex"):])
+        self.assertEqual([d for d in added if d.endswith(".git")], [str(self.env.cwd / ".git")])
+
+    def test_without_git_no_git_directory_is_added(self):
+        make_repo(self.env.cwd)
+
+        self.env.dispatch("codex")
+
+        [call] = self.launches()
+        self.assertFalse([d for d in self.added(call) if ".git" in d])
+        self.assertFalse(self.env.json("status")["dispatches"][0]["git"])
+
+    def test_outside_a_repository_git_is_refused_and_leaves_no_dispatch(self):
+        result = self.env.run("dispatch", "--host", "codex", "--task", str(self.env.task), "--cwd", str(self.env.cwd),
+                              "--report", str(self.env.report), "--git",
+                              env={"GIT_CEILING_DIRECTORIES": str(self.env.cwd.parent)})
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a git repository", result.stderr)  # refused by --git, not by argparse
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(self.launches(), [])
+        db = sqlite3.connect(self.env.state / "router.db")
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM dispatch").fetchone()[0], 0)
+        db.close()
+
+    def test_git_is_ignored_with_a_note_for_hosts_that_can_write_git_anyway(self):
+        make_repo(self.env.cwd)
+        for host in ("claude", "opencode"):
+            with self.subTest(host=host):
+                self.env.calls.unlink(missing_ok=True)
+                out = self.env.json("dispatch", "--host", host, "--task", str(self.env.task), "--cwd",
+                                    str(self.env.cwd), "--report", str(self.env.report), "--git")
+
+                [call] = self.launches()
+                self.assertFalse([a for a in call if a.endswith(".git")])
+                self.assertIn("--git", " ".join(out["ignored"]))
+
+    def test_resume_keeps_git(self):
+        make_repo(self.env.cwd)
+        dispatch = self.env.dispatch("codex", extra_args=["--git"])
+        Resume.codex_rollout(self, dispatch, "main-4444")
+        self.env.end_session(dispatch)
+
+        self.env.json("resume", dispatch)
+
+        [_, again] = self.launches()
+        self.assertIn(str(self.env.cwd / ".git"), self.added(again[again.index("codex"):]))
+
+
 def make_non_utf8_path(parent, name=b"caf\xe9"):
     """Create a directory whose name is not valid UTF-8 (POSIX: any bytes but / and NUL),
     or skip the test where the file system refuses one (macOS APFS does: EILSEQ)."""
@@ -205,6 +297,13 @@ class Labels(unittest.TestCase):
         self.assertEqual(out["label"], "caf\ufffd | 113 | impl")  # undecodable bytes read as U+FFFD
         [call] = self.launches()
         self.assertEqual(self.window_name(call), "caf\ufffd | 113 | impl")
+
+    def test_a_label_that_cleans_to_nothing_falls_back_to_the_default(self):
+        self.env.dispatch("codex", extra_args=("--label", " \n\t\x1b "),
+                          env={"GIT_CEILING_DIRECTORIES": str(self.env.cwd.parent)})
+
+        [call] = self.launches()
+        self.assertEqual(self.window_name(call), "worktree | reports")
 
     def test_resume_keeps_the_label(self):
         dispatch = self.env.dispatch("claude", extra_args=("--label", "p | 9 | review"))

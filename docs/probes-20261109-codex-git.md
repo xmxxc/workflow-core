@@ -64,6 +64,7 @@ The temporary repository was removed afterwards (`rm -rf $P`).
 
 ## Conclusion
 
-- A Codex worker started the way the router starts it (`-s workspace-write`, worktree as cwd, only state and report directories added) **cannot commit** in a linked worktree: `index.lock` in the worktree's git directory is on a read-only file system.
-- Adding the worktree's `--git-dir` and `--git-common-dir` with `--add-dir` **lets `git commit` succeed** with no other change.
+- A Codex worker started the way the router starts it (`-s workspace-write`, worktree as cwd, only state and report directories added) **cannot commit** in a linked worktree **when the worktree's git directories lie outside every writable root** it was given: here the workdir, `/tmp`, `$TMPDIR` and the `--add-dir` directories. `index.lock` in the worktree's git directory is then on a read-only file system. If the git directories are already inside one of those roots (a repository under `/tmp`, say), this result does not apply.
+- Adding the worktree's `--git-dir` and `--git-common-dir` with `--add-dir` **lets `git commit` succeed** with no other change. This was measured only for the layout above (main repository and linked worktree as siblings under `$HOME`) with codex-cli 0.167.0 on Linux; other layouts, versions and platforms were not tested.
+- `dispatch --git` (#7) applies the second result when asked to; the default is unchanged.
 - Not tested: a repository whose `.git` is inside the workdir rather than a linked worktree, and `git push` (that also needs the network; see `dispatch --network`).

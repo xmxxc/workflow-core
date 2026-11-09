@@ -38,7 +38,7 @@ The router names the worker's tmux window with the label (`new-session -n <label
 ```
 wfc-d-probe [proj | 113 | impl] auto=0
 ```
-The `|` characters are kept, and giving `-n` turns `automatic-rename` off, so the running host does not rename the window. Control characters (newline, tab, escape) are turned into spaces before the label is used.
+The `|` characters are kept, and giving `-n` turns `automatic-rename` off, so the running host does not rename the window, provided the user's tmux does not turn on `allow-rename` (with it on, a program can still rename the window through an escape sequence). Control characters (newline, tab, escape) are turned into spaces before the label is used.
 
 ## Decision (controller, 2026-11-09)
 

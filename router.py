@@ -64,11 +64,12 @@ TABLES = {
 # rows without it); `report_dir` is the directory the worker may write; `report`, `model` and
 # `host_session` are what `resume` needs (Claude Code's session id is set at dispatch), and so are
 # `effort` and `network`, the dispatch's reasoning effort and Codex network access, and `label`,
-# its `<project> | <ticket> | <role>` name (tmux window, Claude Code session name).
+# its `<project> | <ticket> | <role>` name (tmux window, Claude Code session name), and `git`,
+# whether a Codex worker may write its worktree's git directories.
 # `process_start` tells a waiter's own process from a later one that reuses its pid.
 ADDED_COLUMNS = {
     "dispatch": {"started": "REAL", "report_dir": "TEXT", "report": "TEXT", "model": "TEXT", "host_session": "TEXT",
-                 "effort": "TEXT", "network": "INTEGER", "label": "TEXT"},
+                 "effort": "TEXT", "network": "INTEGER", "label": "TEXT", "git": "INTEGER"},
     "waiter": {"process_start": "TEXT"},
 }
 
@@ -149,11 +150,14 @@ def worker_brief(dispatch_id, task, report, opening=FIRST_BRIEF):
 # its cwd plus the `writable` directories (router state and the report's directory). `conversation`
 # is the host conversation to resume, or None for a new one (Claude Code: the id to give it).
 # `effort` goes to the host's own reasoning-effort option; `network` opens Codex's sandbox to the
-# network (the other hosts are not network-sandboxed; see IGNORED_OPTIONS).
+# network (the other hosts are not network-sandboxed; see IGNORED_OPTIONS); `git` adds the
+# worktree's git directories to Codex's writable ones, so it can commit (the others can anyway).
 
 def codex_command(brief, writable, cwd, model, conversation=None, resume=False, effort=None, network=False,
-                  label=None):
+                  label=None, git=False):
     # --no-alt-screen keeps the transcript in the tmux scrollback, so `tmux attach` shows history.
+    if git:
+        writable = [*writable, *git_dirs(cwd)]
     extra = [arg for d in writable for arg in ("--add-dir", str(d))]
     models = ["-m", model] if model else []
     overrides = [*(["-c", f"model_reasoning_effort={effort}"] if effort else []),
@@ -165,7 +169,7 @@ def codex_command(brief, writable, cwd, model, conversation=None, resume=False, 
 
 
 def opencode_command(brief, writable, cwd, model, conversation=None, resume=False, effort=None, network=False,
-                     label=None):
+                     label=None, git=False):
     # OpenCode's directory rules are tool prompts, not a sandbox (shell writes bypass them), and
     # git or pnpm reach into ~ constantly, so an unattended worker allows every external directory
     # (user decision 2026-11-05). "*" overrides any narrower rule merged in from the user's config.
@@ -181,7 +185,7 @@ def opencode_command(brief, writable, cwd, model, conversation=None, resume=Fals
 
 
 def claude_command(brief, writable, cwd, model, conversation=None, resume=False, effort=None, network=False,
-                   label=None):
+                   label=None, git=False):
     # The brief goes first: --add-dir is variadic and would swallow a trailing prompt.
     models = ["--model", model] if model else []
     efforts = ["--effort", effort] if effort else []
@@ -445,8 +449,10 @@ def _trust_locked(path, cwd):
 
 LAUNCHERS = {"codex": codex_command, "opencode": opencode_command, "claude": claude_command}
 # Dispatch options a host does not need: dispatch accepts them and says so in its output.
-IGNORED_OPTIONS = {"opencode": {"network": "--network: OpenCode is not network-sandboxed; ignored"},
-                   "claude": {"network": "--network: Claude Code is not network-sandboxed; ignored"}}
+IGNORED_OPTIONS = {"opencode": {"network": "--network: OpenCode is not network-sandboxed; ignored",
+                                "git": "--git: OpenCode can write the git directories anyway; ignored"},
+                   "claude": {"network": "--network: Claude Code is not network-sandboxed; ignored",
+                              "git": "--git: Claude Code can write the git directories anyway; ignored"}}
 
 
 def cmd_dispatch(args):
@@ -457,16 +463,17 @@ def cmd_dispatch(args):
     report = Path(args.report).resolve()
     report.parent.mkdir(parents=True, exist_ok=True)  # hosts grant access to existing directories
     host_session = str(uuid.uuid4()) if args.host == "claude" else None
-    label = clean_label(args.label) if args.label else default_label(cwd, report)
+    # A --label that cleans to nothing (only blanks or control characters) gets the default too.
+    label = clean_label(args.label or "") or default_label(cwd, report)
     command, extra_env = LAUNCHERS[args.host](worker_brief(dispatch_id, task, report),
                                               [state_dir(), report.parent], cwd, args.model, host_session,
-                                              effort=args.effort, network=args.network, label=label)
+                                              effort=args.effort, network=args.network, label=label, git=args.git)
     ignored = [note for option, note in IGNORED_OPTIONS.get(args.host, {}).items() if getattr(args, option)]
     trusted_by = trust_claude_worktree(cwd) if args.host == "claude" else None
     db.execute("INSERT INTO dispatch (id, host, cwd, task, created, report_dir, report, model, host_session, "
-               "effort, network, label) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+               "effort, network, label, git) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                (dispatch_id, args.host, str(cwd), str(task), time.time(), str(report.parent), str(report),
-                args.model, host_session, args.effort, int(args.network), label))
+                args.model, host_session, args.effort, int(args.network), label, int(args.git)))
     launched = launch(dispatch_id, cwd, command, extra_env, label)
     if launched == NOT_SENT:
         db.execute("DELETE FROM dispatch WHERE id = ?", (dispatch_id,))
@@ -499,6 +506,19 @@ def default_label(cwd, report):
     ticket, _, role = readable(Path(report).parent.name).rpartition("-")
     project = readable(project)
     return clean_label(" | ".join(part for part in (project, ticket, role) if part))
+
+
+def git_dirs(cwd):
+    """The worktree's git dir and common dir, absolute (git may print them relative to cwd), each
+    once: what a sandboxed Codex worker needs writable to commit. Exits when cwd is not a repository."""
+    dirs = []
+    try:
+        for option in ("--git-dir", "--git-common-dir"):
+            path = (Path(cwd) / os.fsdecode(git(cwd, "rev-parse", option).rstrip(b"\n"))).resolve()
+            dirs += [path] if path not in dirs else []
+    except (OSError, subprocess.SubprocessError) as err:
+        raise SystemExit(f"--git: {cwd} is not a git repository (or git failed: {err})")
+    return dirs
 
 
 def readable(name):
@@ -798,7 +818,8 @@ def cmd_status(args):
     for row in rows:
         last = db.execute("SELECT * FROM message WHERE dispatch = ? ORDER BY id DESC LIMIT 1", (row["id"],)).fetchone()
         watch = db.execute("SELECT since FROM screen_watch WHERE dispatch = ?", (row["id"],)).fetchone()
-        view = {"dispatch": row["id"], "label": row["label"], "host": row["host"], "model": row["model"], "state": dispatch_state(db, row["id"]),
+        view = {"dispatch": row["id"], "label": row["label"], "host": row["host"], "model": row["model"],
+                "git": bool(row["git"]), "state": dispatch_state(db, row["id"]),
                 "tmux": session_name(row["id"]), "tmuxAlive": session_alive(session_name(row["id"])),
                 "cwd": row["cwd"], "task": row["task"], "report": row["report"], "started": local_time(row["started"]),
                 "last": message_view(last) if last else None,
@@ -896,7 +917,8 @@ def cmd_resume(args):
     command, extra_env = LAUNCHERS[row["host"]](worker_brief(args.dispatch, task, report, opening=opening),
                                                 [state_dir(), Path(row["report_dir"])], Path(row["cwd"]),
                                                 row["model"], host_session, resume=True,
-                                                effort=row["effort"], network=bool(row["network"]), label=row["label"])
+                                                effort=row["effort"], network=bool(row["network"]), label=row["label"],
+                                                git=bool(row["git"]))
     # From the locked re-check to the last keystroke under the input lock (taken before the SQLite
     # lock, as everywhere), so no nudge, done or continue can come between the launch and the brief.
     with input_lock(args.dispatch):
@@ -1215,6 +1237,9 @@ def main(argv):
                                     "(Codex model_reasoning_effort, Claude Code --effort, OpenCode --variant)")
     p.add_argument("--label", help="the dispatch's name, shown in status, as its tmux window name and as the "
                                    "Claude Code session name (default: <project> | <ticket> | <role>)")
+    p.add_argument("--git", action="store_true",
+                   help="let a Codex worker commit: add the worktree's git dir and common dir to its writable "
+                        "dirs (it can then change anything under the main repository's .git)")
     p.add_argument("--network", action="store_true",
                    help="let a Codex worker's sandbox reach the network (other hosts are not sandboxed)")
     p.set_defaults(func=cmd_dispatch)
