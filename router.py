@@ -63,11 +63,12 @@ TABLES = {
 # Column upgrades: `started` is set once the worker's tmux session exists (the watchdog ignores
 # rows without it); `report_dir` is the directory the worker may write; `report`, `model` and
 # `host_session` are what `resume` needs (Claude Code's session id is set at dispatch), and so are
-# `effort` and `network`, the dispatch's reasoning effort and Codex network access.
+# `effort` and `network`, the dispatch's reasoning effort and Codex network access, and `label`,
+# its `<project> | <ticket> | <role>` name (tmux window, Claude Code session name).
 # `process_start` tells a waiter's own process from a later one that reuses its pid.
 ADDED_COLUMNS = {
     "dispatch": {"started": "REAL", "report_dir": "TEXT", "report": "TEXT", "model": "TEXT", "host_session": "TEXT",
-                 "effort": "TEXT", "network": "INTEGER"},
+                 "effort": "TEXT", "network": "INTEGER", "label": "TEXT"},
     "waiter": {"process_start": "TEXT"},
 }
 
@@ -150,7 +151,8 @@ def worker_brief(dispatch_id, task, report, opening=FIRST_BRIEF):
 # `effort` goes to the host's own reasoning-effort option; `network` opens Codex's sandbox to the
 # network (the other hosts are not network-sandboxed; see IGNORED_OPTIONS).
 
-def codex_command(brief, writable, cwd, model, conversation=None, resume=False, effort=None, network=False):
+def codex_command(brief, writable, cwd, model, conversation=None, resume=False, effort=None, network=False,
+                  label=None):
     # --no-alt-screen keeps the transcript in the tmux scrollback, so `tmux attach` shows history.
     extra = [arg for d in writable for arg in ("--add-dir", str(d))]
     models = ["-m", model] if model else []
@@ -162,7 +164,8 @@ def codex_command(brief, writable, cwd, model, conversation=None, resume=False, 
     return ["codex", *flags, brief], {}
 
 
-def opencode_command(brief, writable, cwd, model, conversation=None, resume=False, effort=None, network=False):
+def opencode_command(brief, writable, cwd, model, conversation=None, resume=False, effort=None, network=False,
+                     label=None):
     # OpenCode's directory rules are tool prompts, not a sandbox (shell writes bypass them), and
     # git or pnpm reach into ~ constantly, so an unattended worker allows every external directory
     # (user decision 2026-11-05). "*" overrides any narrower rule merged in from the user's config.
@@ -177,12 +180,14 @@ def opencode_command(brief, writable, cwd, model, conversation=None, resume=Fals
     return (["opencode", str(cwd), *models, *variant, *start], {"OPENCODE_CONFIG_CONTENT": json.dumps(config)})
 
 
-def claude_command(brief, writable, cwd, model, conversation=None, resume=False, effort=None, network=False):
+def claude_command(brief, writable, cwd, model, conversation=None, resume=False, effort=None, network=False,
+                   label=None):
     # The brief goes first: --add-dir is variadic and would swallow a trailing prompt.
     models = ["--model", model] if model else []
     efforts = ["--effort", effort] if effort else []
+    names = ["--name", label] if label else []  # shown in the prompt box, /resume picker and terminal title
     sessions = ["--resume" if resume else "--session-id", conversation] if conversation else []
-    return ["claude", brief, "--permission-mode", "auto", *models, *efforts, *sessions,
+    return ["claude", brief, "--permission-mode", "auto", *models, *efforts, *names, *sessions,
             "--add-dir", *map(str, writable)], {}
 
 
@@ -452,16 +457,17 @@ def cmd_dispatch(args):
     report = Path(args.report).resolve()
     report.parent.mkdir(parents=True, exist_ok=True)  # hosts grant access to existing directories
     host_session = str(uuid.uuid4()) if args.host == "claude" else None
+    label = clean_label(args.label) if args.label else default_label(cwd, report)
     command, extra_env = LAUNCHERS[args.host](worker_brief(dispatch_id, task, report),
                                               [state_dir(), report.parent], cwd, args.model, host_session,
-                                              effort=args.effort, network=args.network)
+                                              effort=args.effort, network=args.network, label=label)
     ignored = [note for option, note in IGNORED_OPTIONS.get(args.host, {}).items() if getattr(args, option)]
     trusted_by = trust_claude_worktree(cwd) if args.host == "claude" else None
     db.execute("INSERT INTO dispatch (id, host, cwd, task, created, report_dir, report, model, host_session, "
-               "effort, network) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+               "effort, network, label) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                (dispatch_id, args.host, str(cwd), str(task), time.time(), str(report.parent), str(report),
-                args.model, host_session, args.effort, int(args.network)))
-    launched = launch(dispatch_id, cwd, command, extra_env)
+                args.model, host_session, args.effort, int(args.network), label))
+    launched = launch(dispatch_id, cwd, command, extra_env, label)
     if launched == NOT_SENT:
         db.execute("DELETE FROM dispatch WHERE id = ?", (dispatch_id,))
         raise SystemExit("could not start the worker's tmux session; is tmux installed and on PATH?")
@@ -471,15 +477,36 @@ def cmd_dispatch(args):
         # `exited` if no session is there.
         raise SystemExit(f"tmux did not confirm the worker's session for dispatch {dispatch_id}; it is kept. "
                          f"Check `tmux ls`; `wait` reports it exited if it never started.")
-    emit({"dispatch": dispatch_id, "host": args.host, "tmux": session_name(dispatch_id),
+    emit({"dispatch": dispatch_id, "host": args.host, "label": label, "tmux": session_name(dispatch_id),
           **({"trustedBy": trusted_by} if trusted_by else {}), **({"ignored": ignored} if ignored else {})})
 
 
-def launch(dispatch_id, cwd, command, extra_env):
+def clean_label(text):
+    """A label safe on a command line and as a tmux window name: control characters (newlines,
+    tabs, escapes) become spaces, runs of white space one space."""
+    return " ".join("".join(" " if ord(c) < 32 or ord(c) == 127 else c for c in text).split())[:120]
+
+
+def default_label(cwd, report):
+    """`<project> | <ticket> | <role>`: the project is the main repository's directory (the parent of
+    the worktree's git common dir; the worktree's own name outside git), and the ticket and role
+    come from the report directory, `reports/<ticket>-<role>/`, split at its last `-`."""
+    try:
+        common = git(cwd, "rev-parse", "--git-common-dir").strip()
+        project = (Path(cwd) / common).resolve().parent.name
+    except (OSError, subprocess.SubprocessError):
+        project = Path(cwd).name
+    ticket, _, role = Path(report).parent.name.rpartition("-")
+    return clean_label(" | ".join(part for part in (project, ticket, role) if part))
+
+
+def launch(dispatch_id, cwd, command, extra_env, label=None):
     """Start the worker's tmux session. Returns SENT, NOT_SENT (nothing started) or UNCERTAIN
-    (tmux ran but did not confirm: a session may exist)."""
+    (tmux ran but did not confirm: a session may exist). The label names its window (tmux then
+    stops renaming it); the session keeps `wfc-<id>`, which the watchdog relies on."""
     env = {"WFC_DISPATCH": dispatch_id, "WFC_STATE": str(state_dir()), **extra_env}
-    started = tmux("new-session", "-d", "-s", session_name(dispatch_id), "-c", str(cwd),
+    window = ["-n", label] if label else []
+    started = tmux("new-session", "-d", "-s", session_name(dispatch_id), *window, "-c", str(cwd),
                    *[arg for k, v in env.items() for arg in ("-e", f"{k}={v}")], *command)
     if started.returncode == 0:
         return SENT
@@ -533,16 +560,20 @@ def cmd_done(args):
 GIT_TIMEOUT = 5
 
 
+def git(cwd, *args):
+    """Run git in cwd and return its output; raises OSError or SubprocessError when it cannot run,
+    fails or takes longer than GIT_TIMEOUT. GIT_OPTIONAL_LOCKS=0: `status` must not refresh the
+    index, so the router never writes the worker's repository."""
+    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=GIT_TIMEOUT,
+                          env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"}, check=True).stdout
+
+
 def worktree_head(cwd):
     """{"head": commit, "dirty": bool} of the worker's worktree, for the controller to compare with
     the head its report names. Both are None when git fails, times out or cwd is not a repository."""
-    def git(*args):
-        # GIT_OPTIONAL_LOCKS=0: `status` must not refresh the index, so done never writes the repo.
-        return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=GIT_TIMEOUT,
-                              env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"}, check=True).stdout
     try:
-        head = git("rev-parse", "--verify", "HEAD").strip()
-        dirty = bool(git("status", "--porcelain", "--untracked-files=normal").strip())
+        head = git(cwd, "rev-parse", "--verify", "HEAD").strip()
+        dirty = bool(git(cwd, "status", "--porcelain", "--untracked-files=normal").strip())
     except (OSError, subprocess.SubprocessError):
         return {"head": None, "dirty": None}
     return {"head": head, "dirty": dirty}
@@ -758,7 +789,7 @@ def cmd_status(args):
     for row in rows:
         last = db.execute("SELECT * FROM message WHERE dispatch = ? ORDER BY id DESC LIMIT 1", (row["id"],)).fetchone()
         watch = db.execute("SELECT since FROM screen_watch WHERE dispatch = ?", (row["id"],)).fetchone()
-        view = {"dispatch": row["id"], "host": row["host"], "model": row["model"], "state": dispatch_state(db, row["id"]),
+        view = {"dispatch": row["id"], "label": row["label"], "host": row["host"], "model": row["model"], "state": dispatch_state(db, row["id"]),
                 "tmux": session_name(row["id"]), "tmuxAlive": session_alive(session_name(row["id"])),
                 "cwd": row["cwd"], "task": row["task"], "report": row["report"], "started": local_time(row["started"]),
                 "last": message_view(last) if last else None,
@@ -856,7 +887,7 @@ def cmd_resume(args):
     command, extra_env = LAUNCHERS[row["host"]](worker_brief(args.dispatch, task, report, opening=opening),
                                                 [state_dir(), Path(row["report_dir"])], Path(row["cwd"]),
                                                 row["model"], host_session, resume=True,
-                                                effort=row["effort"], network=bool(row["network"]))
+                                                effort=row["effort"], network=bool(row["network"]), label=row["label"])
     # From the locked re-check to the last keystroke under the input lock (taken before the SQLite
     # lock, as everywhere), so no nudge, done or continue can come between the launch and the brief.
     with input_lock(args.dispatch):
@@ -879,7 +910,7 @@ def cmd_resume(args):
         if args.task:
             post(db, args.dispatch, "worker", "continue", {"task": str(task), "report": str(report)})
         db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
-        launched = launch(args.dispatch, row["cwd"], command, extra_env)
+        launched = launch(args.dispatch, row["cwd"], command, extra_env, row["label"])
         if launched == NOT_SENT:
             db.execute("ROLLBACK")
             raise SystemExit(f"could not start tmux session {session}")
@@ -1173,6 +1204,8 @@ def main(argv):
     p.add_argument("--model", help="model for the worker; passed to the host's own model flag")
     p.add_argument("--effort", help="reasoning effort, passed to the host's own option "
                                     "(Codex model_reasoning_effort, Claude Code --effort, OpenCode --variant)")
+    p.add_argument("--label", help="the dispatch's name, shown in status, as its tmux window name and as the "
+                                   "Claude Code session name (default: <project> | <ticket> | <role>)")
     p.add_argument("--network", action="store_true",
                    help="let a Codex worker's sandbox reach the network (other hosts are not sandboxed)")
     p.set_defaults(func=cmd_dispatch)

@@ -128,6 +128,67 @@ class MessageRoundTrip(unittest.TestCase):
         self.assertEqual(enter_call, ["tmux", "send-keys", "-t", f"wfc-{dispatch}", "Enter"])
 
 
+class Labels(unittest.TestCase):
+    """Each dispatch has a label, `<project> | <ticket> | <role>`, shown in status, as the tmux window
+    name and, for Claude Code, as the session name."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+
+    def launches(self):
+        return [c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]]
+
+    def window_name(self, call):
+        return call[call.index("-n") + 1]
+
+    def test_default_label_names_the_main_repository_and_the_report_directory(self):
+        root = self.env.cwd.parent
+        main = root / "myproj"
+        git = lambda *a, cwd=main: subprocess.run(["git", "-C", str(cwd), "-c", "user.name=t", "-c",
+                                                   "user.email=t@example.invalid", *a], check=True, capture_output=True)
+        git("init", "-q", str(main), cwd=root)
+        git("commit", "-q", "--allow-empty", "-m", "one")
+        self.env.cwd = root / "trees" / "v1"
+        git("worktree", "add", "-q", str(self.env.cwd))
+        self.env.report = root / "reports" / "113-impl-fix" / "r1.md"
+
+        dispatch = self.env.dispatch("claude")
+
+        label = "myproj | 113-impl | fix"
+        [call] = self.launches()
+        self.assertEqual(self.window_name(call), label)
+        self.assertEqual(call[call.index(f"wfc-{dispatch}") - 1], "-s")  # the session name is unchanged
+        claude = call[call.index("claude"):]
+        self.assertEqual(claude[claude.index("--name") + 1], label)
+        [view] = self.env.json("status")["dispatches"]
+        self.assertEqual(view["label"], label)
+
+    def test_outside_git_the_project_is_the_worktree_and_an_unsplittable_directory_is_kept_whole(self):
+        self.env.dispatch("codex", env={"GIT_CEILING_DIRECTORIES": str(self.env.cwd.parent)})
+
+        [call] = self.launches()
+        self.assertEqual(self.window_name(call), "worktree | reports")
+
+    def test_label_overrides_the_default_and_loses_control_characters(self):
+        self.env.dispatch("opencode", extra_args=("--label", " app |\n 7 |\tdesign\x1b "))
+
+        [call] = self.launches()
+        self.assertEqual(self.window_name(call), "app | 7 | design")
+        self.assertEqual(self.env.json("status")["dispatches"][0]["label"], "app | 7 | design")
+
+    def test_resume_keeps_the_label(self):
+        dispatch = self.env.dispatch("claude", extra_args=("--label", "p | 9 | review"))
+        self.env.end_session(dispatch)
+
+        self.env.json("resume", dispatch)
+
+        [_, again] = self.launches()
+        self.assertEqual(self.window_name(again), "p | 9 | review")
+        claude = again[again.index("claude"):]
+        self.assertEqual(claude[claude.index("--name") + 1], "p | 9 | review")
+
+
 class DoneHead(unittest.TestCase):
     """done records the worker's HEAD and whether its worktree is dirty, read in the dispatch's cwd."""
 
