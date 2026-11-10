@@ -647,8 +647,9 @@ READ_ONLY = "read-only"
 
 # What a host draws when its conversation can no longer take input. `state` texts describe the
 # conversation itself: while one is on screen nothing may be typed (the Codex banner takes single
-# keys such as c and n as choices). A `refusal` answers one Enter: it counts only when it is new
-# after the router's own Enter, since an earlier one stays on screen. Each text must start a screen
+# keys such as c and n as choices), and the watchdog reports it. A `refusal` answers one Enter:
+# it counts only when it is new after the router's own Enter, since an earlier one stays on screen;
+# the watchdog never takes one for the session's state. Each text must start a screen
 # line (after an optional `■ ` or `• `), so a worker quoting it in tool output (`│ `, `└ `) is not
 # taken for the host; it may wrap over up to NOTICE_LINES lines. Claude Code and OpenCode have no
 # known text yet.
@@ -685,10 +686,13 @@ def screen_notices(screen):
 
 
 def read_only_notice(screen):
-    """The line the watchdog reports for a screen: its first state notice, else its last refusal."""
-    found = screen_notices(screen)
-    states = [text for kind, text in found if kind == "state"]
-    return states[0] if states else (found[-1][1] if found else None)
+    """The screen's first state notice: what makes it evidence that the session is read-only now.
+    A refusal only answers one Enter; one left on screen says nothing about the session now."""
+    return next((text for kind, text in screen_notices(screen) if kind == "state"), None)
+
+
+def refusals(found):
+    return [text for kind, text in found if kind == "refusal"]
 
 
 def capture(session):
@@ -704,15 +708,21 @@ def seconds_setting(name, default):
 
 
 def new_notice(session, before, seconds):
-    """Watch the screen for `seconds` and return the first notice that was not in `before`."""
+    """Watch the screen for `seconds` for evidence that the session takes no input: any state
+    notice, or more refusals than `before` (the notices on screen before the Enter) had, which
+    answer this Enter. Returns that line, or None."""
     deadline = time.monotonic() + seconds
+    earlier = len(refusals(before))
     while True:
         time.sleep(max(0.0, min(0.25, deadline - time.monotonic())))
         screen = capture(session)
         if screen is not None:
             found = screen_notices(screen)
-            if len(found) > len(before):
-                return found[-1][1]
+            state = next((text for kind, text in found if kind == "state"), None)
+            if state:
+                return state
+            if len(refusals(found)) > earlier:
+                return refusals(found)[-1]
         if time.monotonic() >= deadline:
             return None
 

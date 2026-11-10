@@ -2278,6 +2278,49 @@ class ReadOnlySessions(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.messages(dispatch), ["nudge"])
 
+    def test_a_state_notice_drawn_after_the_enter_fails_the_send_even_if_an_old_refusal_scrolled_away(self):
+        # Review R2-1: one notice before (an old refusal), one after (a new state notice).
+        dispatch = self.env.dispatch()
+        self.env.screen.write_text(NO_OPERATION + PROMPT)
+        self.answer.write_text(UNAVAILABLE_CHAT)
+
+        result = self.env.run("nudge", dispatch, "--text", "continue", env=self.screens)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("This conversation is unavailable. Its cached transcript and draft remain here; input is paused.",
+                      result.stderr)
+        self.assertEqual(self.messages(dispatch), [])
+
+    def test_after_a_send_that_went_through_an_old_refusal_on_screen_is_not_reported(self):
+        # Review R2-2: the refusal answered an earlier Enter, not the current state of the session.
+        dispatch = self.env.dispatch()
+        self.env.screen.write_text(NO_OPERATION + PROMPT)
+        env = {"FAKE_SCREEN": str(self.env.screen)}
+
+        self.env.json("nudge", dispatch, "--text", "continue", env=env)
+        after = self.env.json("wait", "--timeout", "1", "--stall-after", "60", env=env)
+
+        self.assertEqual(after["messages"], [])
+
+    def test_a_screen_with_only_old_refusals_stalls_as_usual(self):
+        dispatch = self.env.dispatch()
+        self.env.screen.write_text(NO_OPERATION + NO_OPERATION + PROMPT)
+
+        [message] = self.env.json("wait", "--timeout", "2", "--stall-after", "0.3",
+                                  env={"FAKE_SCREEN": str(self.env.screen)})["messages"]
+
+        self.assertEqual((message["type"], message["dispatch"]), ("stalled", dispatch))
+
+    def test_a_normal_send_is_followed_by_no_blocked_report(self):
+        dispatch = self.env.dispatch()
+        self.env.screen.write_text(PROMPT)
+        env = {"FAKE_SCREEN": str(self.env.screen)}
+
+        self.env.json("nudge", dispatch, "--text", "continue", env=env)
+        after = self.env.json("wait", "--timeout", "1", "--stall-after", "60", env=env)
+
+        self.assertEqual(after["messages"], [])
+
     def test_nothing_is_typed_into_a_session_whose_screen_says_it_is_read_only(self):
         # The read-only banner takes single keys (c, n) as choices: typing there would pick one.
         dispatch = self.env.dispatch()
