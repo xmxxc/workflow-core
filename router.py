@@ -816,23 +816,30 @@ def dispatch_state(db, dispatch_id):
 
 def cmd_status(args):
     """Read-only view of the scope: every dispatch, undelivered messages and the running waiters.
-    It never creates, upgrades or changes router.db; write commands do that."""
+    With --active, only the unfinished dispatches, plus the finished ones whose tmux session is still
+    alive under `reclaimable`. It never creates, upgrades or changes router.db; write commands do that."""
     db, outdated = connect_read_only()
     if db is None:
         if args.dispatch:
             raise SystemExit(f"unknown dispatch {args.dispatch} in {state_dir()}")
-        emit({"state": str(state_dir()), "dispatches": [], "undelivered": [], "waiters": []})
+        emit({"state": str(state_dir()), "dispatches": [], **({"reclaimable": []} if args.active else {}),
+              "undelivered": [], "waiters": []})
         return
     query = "SELECT * FROM dispatch WHERE started IS NOT NULL" + (" AND id = ?" if args.dispatch else "") + " ORDER BY created"
     rows = db.execute(query, (args.dispatch,) if args.dispatch else ()).fetchall()
     if args.dispatch and not rows:
         raise SystemExit(f"unknown dispatch {args.dispatch} in {state_dir()}")
-    now, dispatches = time.time(), []
+    now, dispatches, reclaimable = time.time(), [], []
     for row in rows:
+        state = dispatch_state(db, row["id"])
+        if args.active and state == "done":
+            if session_alive(session_name(row["id"])):
+                reclaimable.append({"dispatch": row["id"], "label": row["label"], "tmux": session_name(row["id"])})
+            continue
         last = db.execute("SELECT * FROM message WHERE dispatch = ? ORDER BY id DESC LIMIT 1", (row["id"],)).fetchone()
         watch = db.execute("SELECT since FROM screen_watch WHERE dispatch = ?", (row["id"],)).fetchone()
         view = {"dispatch": row["id"], "label": row["label"], "host": row["host"], "model": row["model"],
-                "git": bool(row["git"]), "state": dispatch_state(db, row["id"]),
+                "git": bool(row["git"]), "state": state,
                 "tmux": session_name(row["id"]), "tmuxAlive": session_alive(session_name(row["id"])),
                 "cwd": row["cwd"], "task": row["task"], "report": row["report"], "started": local_time(row["started"]),
                 "last": message_view(last) if last else None,
@@ -846,7 +853,7 @@ def cmd_status(args):
                              (args.dispatch,) if args.dispatch else ()).fetchall()
     waiters = [{"pid": w["pid"], "kind": w["kind"], "since": local_time(w["since"])}
                for w in db.execute("SELECT * FROM waiter ORDER BY since") if waiter_alive(w)]
-    emit({"state": str(state_dir()), "dispatches": dispatches,
+    emit({"state": str(state_dir()), "dispatches": dispatches, **({"reclaimable": reclaimable} if args.active else {}),
           "undelivered": [message_view(m) for m in undelivered], "waiters": waiters,
           **({"schema": "router.db is older than this wfc and is shown as far as it goes; "
                         "the next write command (wait, dispatch, ...) upgrades it"} if outdated else {})})
@@ -1328,7 +1335,11 @@ def main(argv):
     p.add_argument("--text", required=True)
     p.set_defaults(func=cmd_nudge)
     p = sub.add_parser("status", help="show every dispatch, undelivered messages and running waiters")
-    p.add_argument("--dispatch", help="one dispatch, with its whole message history")
+    one = p.add_mutually_exclusive_group()
+    one.add_argument("--dispatch", help="one dispatch, with its whole message history")
+    one.add_argument("--active", action="store_true",
+                     help="only unfinished dispatches (working, asking, exited); finished ones whose tmux session "
+                          "is still alive are listed under reclaimable")
     p.set_defaults(func=cmd_status)
     p = sub.add_parser("wait")
     p.add_argument("--timeout", type=float, default=3600)

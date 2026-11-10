@@ -2031,6 +2031,48 @@ class Status(unittest.TestCase):
         self.assertEqual(done["type"], "done")  # status did not take it
         self.assertEqual(self.env.json("status")["undelivered"], [])
 
+    def test_active_lists_only_unfinished_dispatches_and_the_done_ones_whose_session_is_alive(self):
+        working = self.env.dispatch()
+        asking = self.env.dispatch()
+        self.env.run("ask", "Red or blue?", dispatch=asking)
+        exited = self.env.dispatch()
+        self.env.end_session(exited)
+        self.env.json("wait", "--timeout", "2")  # the watchdog notices the ended session
+        lingering = self.env.dispatch(extra_args=("--label", "p | 11 | impl"))
+        closed = self.env.dispatch()
+        for finished in (lingering, closed):
+            self.env.report.write_text("# report\n")
+            self.env.run("done", "--report", str(self.env.report), dispatch=finished)
+        self.env.end_session(closed)
+        everything = self.env.json("status")
+
+        status = self.env.json("status", "--active")
+
+        self.assertEqual({d["dispatch"]: d["state"] for d in status["dispatches"]},
+                         {working: "working", asking: "asking", exited: "exited"})
+        self.assertEqual(status["reclaimable"],
+                         [{"dispatch": lingering, "label": "p | 11 | impl", "tmux": f"wfc-{lingering}"}])
+        # undelivered and waiters are the same as without --active
+        self.assertEqual(status["undelivered"], everything["undelivered"])
+        self.assertEqual(status["waiters"], everything["waiters"])
+        self.assertEqual(len(everything["dispatches"]), 5)
+        self.assertNotIn("reclaimable", everything)
+
+    def test_active_without_a_state_database_is_empty(self):
+        status = self.env.json("status", "--active")
+
+        self.assertEqual((status["dispatches"], status["reclaimable"], status["undelivered"], status["waiters"]),
+                         ([], [], [], []))
+        self.assertFalse(self.env.state.exists())
+
+    def test_active_with_dispatch_is_refused(self):
+        dispatch = self.env.dispatch()
+
+        result = self.env.run("status", "--active", "--dispatch", dispatch)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("not allowed with", result.stderr)
+
     def test_a_running_wait_is_listed(self):
         self.env.dispatch()
         env = {**os.environ, "WFC_STATE": str(self.env.state), "PATH": f"{self.env.bin}{os.pathsep}{os.environ['PATH']}"}
