@@ -928,6 +928,8 @@ def message_view(r):
 def dispatch_state(db, dispatch_id):
     if done_current_task(db, dispatch_id):
         return "done"
+    if reclaimed(db, dispatch_id):
+        return "reclaimed"
     if not watched(db, dispatch_id):
         return "exited"
     return "asking" if awaiting_answer(db, dispatch_id) else "working"
@@ -951,8 +953,9 @@ def cmd_status(args):
     now, dispatches, reclaimable = time.time(), [], []
     for row in rows:
         state = dispatch_state(db, row["id"])
+        closed = reclaimed(db, row["id"])
         if args.active and state == "done":
-            if session_alive(session_name(row["id"])):
+            if not closed and session_alive(session_name(row["id"])):
                 reclaimable.append({"dispatch": row["id"], "label": row["label"], "tmux": session_name(row["id"])})
             continue
         last = db.execute("SELECT * FROM message WHERE dispatch = ? ORDER BY id DESC LIMIT 1", (row["id"],)).fetchone()
@@ -962,7 +965,8 @@ def cmd_status(args):
                 "tmux": session_name(row["id"]), "tmuxAlive": session_alive(session_name(row["id"])),
                 "cwd": row["cwd"], "task": row["task"], "report": row["report"], "started": local_time(row["started"]),
                 "last": message_view(last) if last else None,
-                **({"screenIdleSeconds": int(now - watch["since"])} if watch else {})}
+                **({"screenIdleSeconds": int(now - watch["since"])} if watch else {}),
+                **({"reclaimed": local_time(closed)} if closed else {})}
         if args.dispatch:
             view["messages"] = [message_view(m) for m in
                                 db.execute("SELECT * FROM message WHERE dispatch = ? ORDER BY id", (row["id"],))]
@@ -1112,6 +1116,111 @@ def cmd_resume(args):
     emit({"resumed": args.dispatch, "session": host_session, "tmux": session})
 
 
+def session_owner(session):
+    """(True, None) when the tmux session's WFC_STATE is this state directory, else (False, why)."""
+    shown = tmux("show-environment", "-t", session, "WFC_STATE")
+    if shown.returncode != 0:
+        return False, f"cannot read WFC_STATE of tmux session {session}: {(shown.stderr or '').strip() or 'not set'}"
+    value = shown.stdout.strip().partition("=")[2]
+    if not value or Path(value).expanduser().resolve() != state_dir():
+        return False, f"tmux session {session} belongs to state directory {value or '(none)'}, not {state_dir()}"
+    return True, None
+
+
+def reclaim_targets(db, named):
+    """The dispatches reclaim considers: the named ones (each must exist), or else every done one
+    whose session is alive and not yet reclaimed, as `status --active` lists under `reclaimable`."""
+    rows = []
+    for dispatch_id in named:
+        row = db.execute("SELECT * FROM dispatch WHERE id = ? AND started IS NOT NULL", (dispatch_id,)).fetchone()
+        if row is None:
+            raise SystemExit(f"unknown dispatch {dispatch_id} in {state_dir()}")
+        rows.append(row)
+    if named:
+        return rows
+    return [row for row in db.execute("SELECT * FROM dispatch WHERE started IS NOT NULL ORDER BY created")
+            if done_current_task(db, row["id"]) and not reclaimed(db, row["id"])
+            and session_alive(session_name(row["id"]))]
+
+
+def cmd_reclaim(args):
+    """List the tmux sessions of finished dispatches; with --yes, close them. An unfinished dispatch
+    is listed and closed only when named. Only `wfc-<id>` sessions of this state directory are
+    closed; router.db keeps every record (resume and the ledger need them), and worktrees,
+    branches and host conversations are left alone. Without --yes nothing is changed."""
+    named = list(dict.fromkeys(args.dispatch or []))
+    if args.yes:
+        db = connect()
+    else:
+        db, _ = connect_read_only()
+        if db is None:
+            if named:
+                raise SystemExit(f"unknown dispatch {named[0]} in {state_dir()}")
+            emit({"state": str(state_dir()), "yes": False, "sessions": []})
+            return 0
+    sessions, errors = [], []
+    for row in reclaim_targets(db, named):
+        dispatch_id, session = row["id"], session_name(row["id"])
+        state = dispatch_state(db, dispatch_id)
+        item = {"dispatch": dispatch_id, "label": row["label"], "tmux": session, "state": state,
+                "reclaimable": state == "done" and not reclaimed(db, dispatch_id)}
+        if not item["reclaimable"]:
+            item["note"] = (f"not in reclaimable ({'already reclaimed' if reclaimed(db, dispatch_id) else 'its task is not done'}); "
+                            f"closed only when named and with --yes")
+        sessions.append(item)
+        if not session_alive(session):
+            item.update(result="gone", note=f"tmux session {session} no longer exists; skipped")
+            continue
+        owned, why = session_owner(session)
+        if not owned:
+            item.update(result="refused", error=why)
+            if args.yes:  # a listing only shows it: nothing was attempted
+                errors.append(why)
+            continue
+        if not args.yes:
+            item["result"] = "listed"
+            continue
+        item.update(reclaim_session(db, row, item["reclaimable"]))
+        if item["result"] == "failed":
+            errors.append(item["error"])
+    emit({"state": str(state_dir()), "yes": bool(args.yes), "sessions": sessions})
+    for error in errors:
+        print(f"router: {error}", file=sys.stderr)
+    return 1 if errors else 0
+
+
+def reclaim_session(db, row, was_reclaimable):
+    """Close one session and record `reclaimed`, under the input lock and the write lock the
+    watchdog takes, so it never sees the session gone without the record. A done dispatch that a
+    `continue` or `resume` moved on since it was listed is left running."""
+    dispatch_id, session = row["id"], session_name(row["id"])
+    with input_lock(dispatch_id):
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            if was_reclaimable and not done_current_task(db, dispatch_id):
+                db.execute("ROLLBACK")
+                return {"result": "changed", "note": f"dispatch {dispatch_id} got a new task meanwhile; left running"}
+            if not session_alive(session):
+                db.execute("ROLLBACK")
+                return {"result": "gone", "note": f"tmux session {session} no longer exists; skipped"}
+            owned, why = session_owner(session)
+            if not owned:
+                db.execute("ROLLBACK")
+                return {"result": "failed", "error": why}
+            killed = tmux("kill-session", "-t", session)
+            if killed.returncode != 0:
+                db.execute("ROLLBACK")
+                return {"result": "failed", "error": f"could not close tmux session {session} "
+                                                     f"(exit {killed.returncode}): {(killed.stderr or '').strip()}"}
+            message_id = post(db, dispatch_id, "worker", "reclaimed", {"tmux": session})
+            db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (dispatch_id,))
+            db.execute("COMMIT")
+        except BaseException:
+            db.execute("ROLLBACK")
+            raise
+    return {"result": "reclaimed", "message": message_id}
+
+
 def take_controller_messages(db):
     db.execute("BEGIN IMMEDIATE")
     rows = db.execute("SELECT * FROM message WHERE recipient = 'controller' AND delivered = 0 ORDER BY id").fetchall()
@@ -1167,6 +1276,17 @@ def watched(db, dispatch_id):
     return started is not None and exited is None and not done_current_task(db, dispatch_id)
 
 
+def reclaimed(db, dispatch_id):
+    """When `reclaim` closed the dispatch's session, if no `resume` reopened it since; else None.
+    A reclaimed session is not watched. `reclaimed` is not a round event: it changes neither the
+    round mark nor whether the task is done, so a later `resume` works as before."""
+    row = db.execute(
+        "SELECT m.created FROM message m WHERE m.dispatch = ? AND m.type = 'reclaimed' AND m.id > "
+        "COALESCE((SELECT MAX(r.id) FROM message r WHERE r.dispatch = m.dispatch AND r.type = 'resumed'), 0) "
+        "ORDER BY m.id DESC LIMIT 1", (dispatch_id,)).fetchone()
+    return row[0] if row else None
+
+
 def awaiting_answer(db, dispatch_id):
     return any(not answered(db, q["id"]) for q in db.execute(
         "SELECT id FROM message WHERE dispatch = ? AND type = 'question'", (dispatch_id,)))
@@ -1179,7 +1299,7 @@ def check_workers(db, stall_after):
     candidates = db.execute("SELECT * FROM dispatch WHERE started IS NOT NULL").fetchall()
     for row in candidates:
         dispatch_id = row["id"]
-        if not watched(db, dispatch_id):
+        if not watched(db, dispatch_id) or reclaimed(db, dispatch_id):
             continue
         session = session_name(dispatch_id)
         alive = session_alive(session)
@@ -1193,7 +1313,7 @@ def check_workers(db, stall_after):
         # Decide and post under one write lock, re-checking state a worker's `done` may have changed.
         db.execute("BEGIN IMMEDIATE")
         try:
-            if not watched(db, dispatch_id):
+            if not watched(db, dispatch_id) or reclaimed(db, dispatch_id):
                 pass
             elif not alive and session_alive(session):
                 pass  # a stale sample: `resume` relaunched it while we sampled; look again next pass
@@ -1481,6 +1601,11 @@ def main(argv):
                      help="only unfinished dispatches (working, asking, exited); finished ones whose tmux session "
                           "is still alive are listed under reclaimable")
     p.set_defaults(func=cmd_status)
+    p = sub.add_parser("reclaim", help="list the tmux sessions of finished dispatches; close them with --yes")
+    p.add_argument("--dispatch", action="append",
+                   help="only this dispatch (repeatable); an unfinished one is closed only when named")
+    p.add_argument("--yes", action="store_true", help="close the listed sessions (default: only list them)")
+    p.set_defaults(func=cmd_reclaim)
     p = sub.add_parser("wait")
     p.add_argument("--timeout", type=float, default=3600)
     p.add_argument("--stall-after", type=float, default=300,

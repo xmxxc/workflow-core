@@ -37,6 +37,8 @@ class Env:
         # The fake tmux keeps one marker file per session: new-session creates it (after
         # FAKE_LAUNCH_DELAY seconds) and has-session checks it. capture-pane prints FAKE_SCREEN's
         # file if set, else a fresh screen each time (a busy worker).
+        # The marker holds the session's environment (new-session's -e), which show-environment
+        # prints; kill-session removes it, and fails for FAKE_KILL_FAIL=<session> or a missing one.
         self.screen = root / "screen.txt"
         self.sessions = root / "sessions"
         self.sessions.mkdir()
@@ -50,7 +52,8 @@ class Env:
                 f"sessions = {str(self.sessions)!r}\n"
                 f"if {name!r} == 'tmux' and sys.argv[1] == 'new-session':\n"
                 f"    time.sleep(float(os.environ.get('FAKE_LAUNCH_DELAY', '0')))\n"
-                f"    open(os.path.join(sessions, sys.argv[sys.argv.index('-s') + 1]), 'w').close()\n"
+                f"    session_env = dict(sys.argv[i + 1].split('=', 1) for i, a in enumerate(sys.argv) if a == '-e')\n"
+                f"    open(os.path.join(sessions, sys.argv[sys.argv.index('-s') + 1]), 'w').write(json.dumps(session_env))\n"
                 f"if {name!r} == 'tmux' and sys.argv[1] == 'has-session':\n"
                 f"    sys.exit(0 if os.path.exists(os.path.join(sessions, sys.argv[sys.argv.index('-t') + 1])) else 1)\n"
                 f"if {name!r} == 'tmux' and sys.argv[1:2] == ['send-keys'] and sys.argv[-1] == 'Enter':\n"
@@ -59,6 +62,20 @@ class Env:
                 f"    if os.environ.get('FAKE_ENTER_SQL'):\n"
                 f"        import sqlite3; db = sqlite3.connect(os.path.join(os.environ['WFC_STATE'], 'router.db'))\n"
                 f"        db.executescript(os.environ['FAKE_ENTER_SQL']); db.close()\n"
+                f"if {name!r} == 'tmux' and sys.argv[1] == 'show-environment':\n"
+                f"    marker = os.path.join(sessions, sys.argv[sys.argv.index('-t') + 1])\n"
+                f"    if not os.path.exists(marker):\n"
+                f"        sys.exit(1)\n"
+                f"    text = open(marker).read()\n"
+                f"    value = (json.loads(text) if text else {{}}).get(sys.argv[-1])\n"
+                f"    if value is None:\n"
+                f"        print('unknown variable: ' + sys.argv[-1], file=sys.stderr); sys.exit(1)\n"
+                f"    print(sys.argv[-1] + '=' + value)\n"
+                f"if {name!r} == 'tmux' and sys.argv[1] == 'kill-session':\n"
+                f"    target = sys.argv[sys.argv.index('-t') + 1]\n"
+                f"    if os.environ.get('FAKE_KILL_FAIL') == target or not os.path.exists(os.path.join(sessions, target)):\n"
+                f"        sys.exit(1)\n"
+                f"    os.unlink(os.path.join(sessions, target))\n"
                 f"if {name!r} == 'tmux' and sys.argv[1] == 'capture-pane':\n"
                 f"    screen = os.environ.get('FAKE_SCREEN')\n"
                 f"    print(open(screen).read() if screen else f'Working ({{time.time_ns()}})')\n")
@@ -2421,6 +2438,181 @@ def socket_free_port():
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         return probe.getsockname()[1]
+
+
+class Reclaim(unittest.TestCase):
+    """reclaim lists the tmux sessions of finished dispatches and closes them only with --yes;
+    an unfinished one only when named. router.db keeps every record, and resume still works."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+
+    def finish(self, dispatch):
+        self.env.report.write_text("# report\n")
+        self.env.run("done", "--report", str(self.env.report), dispatch=dispatch)
+
+    def kills(self):
+        return [c for c in self.env.host_calls() if c[:2] == ["tmux", "kill-session"]]
+
+    def alive(self, dispatch):
+        return (self.env.sessions / f"wfc-{dispatch}").exists()
+
+    def messages(self, dispatch):
+        return self.env.json("status", "--dispatch", dispatch)["dispatches"][0]["messages"]
+
+    def db_rows(self):
+        db = sqlite3.connect(self.env.state / "router.db")
+        rows = (db.execute("SELECT * FROM dispatch ORDER BY id").fetchall(),
+                db.execute("SELECT * FROM message ORDER BY id").fetchall())
+        db.close()
+        return rows
+
+    def test_default_only_lists_the_done_dispatches_with_a_live_session_and_changes_nothing(self):
+        working = self.env.dispatch()
+        lingering = self.env.dispatch(extra_args=("--label", "p | 16 | impl"))
+        closed = self.env.dispatch()
+        for finished in (lingering, closed):
+            self.finish(finished)
+        self.env.end_session(closed)
+        before = self.db_rows()
+
+        listed = self.env.json("reclaim")
+
+        self.assertEqual(listed["sessions"], [{"dispatch": lingering, "label": "p | 16 | impl", "tmux": f"wfc-{lingering}",
+                                               "state": "done", "reclaimable": True, "result": "listed"}])
+        self.assertFalse(listed["yes"])
+        self.assertEqual(self.kills(), [])
+        self.assertTrue(self.alive(lingering) and self.alive(working))
+        self.assertEqual(self.db_rows(), before)
+
+    def test_default_without_a_state_database_lists_nothing_and_creates_nothing(self):
+        self.assertEqual(self.env.json("reclaim")["sessions"], [])
+        self.assertFalse(self.env.state.exists())
+
+    def test_yes_closes_the_done_sessions_and_records_reclaimed_for_the_worker(self):
+        working = self.env.dispatch()
+        lingering = self.env.dispatch()
+        self.finish(lingering)
+        self.env.json("wait", "--timeout", "2")  # the controller took the done
+
+        result = self.env.json("reclaim", "--yes")
+
+        self.assertEqual([(s["dispatch"], s["result"]) for s in result["sessions"]], [(lingering, "reclaimed")])
+        self.assertEqual(self.kills(), [["tmux", "kill-session", "-t", f"wfc-{lingering}"]])
+        self.assertFalse(self.alive(lingering))
+        self.assertTrue(self.alive(working))
+        last = self.messages(lingering)[-1]
+        self.assertEqual((last["type"], last["to"]), ("reclaimed", "worker"))
+        status = self.env.json("status")
+        views = {d["dispatch"]: d for d in status["dispatches"]}
+        self.assertEqual(views[lingering]["state"], "done")
+        self.assertEqual(views[lingering]["reclaimed"], last["at"])
+        self.assertNotIn("reclaimed", views[working])
+        self.assertEqual(status["undelivered"], [])  # not for the controller
+        self.assertEqual(self.env.json("status", "--active")["reclaimable"], [])
+        self.assertEqual(self.env.json("reclaim")["sessions"], [])
+        self.assertEqual(len(self.db_rows()[0]), 2)  # the records stay
+
+    def test_an_unfinished_dispatch_is_closed_only_when_named_with_yes(self):
+        stale = self.env.dispatch()
+
+        self.assertEqual(self.env.json("reclaim", "--yes")["sessions"], [])
+        [named] = self.env.json("reclaim", "--dispatch", stale)["sessions"]
+        self.assertEqual((named["dispatch"], named["state"], named["reclaimable"], named["result"]),
+                         (stale, "working", False, "listed"))
+        self.assertIn("not in reclaimable", named["note"])
+        self.assertEqual(self.kills(), [])
+        self.assertTrue(self.alive(stale))
+
+        [closed] = self.env.json("reclaim", "--dispatch", stale, "--yes")["sessions"]
+
+        self.assertEqual((closed["result"], closed["reclaimable"]), ("reclaimed", False))
+        self.assertIn("not in reclaimable", closed["note"])
+        self.assertFalse(self.alive(stale))
+        [view] = self.env.json("status", "--active")["dispatches"]
+        self.assertEqual((view["dispatch"], view["state"]), (stale, "reclaimed"))
+        # the watchdog does not report the closed session as exited
+        self.assertTrue(self.env.json("wait", "--timeout", "1", "--stall-after", "0.3")["timedOut"])
+
+    def test_an_unknown_named_dispatch_is_refused_before_anything_is_closed(self):
+        lingering = self.env.dispatch()
+        self.finish(lingering)
+
+        result = self.env.run("reclaim", "--dispatch", lingering, "--dispatch", "d-nosuch", "--yes")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unknown dispatch d-nosuch", result.stderr)
+        self.assertEqual(self.kills(), [])
+
+    def test_a_session_of_another_state_directory_is_refused(self):
+        other, unmarked = self.env.dispatch(), self.env.dispatch()
+        for finished in (other, unmarked):
+            self.finish(finished)
+        (self.env.sessions / f"wfc-{other}").write_text(json.dumps({"WFC_STATE": "/elsewhere/state"}))
+        (self.env.sessions / f"wfc-{unmarked}").write_text("{}")
+
+        listed = {s["dispatch"]: s for s in self.env.json("reclaim")["sessions"]}
+        result = self.env.run("reclaim", "--yes")
+
+        self.assertEqual({d: s["result"] for d, s in listed.items()}, {other: "refused", unmarked: "refused"})
+        self.assertIn("/elsewhere/state", listed[other]["error"])
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"wfc-{other}", result.stderr)
+        self.assertEqual(self.kills(), [])
+        self.assertTrue(self.alive(other) and self.alive(unmarked))
+        self.assertNotIn("reclaimed", [m["type"] for m in self.messages(other) + self.messages(unmarked)])
+
+    def test_a_gone_session_is_skipped_and_a_failed_close_does_not_stop_the_rest(self):
+        failing, closing, gone = self.env.dispatch(), self.env.dispatch(), self.env.dispatch()
+        for finished in (failing, closing, gone):
+            self.finish(finished)
+        self.env.end_session(gone)
+
+        result = self.env.run("reclaim", "--yes", "--dispatch", failing, "--dispatch", closing, "--dispatch", gone,
+                              env={"FAKE_KILL_FAIL": f"wfc-{failing}"})
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"wfc-{failing}", result.stderr)
+        sessions = {s["dispatch"]: s for s in json.loads(result.stdout)["sessions"]}
+        self.assertEqual({d: s["result"] for d, s in sessions.items()},
+                         {failing: "failed", closing: "reclaimed", gone: "gone"})
+        self.assertIn("no longer exists", sessions[gone]["note"])
+        self.assertTrue(self.alive(failing))
+        self.assertFalse(self.alive(closing))
+        for kept in (failing, gone):
+            self.assertNotIn("reclaimed", [m["type"] for m in self.messages(kept)])
+
+    def test_resume_after_reclaiming_an_unfinished_dispatch_finishes_its_task_and_is_watched_again(self):
+        dispatch = self.env.dispatch("claude")
+        self.env.json("reclaim", "--dispatch", dispatch, "--yes")
+        self.assertTrue(self.env.json("wait", "--timeout", "1")["timedOut"])
+
+        resumed = self.env.json("resume", dispatch)
+
+        self.assertEqual(resumed["resumed"], dispatch)
+        self.assertTrue(self.alive(dispatch))
+        self.assertEqual(self.env.json("status", "--dispatch", dispatch)["dispatches"][0]["state"], "working")
+        self.assertNotIn("reclaimed", self.env.json("status", "--dispatch", dispatch)["dispatches"][0])
+        self.env.end_session(dispatch)
+        [exited] = self.env.json("wait", "--timeout", "2")["messages"]
+        self.assertEqual((exited["type"], exited["dispatch"]), ("exited", dispatch))
+
+    def test_resume_after_reclaiming_a_done_dispatch_takes_its_next_task(self):
+        dispatch = self.env.dispatch("claude")
+        self.finish(dispatch)
+        self.env.json("reclaim", "--yes")
+
+        unfinished = self.env.run("resume", dispatch)  # the round is still done: reclaim did not move it
+        nxt = self.env.report.parent / "113-impl-r2.md"
+        resumed = self.env.json("resume", dispatch, "--task", str(self.env.task), "--report", str(nxt))
+
+        self.assertIn("already finished its task", unfinished.stderr)
+        self.assertEqual(resumed["resumed"], dispatch)
+        self.assertEqual(self.env.json("status", "--dispatch", dispatch)["dispatches"][0]["state"], "working")
+        nxt.write_text("# r2\n")
+        self.env.run("done", "--report", str(nxt), dispatch=dispatch)
+        self.assertEqual([m["type"] for m in self.env.json("wait", "--timeout", "2")["messages"]], ["done", "done"])
 
 
 if __name__ == "__main__":
