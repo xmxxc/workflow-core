@@ -12,6 +12,7 @@ import calendar
 import fcntl
 import json
 import os
+import re
 import shlex
 import sqlite3
 import subprocess
@@ -642,21 +643,119 @@ def cmd_ask(args):
 
 
 SENT, NOT_SENT, UNCERTAIN, PARTIAL = "sent", "not-sent", "uncertain", "partial"
+READ_ONLY = "read-only"
+
+# What a host draws when its conversation can no longer take input. `state` texts describe the
+# conversation itself: while one is on screen nothing may be typed (the Codex banner takes single
+# keys such as c and n as choices). A `refusal` answers one Enter: it counts only when it is new
+# after the router's own Enter, since an earlier one stays on screen. Each text must start a screen
+# line (after an optional `■ ` or `• `), so a worker quoting it in tool output (`│ `, `└ `) is not
+# taken for the host; it may wrap over up to NOTICE_LINES lines. Claude Code and OpenCode have no
+# known text yet.
+READ_ONLY_NOTICES = [
+    # (host, kind, text, source)
+    ("codex", "state", r"This chat uses .+?, but Codex now uses .+?, so this chat is read-only\.",
+     "Codex 0.167.0, a conversation resumed after the provider was switched (OpenAI to Codex API Service), "
+     "under the banner `🔒  Continue in a new chat`; tmux session wfc-d-3c8ab0af, 2026-11-09"),
+    ("codex", "state", r"This conversation is unavailable\. Its cached transcript and draft remain here; input is paused\.",
+     "Codex 0.167.0, an older TUI whose conversation became unavailable; wfc-d-ece89726, 2026-11-09"),
+    ("codex", "refusal", r"This conversation is read-only or unavailable; no operation was sent\.",
+     "Codex 0.167.0, its answer to each Enter in either conversation above; wfc-d-ece89726, 2026-11-09"),
+]
+NOTICE_LINES = 4
+_NOTICES = [(kind, re.compile(text)) for _, kind, text, _ in READ_ONLY_NOTICES]
+_NOTICE_MARK = re.compile(r"(?:[■•]\s*)?")
+
+
+def screen_notices(screen):
+    """(kind, text) of every read-only notice on a screen, top to bottom, each as one line."""
+    lines = [line.strip() for line in screen.splitlines()]
+    found = []
+    for i, line in enumerate(lines):
+        if not line:
+            continue
+        joined = " ".join(" ".join(lines[i:i + NOTICE_LINES]).split())
+        joined = joined[_NOTICE_MARK.match(joined).end():]
+        for kind, pattern in _NOTICES:
+            matched = pattern.match(joined)
+            if matched:
+                found.append((kind, matched.group(0)))
+                break
+    return found
+
+
+def read_only_notice(screen):
+    """The line the watchdog reports for a screen: its first state notice, else its last refusal."""
+    found = screen_notices(screen)
+    states = [text for kind, text in found if kind == "state"]
+    return states[0] if states else (found[-1][1] if found else None)
+
+
+def capture(session):
+    shot = tmux("capture-pane", "-p", "-t", session)
+    return shot.stdout if shot.returncode == 0 else None
+
+
+def seconds_setting(name, default):
+    try:
+        return max(0.0, float(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+
+def new_notice(session, before, seconds):
+    """Watch the screen for `seconds` and return the first notice that was not in `before`."""
+    deadline = time.monotonic() + seconds
+    while True:
+        time.sleep(max(0.0, min(0.25, deadline - time.monotonic())))
+        screen = capture(session)
+        if screen is not None:
+            found = screen_notices(screen)
+            if len(found) > len(before):
+                return found[-1][1]
+        if time.monotonic() >= deadline:
+            return None
 
 
 def type_into(session, text):
-    """Type one line into a TUI and submit it. Returns
+    """Type one line into a TUI and submit it. Returns (state, notice), the state being
     SENT;
     NOT_SENT when the text certainly did not arrive (tmux could not be run at all): safe to type again;
+    READ_ONLY when the host's screen says its conversation takes no input (`notice` is that line):
+      either it said so before anything was typed, or it answered the Enter with a new refusal.
+      Either way nothing was sent, and nothing typed later will be;
     UNCERTAIN when the text command ran but did not confirm (it may have handed the text over
       before failing, and a follow-up probe could fail the same way, so none is trusted);
     PARTIAL when the text arrived but its Enter was not confirmed.
-    After UNCERTAIN or PARTIAL, typing again could double the line: someone has to look."""
+    After UNCERTAIN or PARTIAL, typing again could double the line: someone has to look.
+    A SENT costs the check window after the Enter (WFC_TYPED_CHECK_SECONDS, 1.5 s by default)."""
+    screen = capture(session)
+    before = screen_notices(screen) if screen is not None else None
+    if before and any(kind == "state" for kind, _ in before):
+        return READ_ONLY, next(t for kind, t in before if kind == "state")
     sent = tmux("send-keys", "-t", session, "-l", text)
     if sent.returncode != 0:
-        return NOT_SENT if getattr(sent, "not_run", False) else UNCERTAIN
+        return (NOT_SENT if getattr(sent, "not_run", False) else UNCERTAIN), None
     time.sleep(0.5)  # TUIs drop an Enter that arrives in the same burst as the text
-    return SENT if tmux("send-keys", "-t", session, "Enter").returncode == 0 else PARTIAL
+    if tmux("send-keys", "-t", session, "Enter").returncode != 0:
+        return PARTIAL, None
+    if before is None:  # no screen to compare with: tmux could not capture it
+        return SENT, None
+    notice = new_notice(session, before, seconds_setting("WFC_TYPED_CHECK_SECONDS", 1.5))
+    return (READ_ONLY, notice) if notice else (SENT, None)
+
+
+def refusal(session, what, notice):
+    return (f"tmux session {session} did not take {what}: its screen says \"{notice}\" Nothing was sent, and this "
+            f"conversation cannot go on; dispatch a new worker")
+
+
+def mark_screen_reported(db, dispatch_id, session):
+    """The command that met a read-only screen reports it, so the watchdog does not report it again."""
+    screen = capture(session)
+    if screen is not None:
+        db.execute("INSERT OR REPLACE INTO screen_watch (dispatch, screen, since, reported_screen) VALUES (?, ?, ?, ?)",
+                   (dispatch_id, screen, time.time(), screen))
 
 
 def typing_error(session, what, typed):
@@ -708,9 +807,12 @@ def cmd_reply(args):
     db.execute("COMMIT")
     session = session_name(question["dispatch"])
     with input_lock(question["dispatch"]):
-        typed = type_into(session, f"[router] Answer to question {question['id']}: {answer}")
-    if typed == NOT_SENT:
+        typed, notice = type_into(session, f"[router] Answer to question {question['id']}: {answer}")
+    if typed in (NOT_SENT, READ_ONLY):
         db.execute("DELETE FROM message WHERE id = ?", (reply_id,))
+        if typed == READ_ONLY:
+            mark_screen_reported(db, question["dispatch"], session)
+            raise SystemExit(refusal(session, "the answer", notice))
         raise SystemExit(f"could not type the answer into tmux session {session}; is the worker still running?")
     if typed in (PARTIAL, UNCERTAIN):
         raise typing_error(session, f"The answer to question {question['id']}", typed)  # the claim stays
@@ -749,21 +851,25 @@ def cmd_continue(args):
     db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
     db.execute("COMMIT")
     brief = worker_brief(args.dispatch, task, report, opening="[router] New task for you")
-    typed = type_into(session, brief)
-    if typed == NOT_SENT:
+    typed, notice = type_into(session, brief)
+    if typed in (NOT_SENT, READ_ONLY):
+        why = (refusal(session, "the next task", notice) if typed == READ_ONLY
+               else f"could not type the next task into tmux session {session}")
         # Undo the claim only while it is still the latest round event and its task is still the
         # current one: a `resume` may have taken the new round over in between.
         db.execute("BEGIN IMMEDIATE")
+        if typed == READ_ONLY:
+            mark_screen_reported(db, args.dispatch, session)
         current = db.execute("SELECT task, report FROM dispatch WHERE id = ?", (args.dispatch,)).fetchone()
         if round_mark(db, args.dispatch) == message_id and (current["task"], current["report"]) == (str(task), str(report)):
             db.execute("DELETE FROM message WHERE id = ?", (message_id,))
             db.execute("UPDATE dispatch SET task = ?, report = ? WHERE id = ?",
                        (previous["task"], previous["report"], args.dispatch))
             db.execute("COMMIT")
-            raise SystemExit(f"could not type the next task into tmux session {session}")
+            raise SystemExit(why)
         db.execute("COMMIT")
-        raise SystemExit(f"could not type the next task into tmux session {session}, but dispatch {args.dispatch} "
-                         f"moved on meanwhile (a resume took the round over); its current state is kept")
+        raise SystemExit(f"{why}. But dispatch {args.dispatch} moved on meanwhile (a resume took the round over); "
+                         f"its current state is kept")
     if typed in (PARTIAL, UNCERTAIN):
         raise typing_error(session, "The next task", typed)
     emit({"continued": args.dispatch, "message": message_id})
@@ -788,9 +894,12 @@ def cmd_nudge(args):
     message_id = post(db, args.dispatch, "worker", "nudge", {"text": text})
     db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
     db.execute("COMMIT")
-    typed = type_into(session, f"[router] Message from the controller: {text}")
-    if typed == NOT_SENT:
+    typed, notice = type_into(session, f"[router] Message from the controller: {text}")
+    if typed in (NOT_SENT, READ_ONLY):
         db.execute("DELETE FROM message WHERE id = ?", (message_id,))
+        if typed == READ_ONLY:
+            mark_screen_reported(db, args.dispatch, session)
+            raise SystemExit(refusal(session, "the message", notice))
         raise SystemExit(f"could not type the message into tmux session {session}")
     if typed in (PARTIAL, UNCERTAIN):
         raise typing_error(session, "The message", typed)
@@ -974,11 +1083,22 @@ def cmd_resume(args):
                              f"`wait` reports it exited if it never started.")
         if row["host"] == "opencode":
             brief = worker_brief(args.dispatch, task, report, opening=opening)
-            typed = type_into(session, brief) if wait_for_quiet_screen(session) else NOT_SENT
+            typed, notice = type_into(session, brief) if wait_for_quiet_screen(session) else (NOT_SENT, None)
             if typed in (PARTIAL, UNCERTAIN):
                 raise typing_error(session, "The brief", typed)
+            if typed == READ_ONLY:
+                mark_screen_reported(db, args.dispatch, session)
+                raise SystemExit(f"resumed {session}, but " + refusal(session, "the brief", notice))
             if typed == NOT_SENT:
                 raise SystemExit(f"resumed {session} but could not type the brief into it; attach and paste it: {brief}")
+        elif any(host == row["host"] for host, *_ in READ_ONLY_NOTICES):
+            # The brief went in on the command line; a conversation that opens read-only drops it.
+            notice = new_notice(session, [], seconds_setting("WFC_RESUME_CHECK_SECONDS", 5))
+            if notice:
+                mark_screen_reported(db, args.dispatch, session)
+                raise SystemExit(f"resumed {session}, but its screen says \"{notice}\" The brief was not sent, and "
+                                 f"this conversation cannot go on; dispatch a new worker (the resumed round stays "
+                                 f"recorded; close the session with tmux kill-session -t {session})")
     emit({"resumed": args.dispatch, "session": host_session, "tmux": session})
 
 
@@ -1059,6 +1179,7 @@ def check_workers(db, stall_after):
         watch_key = (dispatch_id, db.execute("SELECT MAX(id) FROM message WHERE dispatch = ? AND type = 'resumed'",
                                              (dispatch_id,)).fetchone()[0])
         turn_end = TURN_WATCHES.setdefault(watch_key, TurnWatch()).latest(row, now) if alive else None
+        notice = read_only_notice(captured.stdout) if alive and captured.returncode == 0 else None
         # Decide and post under one write lock, re-checking state a worker's `done` may have changed.
         db.execute("BEGIN IMMEDIATE")
         try:
@@ -1069,6 +1190,15 @@ def check_workers(db, stall_after):
             elif not alive:
                 post(db, dispatch_id, "controller", "exited",
                      {"reason": f"tmux session {session} ended without done"})
+            elif notice:
+                # Nothing typed into this session will arrive: report it now, once per screen.
+                watch = db.execute("SELECT reported_screen FROM screen_watch WHERE dispatch = ?",
+                                   (dispatch_id,)).fetchone()
+                if watch is None or watch["reported_screen"] != captured.stdout:
+                    post(db, dispatch_id, "controller", "blocked",
+                         {"host": row["host"], "kind": "session_read_only", "message": notice})
+                    db.execute("INSERT OR REPLACE INTO screen_watch (dispatch, screen, since, reported_screen) "
+                               "VALUES (?, ?, ?, ?)", (dispatch_id, captured.stdout, now, captured.stdout))
             elif awaiting_answer(db, dispatch_id):
                 db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (dispatch_id,))
             elif blocked_turn(db, dispatch_id, turn_end):

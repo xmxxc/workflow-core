@@ -32,6 +32,8 @@ class Env:
         self.bin = root / "bin"
         self.bin.mkdir()
         # Each fake logs its argv; FAKE_FAIL=<subcommand> makes that subcommand exit 1.
+        # On an Enter, FAKE_ENTER_SCREEN's file replaces FAKE_SCREEN's (what the TUI drew in answer)
+        # and FAKE_ENTER_SQL runs against router.db (something that happened meanwhile).
         # The fake tmux keeps one marker file per session: new-session creates it (after
         # FAKE_LAUNCH_DELAY seconds) and has-session checks it. capture-pane prints FAKE_SCREEN's
         # file if set, else a fresh screen each time (a busy worker).
@@ -51,6 +53,12 @@ class Env:
                 f"    open(os.path.join(sessions, sys.argv[sys.argv.index('-s') + 1]), 'w').close()\n"
                 f"if {name!r} == 'tmux' and sys.argv[1] == 'has-session':\n"
                 f"    sys.exit(0 if os.path.exists(os.path.join(sessions, sys.argv[sys.argv.index('-t') + 1])) else 1)\n"
+                f"if {name!r} == 'tmux' and sys.argv[1:2] == ['send-keys'] and sys.argv[-1] == 'Enter':\n"
+                f"    if os.environ.get('FAKE_ENTER_SCREEN'):\n"
+                f"        open(os.environ['FAKE_SCREEN'], 'w').write(open(os.environ['FAKE_ENTER_SCREEN']).read())\n"
+                f"    if os.environ.get('FAKE_ENTER_SQL'):\n"
+                f"        import sqlite3; db = sqlite3.connect(os.path.join(os.environ['WFC_STATE'], 'router.db'))\n"
+                f"        db.executescript(os.environ['FAKE_ENTER_SQL']); db.close()\n"
                 f"if {name!r} == 'tmux' and sys.argv[1] == 'capture-pane':\n"
                 f"    screen = os.environ.get('FAKE_SCREEN')\n"
                 f"    print(open(screen).read() if screen else f'Working ({{time.time_ns()}})')\n")
@@ -66,6 +74,8 @@ class Env:
                     "CODEX_HOME": str(self.bin.parent / "codex-home"),
                     "WFC_OPENCODE_DB": str(self.bin.parent / "opencode.db"),
                     "CLAUDE_CONFIG_DIR": str(self.bin.parent / "claude-home"),
+                    # Short read-only checks keep the suite fast; ReadOnlySessions sets its own.
+                    "WFC_TYPED_CHECK_SECONDS": "0.2", "WFC_RESUME_CHECK_SECONDS": "0.3",
                     "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}", **(env or {})}
         full_env.pop("WFC_DISPATCH", None)
         if "CODEX_THREAD_ID" not in (env or {}):
@@ -2145,6 +2155,222 @@ class Status(unittest.TestCase):
         db.close()
 
         self.assertEqual(self.env.json("status")["waiters"], [])
+
+
+# Codex 0.167.0 screens captured on 2026-11-09 (tmux sessions wfc-d-3c8ab0af and wfc-d-ece89726).
+READ_ONLY_CHAT = """\
+• 第 13 轮审查完成，报告已提交（message 27）。
+
+  Worked for 1m 19s • 6:43 AM
+
+
+  🔒  Continue in a new chat
+      This chat uses OpenAI, but Codex now uses Codex API Service, so this
+      chat is read-only.
+
+  c continue in new chat · n start fresh · esc other chats
+"""
+UNAVAILABLE_CHAT = """\
+  Worked for 2m 41s • Nov 6 at 6:36 AM
+
+• This conversation is unavailable. Its cached transcript and draft remain here;
+input is paused. Open the agent picker or return to the parent to continue.
+
+
+› Ask Codex to do anything
+
+  GPT-6.1-Sol low · /path/to/workspace/.worktrees/example-project-5-review · Review …
+"""
+NO_OPERATION = "■ This conversation is read-only or unavailable; no operation was sent.\n"
+PROMPT = "• Done.\n\n\n› Ask Codex to do anything\n\n  GPT-6.1-Sol low · /tmp/worktree\n"
+
+
+class ReadOnlySessions(unittest.TestCase):
+    """A host conversation that has become read-only (Codex after a provider switch) drops what is
+    typed into it: the router checks the screen around its typing and after a resume, and the
+    watchdog reports such a screen as `blocked` (#13)."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+        self.answer = self.env.bin.parent / "answer.txt"
+        self.screens = {"FAKE_SCREEN": str(self.env.screen), "FAKE_ENTER_SCREEN": str(self.answer)}
+
+    def rejecting(self, before=PROMPT):
+        """The screen shows `before`; an Enter adds Codex's rejection line below it."""
+        self.env.screen.write_text(before)
+        self.answer.write_text(before + "\n" + NO_OPERATION + "\n")
+        return self.screens
+
+    def sends(self):
+        return [c for c in self.env.host_calls() if c[:2] == ["tmux", "send-keys"] and "-l" in c]
+
+    def messages(self, dispatch):
+        return [m["type"] for m in self.env.json("status", "--dispatch", dispatch)["dispatches"][0]["messages"]]
+
+    def finished(self, dispatch):
+        self.env.report.write_text("# r1\n")
+        self.env.run("done", "--report", str(self.env.report), dispatch=dispatch)
+        self.env.json("wait", "--timeout", "1")
+        task = self.env.task.with_name("113-impl-r2.md")
+        task.write_text("# r2\n")
+        return task, self.env.report.with_name("r2.md")
+
+    def test_a_nudge_the_session_refused_is_reported_and_not_recorded(self):
+        dispatch = self.env.dispatch()
+
+        result = self.env.run("nudge", dispatch, "--text", "continue", env=self.rejecting())
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("This conversation is read-only or unavailable; no operation was sent.", result.stderr)
+        self.assertIn("dispatch a new worker", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(len(self.sends()), 1)
+        self.assertEqual(self.messages(dispatch), [])
+
+    def test_a_refused_continue_restores_the_round_so_it_can_be_given_again(self):
+        dispatch = self.env.dispatch()
+        task, report = self.finished(dispatch)
+
+        first = self.env.run("continue", dispatch, "--task", str(task), "--report", str(report), env=self.rejecting())
+        [row] = self.env.json("status", "--dispatch", dispatch)["dispatches"]
+        second = self.env.run("continue", dispatch, "--task", str(task), "--report", str(report),
+                              env={"FAKE_SCREEN": str(self.env.screen)})
+
+        self.assertNotEqual(first.returncode, 0)
+        self.assertIn("no operation was sent", first.stderr)
+        self.assertEqual(row["report"], str(self.env.report))
+        self.assertEqual([m["type"] for m in row["messages"]], ["done"])
+        self.assertEqual(second.returncode, 0, second.stderr)
+
+    def test_a_refused_continue_keeps_a_round_that_moved_on_meanwhile(self):
+        dispatch = self.env.dispatch()
+        task, report = self.finished(dispatch)
+        moved = (f"INSERT INTO message (dispatch, recipient, type, body, created) "
+                 f"VALUES ('{dispatch}', 'worker', 'resumed', '{{}}', 0);")
+
+        result = self.env.run("continue", dispatch, "--task", str(task), "--report", str(report),
+                              env={**self.rejecting(), "FAKE_ENTER_SQL": moved})
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("moved on meanwhile", result.stderr)
+        [row] = self.env.json("status", "--dispatch", dispatch)["dispatches"]
+        self.assertEqual(row["report"], str(report))
+        self.assertEqual([m["type"] for m in row["messages"]], ["done", "continue", "resumed"])
+
+    def test_a_refused_reply_releases_the_question(self):
+        dispatch = self.env.dispatch()
+        question = self.env.json("ask", "Red or blue?", dispatch=dispatch)["message"]
+
+        first = self.env.run("reply", str(question), "blue", env=self.rejecting())
+        second = self.env.run("reply", str(question), "blue", env={"FAKE_SCREEN": str(self.env.screen)})
+
+        self.assertNotEqual(first.returncode, 0)
+        self.assertIn("no operation was sent", first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+
+    def test_an_earlier_refusal_still_on_screen_does_not_fail_a_send_that_went_through(self):
+        dispatch = self.env.dispatch()
+        self.env.screen.write_text(NO_OPERATION + PROMPT)
+
+        result = self.env.run("nudge", dispatch, "--text", "continue", env={"FAKE_SCREEN": str(self.env.screen)})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.messages(dispatch), ["nudge"])
+
+    def test_nothing_is_typed_into_a_session_whose_screen_says_it_is_read_only(self):
+        # The read-only banner takes single keys (c, n) as choices: typing there would pick one.
+        dispatch = self.env.dispatch()
+        for screen in (READ_ONLY_CHAT, UNAVAILABLE_CHAT):
+            with self.subTest(screen=screen[:20]):
+                self.env.screen.write_text(screen)
+
+                result = self.env.run("nudge", dispatch, "--text", "continue", env={"FAKE_SCREEN": str(self.env.screen)})
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("dispatch a new worker", result.stderr)
+                self.assertEqual(self.sends(), [])
+                self.assertEqual(self.messages(dispatch), [])
+
+    def test_the_typing_is_checked_on_the_screen_after_its_enter(self):
+        dispatch = self.env.dispatch()
+
+        self.env.json("nudge", dispatch, "--text", "continue")
+
+        calls = [c[:2] for c in self.env.host_calls()]
+        enter = max(i for i, c in enumerate(self.env.host_calls()) if c[-1] == "Enter")
+        self.assertIn(["tmux", "capture-pane"], calls[enter:])
+
+    def test_a_normal_send_waits_at_most_the_check_window(self):
+        dispatch = self.env.dispatch()
+        started = time.monotonic()
+
+        self.env.json("nudge", dispatch, "--text", "continue", env={"WFC_TYPED_CHECK_SECONDS": "1.5"})
+
+        self.assertLess(time.monotonic() - started, 0.5 + 1.5 + 1.5)  # Enter delay, window, process start
+
+    def test_the_watchdog_reports_a_read_only_screen_once_as_blocked(self):
+        dispatch = self.env.dispatch()
+        self.env.screen.write_text(READ_ONLY_CHAT)
+        env = {"FAKE_SCREEN": str(self.env.screen)}
+
+        first = self.env.json("wait", "--timeout", "2", "--stall-after", "60", env=env)
+        again = self.env.json("wait", "--timeout", "1.5", "--stall-after", "0.3", env=env)
+
+        [message] = first["messages"]
+        self.assertEqual((message["type"], message["dispatch"], message["host"], message["kind"], message["message"]),
+                         ("blocked", dispatch, "codex", "session_read_only",
+                          "This chat uses OpenAI, but Codex now uses Codex API Service, so this chat is read-only."))
+        self.assertTrue(again["timedOut"], again)  # neither reported again nor followed by a stall
+
+    def test_the_watchdog_reports_an_unavailable_screen_with_its_line(self):
+        self.env.dispatch()
+        self.env.screen.write_text(UNAVAILABLE_CHAT + NO_OPERATION)
+
+        [message] = self.env.json("wait", "--timeout", "2", "--stall-after", "60",
+                                  env={"FAKE_SCREEN": str(self.env.screen)})["messages"]
+
+        self.assertEqual((message["type"], message["kind"], message["message"]),
+                         ("blocked", "session_read_only",
+                          "This conversation is unavailable. Its cached transcript and draft remain here; "
+                          "input is paused."))
+
+    def test_a_worker_quoting_the_notice_in_its_output_is_not_reported(self):
+        self.env.dispatch()
+        self.env.screen.write_text("• Ran grep -n read-only router.py\n"
+                                   "  └ 12: ■ This conversation is read-only or unavailable; no operation was sent.\n"
+                                   "  │ so this chat is read-only.\n" + PROMPT)
+
+        [message] = self.env.json("wait", "--timeout", "2", "--stall-after", "0.3",
+                                  env={"FAKE_SCREEN": str(self.env.screen)})["messages"]
+
+        self.assertEqual(message["type"], "stalled")
+
+    def test_a_codex_resume_that_opens_read_only_is_reported(self):
+        dispatch = self.env.dispatch()
+        Resume.codex_rollout(type("R", (), {"env": self.env})(), dispatch, "main-2222")
+        self.env.end_session(dispatch)
+        self.env.screen.write_text(READ_ONLY_CHAT)
+        env = {"FAKE_SCREEN": str(self.env.screen)}
+
+        result = self.env.run("resume", dispatch, env=env)
+        after = self.env.json("wait", "--timeout", "1.5", "--stall-after", "60", env=env)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("so this chat is read-only", result.stderr)
+        self.assertIn("dispatch a new worker", result.stderr)
+        self.assertTrue(after["timedOut"], after)  # the resume already said so
+
+    def test_an_opencode_resume_whose_brief_was_refused_is_reported(self):
+        dispatch = self.env.dispatch("opencode", extra_args=("--model", "m"))
+        Resume.opencode_session(type("R", (), {"env": self.env})(), dispatch, "ses_main")
+        self.env.end_session(dispatch)
+
+        result = self.env.run("resume", dispatch, env=self.rejecting("> ready\n"), timeout=20)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no operation was sent", result.stderr)
+        self.assertIn("dispatch a new worker", result.stderr)
 
 
 def socket_free_port():
