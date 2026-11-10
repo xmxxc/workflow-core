@@ -1180,7 +1180,7 @@ def cmd_reclaim(args):
         if not args.yes:
             item["result"] = "listed"
             continue
-        item.update(reclaim_session(db, row, item["reclaimable"]))
+        item.update(reclaim_session(db, row, named=bool(named)))
         if item["result"] == "failed":
             errors.append(item["error"])
     emit({"state": str(state_dir()), "yes": bool(args.yes), "sessions": sessions})
@@ -1189,17 +1189,20 @@ def cmd_reclaim(args):
     return 1 if errors else 0
 
 
-def reclaim_session(db, row, was_reclaimable):
+def reclaim_session(db, row, named):
     """Close one session and record `reclaimed`, under the input lock and the write lock the
-    watchdog takes, so it never sees the session gone without the record. A done dispatch that a
-    `continue` or `resume` moved on since it was listed is left running."""
+    watchdog takes, so it never sees the session gone without the record. A dispatch reclaim chose
+    by itself (not `named` with --dispatch) must still be done and not reclaimed under the lock: one
+    a `continue` or `resume` moved on since it was listed is left running (`changed`). A named one
+    is closed whatever its task's state, as naming it is the user's explicit decision."""
     dispatch_id, session = row["id"], session_name(row["id"])
     with input_lock(dispatch_id):
         db.execute("BEGIN IMMEDIATE")
         try:
-            if was_reclaimable and not done_current_task(db, dispatch_id):
+            if not named and (not done_current_task(db, dispatch_id) or reclaimed(db, dispatch_id)):
                 db.execute("ROLLBACK")
-                return {"result": "changed", "note": f"dispatch {dispatch_id} got a new task meanwhile; left running"}
+                return {"result": "changed", "note": f"dispatch {dispatch_id} is no longer done and unreclaimed "
+                                                     f"(a continue, resume or reclaim came meanwhile); left running"}
             if not session_alive(session):
                 db.execute("ROLLBACK")
                 return {"result": "gone", "note": f"tmux session {session} no longer exists; skipped"}

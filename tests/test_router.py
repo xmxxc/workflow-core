@@ -1,5 +1,6 @@
 """Tests for router.py through its command-line interface."""
 
+import fcntl
 import json
 import os
 import shlex
@@ -85,6 +86,10 @@ class Env:
         (self.sessions / f"wfc-{dispatch}").unlink()
 
     def run(self, *args, dispatch=None, timeout=10, env=None, cwd=None):
+        return subprocess.run([sys.executable, str(ROUTER), *args], capture_output=True,
+                              text=True, timeout=timeout, env=self.router_env(dispatch, env), cwd=cwd)
+
+    def router_env(self, dispatch=None, env=None):
         # Tests never read or write the real ~/.claude.json.
         full_env = {**os.environ, "WFC_STATE": str(self.state),
                     "WFC_CLAUDE_CONFIG": str(self.bin.parent / "no-claude-config.json"),
@@ -99,8 +104,7 @@ class Env:
             full_env.pop("CODEX_THREAD_ID", None)  # set when the tests themselves run inside Codex
         if dispatch:
             full_env["WFC_DISPATCH"] = dispatch
-        return subprocess.run([sys.executable, str(ROUTER), *args], capture_output=True,
-                              text=True, timeout=timeout, env=full_env, cwd=cwd)
+        return full_env
 
     def json(self, *args, **kw):
         result = self.run(*args, **kw)
@@ -2582,6 +2586,54 @@ class Reclaim(unittest.TestCase):
         self.assertFalse(self.alive(closing))
         for kept in (failing, gone):
             self.assertNotIn("reclaimed", [m["type"] for m in self.messages(kept)])
+
+    def continue_while_reclaiming(self, first, second, *named):
+        """Start `reclaim --yes`, hold it at `first`'s input lock (after it listed its targets and
+        checked `first`'s owner), give `second` its next task with `continue`, then let it go on."""
+        lock = os.open(self.env.state / f"input-{first}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, lock)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        reclaiming = subprocess.Popen([sys.executable, str(ROUTER), "reclaim", "--yes", *named], stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, text=True, env=self.env.router_env())
+        self.addCleanup(reclaiming.kill)
+        deadline = time.monotonic() + 10
+        while not any(c[:2] == ["tmux", "show-environment"] and f"wfc-{first}" in c for c in self.env.host_calls()):
+            self.assertLess(time.monotonic(), deadline, "reclaim never reached the first session")
+            time.sleep(0.05)
+        time.sleep(0.3)  # past its ownership check, waiting for the lock
+        nxt = self.env.report.parent / "113-impl-r2.md"
+        self.env.json("continue", second, "--task", str(self.env.task), "--report", str(nxt))
+        self.assertEqual(self.env.json("status", "--dispatch", second)["dispatches"][0]["state"], "working")
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        return reclaiming
+
+    def test_a_default_target_given_a_new_task_after_listing_is_left_running(self):
+        first, second = self.env.dispatch(), self.env.dispatch()
+        for finished in (first, second):
+            self.finish(finished)
+        reclaiming = self.continue_while_reclaiming(first, second)
+
+        out, err = reclaiming.communicate(timeout=10)
+
+        sessions = {s["dispatch"]: s for s in json.loads(out)["sessions"]}
+        self.assertEqual((sessions[first]["result"], sessions[second]["result"]), ("reclaimed", "changed"), err)
+        self.assertEqual(reclaiming.returncode, 0)
+        self.assertTrue(self.alive(second))
+        self.assertEqual(self.kills(), [["tmux", "kill-session", "-t", f"wfc-{first}"]])
+        self.assertNotIn("reclaimed", [m["type"] for m in self.messages(second)])
+
+    def test_a_named_dispatch_is_closed_even_if_it_got_a_new_task_meanwhile(self):
+        """Naming a dispatch is the user's explicit decision to close it, whatever its task's state."""
+        first, second = self.env.dispatch(), self.env.dispatch()
+        for finished in (first, second):
+            self.finish(finished)
+        reclaiming = self.continue_while_reclaiming(first, second, "--dispatch", first, "--dispatch", second)
+
+        out, err = reclaiming.communicate(timeout=10)
+
+        sessions = {s["dispatch"]: s for s in json.loads(out)["sessions"]}
+        self.assertEqual((sessions[first]["result"], sessions[second]["result"]), ("reclaimed", "reclaimed"), err)
+        self.assertFalse(self.alive(second))
 
     def test_resume_after_reclaiming_an_unfinished_dispatch_finishes_its_task_and_is_watched_again(self):
         dispatch = self.env.dispatch("claude")
