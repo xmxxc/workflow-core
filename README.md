@@ -1,5 +1,7 @@
 # workflow-core
 
+![wfc · workflow-core: one controller terminal dispatching to three worker terminals, with messages flowing back](docs/assets/banner.png)
+
 [![CI](https://github.com/xmxxc/workflow-core/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/xmxxc/workflow-core/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/xmxxc/workflow-core?sort=semver)](https://github.com/xmxxc/workflow-core/releases/latest)
 [![License: MIT](https://img.shields.io/github/license/xmxxc/workflow-core)](LICENSE)
@@ -383,6 +385,7 @@ Each phase adds to the previous one, and each phase can be used on its own.
 - `wfc.py`: the single command. `build.py` packs it with `router.py` into the one-file `wfc` (a Python zip application). `tests/test_wfc.py` covers the build.
 - `notify_controller.py`: the earlier hook-based classifier, replaced by the watchdog and kept for reference.
 - `docs/decision-log.md`: user decisions, controller decisions and lessons. `docs/probes-*.md`: host capability probes behind the design.
+- `docs/assets/banner.png`: the banner at the top of both READMEs.
 
 ### Build and test
 

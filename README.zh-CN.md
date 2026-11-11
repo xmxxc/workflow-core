@@ -1,5 +1,7 @@
 # workflow-core
 
+![wfc · workflow-core：一个总控终端向三个 worker 终端派发任务，消息沿箭头传回](docs/assets/banner.png)
+
 [![CI](https://github.com/xmxxc/workflow-core/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/xmxxc/workflow-core/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/xmxxc/workflow-core?sort=semver)](https://github.com/xmxxc/workflow-core/releases/latest)
 [![License: MIT](https://img.shields.io/github/license/xmxxc/workflow-core)](LICENSE)
@@ -383,6 +385,7 @@ Claude Code 和 OpenCode 仍然只按一次回车。它们的输入框量过（C
 - `wfc.py`：唯一的命令入口。`build.py` 把它和 `router.py` 打包成单文件 `wfc`（一个 Python zip 应用）。`tests/test_wfc.py` 测试打包。
 - `notify_controller.py`：早先基于钩子的分类器，已被看门狗取代，保留作参考。
 - `docs/decision-log.md`：用户决定、总控决定和教训。`docs/probes-*.md`：设计所依据的宿主能力探针。
+- `docs/assets/banner.png`：两份 README 顶部的横幅图。
 
 ### 构建与测试
 
