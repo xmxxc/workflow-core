@@ -6,7 +6,10 @@ this worktree; the server was killed afterwards (`tmux -L wfc18probe kill-server
 
 ## Codex 0.167.0 (`codex -s read-only -a never`)
 
-Empty box after start: the placeholder, a blank line, a two-line footer.
+Empty box after start: the placeholder, a blank line, a two-line footer. Three more fresh starts
+(review R6-1) showed the same placeholder each time. With `capture-pane -e` it is drawn dim
+(`ESC[2m`), while typed text, even the same words, is not; `capture-pane -p`, which the router
+reads, drops that style, so the placeholder is listed by its text in `INPUT_BOX_PLACEHOLDERS`.
 
 ```
 › Ask Codex to do anything

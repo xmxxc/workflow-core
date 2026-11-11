@@ -2564,6 +2564,28 @@ class DroppedEnter(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self.enters()), 1)
 
+    def test_text_holding_the_placeholder_is_not_entered_again_once_the_box_is_empty(self):
+        # Review R6-1: the empty box shows its placeholder, which the typed text may contain.
+        dispatch = self.env.dispatch()
+        env = {"FAKE_SCREEN": self.screen("now.txt", PROMPT)}
+
+        result = self.env.run("nudge", dispatch, "--text", "the composer says: Ask Codex to do anything",
+                              env=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.enters()), 1)
+
+    def test_a_placeholder_not_in_the_table_inside_the_text_is_not_entered_again(self):
+        # An unknown placeholder cannot be told from text by itself; a box that is not scrolled must
+        # start where the typed text starts, which no placeholder does.
+        dispatch = self.env.dispatch()
+        env = {"FAKE_SCREEN": self.screen("now.txt", codex_box("Explain this codebase"))}
+
+        result = self.env.run("nudge", dispatch, "--text", "Explain this codebase", env=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.enters()), 1)
+
     def test_no_enter_while_the_box_holds_text_the_router_did_not_type(self):
         dispatch = self.env.dispatch()
         env = {"FAKE_SCREEN": self.screen("now.txt", codex_box("fix the flaky test"))}

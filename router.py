@@ -8,6 +8,7 @@ SQLite database under $WFC_STATE (default ~/.local/state/workflow-core).
 """
 
 import argparse
+import collections
 import calendar
 import fcntl
 import json
@@ -733,10 +734,26 @@ def new_notice(session, before, seconds):
 # OpenCode have no reader yet (see the README), so they get one Enter, as before.
 ENTER_RETRIES = 2
 _BOX_SCROLL = re.compile(r"\s*[↑↓]$")
+# What a reader saw in an input box: its text, and whether lines above it are scrolled out of
+# sight (Codex marks that with ↑), so that the text may start inside the typed text.
+InputBox = collections.namedtuple("InputBox", "text scrolled")
+EMPTY_BOX = InputBox("", False)
+# What an empty input box shows. A box showing one of these is empty: it is never compared with the
+# typed text, which may contain it (review R6-1).
+INPUT_BOX_PLACEHOLDERS = [
+    # (host, text, source)
+    ("codex", "Ask Codex to do anything",
+     "Codex 0.167.0, three fresh starts on a private tmux socket, 2026-11-10, drawn dim (SGR 2) unlike typed "
+     "text (docs/probes-20261110-input-box.md); also on the 2026-11-09 screens of wfc-d-ece89726"),
+]
+_PLACEHOLDERS = {}
+for _host, _text, _ in INPUT_BOX_PLACEHOLDERS:
+    _PLACEHOLDERS.setdefault(_host, set()).add("".join(_text.split()))
 
 
 def codex_input_box(screen):
-    """The text in Codex's input box, or None when the screen shows no box we can tell apart.
+    """What Codex's input box holds (an InputBox): EMPTY_BOX when it shows a known placeholder, None
+    when the screen shows no box we can tell apart.
     Codex 0.167.0 draws the box as the last paragraph that starts with `›` at the left edge, its
     further lines indented by two spaces, then (usually after a blank line) a footer of one or two
     indented lines joined by ` · ` (model, cwd; shortcuts). A tall box scrolls and shows ↑ or ↓ at
@@ -759,17 +776,26 @@ def codex_input_box(screen):
     if not 1 <= len(footer) <= 2 or not all(line.startswith("  ") and " · " in line for line in footer):
         return None
     box[0] = box[0][1:]
-    return " ".join(_BOX_SCROLL.sub("", line).strip() for line in box)
+    text = " ".join(_BOX_SCROLL.sub("", line).strip() for line in box)
+    if "".join(text.split()) in _PLACEHOLDERS["codex"]:
+        return EMPTY_BOX
+    return InputBox(text, any(line.endswith("↑") for line in box))
 
 
 INPUT_BOXES = {"codex": codex_input_box}
 
 
 def holds_typed_text(box, text):
-    """The box shows `text`, or a part of it (a scrolled box), ignoring how it was wrapped. An
-    empty box, its placeholder, or text the router did not type does not count."""
-    shown, typed = "".join(box.split()), "".join(text.split())
-    return bool(shown) and shown in typed and len(shown) >= min(len(typed), 8)
+    """The box shows the start of `text` (or, scrolled, a later part of it), ignoring how it was
+    wrapped. An empty box (EMPTY_BOX: the reader saw a known placeholder) or text the router did not
+    type does not count. A placeholder the reader does not know reads as text (`capture-pane -p`
+    drops the dim style Codex draws it in), but it is never scrolled and does not start the typed
+    text, which starts with `[router]`, so it gets no Enter either: when the screen cannot tell an
+    empty box from the text, nothing is pressed."""
+    shown, typed = "".join(box.text.split()), "".join(text.split())
+    if not shown or len(shown) < min(len(typed), 8):
+        return False
+    return shown in typed if box.scrolled else typed.startswith(shown)
 
 
 def text_left_in_box(session, host, text):
@@ -1093,7 +1119,10 @@ def waiter_alive(row):
 def process_start(pid):
     """What names process `pid` among all that ever had its pid, or None when there is no such process.
     On Linux `linux:<boot id>:<starttime>`, the starttime being field 22 of /proc/<pid>/stat (clock
-    ticks after boot), which no clock correction moves; elsewhere its lstart."""
+    ticks after boot), which no clock correction moves; elsewhere its lstart. The boot id tells a
+    process from one of an earlier boot with the same pid and starttime. When it cannot be read the
+    part is left empty, and such a row only names a pid and starttime: across a reboot it may be taken
+    for a later process with both the same."""
     if not Path("/proc/self/stat").exists():
         return process_lstart(pid)
     try:
