@@ -2424,6 +2424,19 @@ class ReadOnlySessions(unittest.TestCase):
 
         self.assertEqual(message["type"], "stalled")
 
+    def test_a_worker_quoting_the_state_notices_in_its_output_is_not_reported(self):
+        self.env.dispatch()
+        self.env.screen.write_text("• Ran grep -n -A1 'This' router.py\n"
+                                   "  └ This chat uses OpenAI, but Codex now uses Codex API Service, so this chat\n"
+                                   "    is read-only.\n"
+                                   "  │ This conversation is unavailable. Its cached transcript and draft remain\n"
+                                   "    here; input is paused.\n" + PROMPT)
+
+        [message] = self.env.json("wait", "--timeout", "2", "--stall-after", "0.3",
+                                  env={"FAKE_SCREEN": str(self.env.screen)})["messages"]
+
+        self.assertEqual(message["type"], "stalled")
+
     def test_a_codex_resume_that_opens_read_only_is_reported(self):
         dispatch = self.env.dispatch()
         Resume.codex_rollout(type("R", (), {"env": self.env})(), dispatch, "main-2222")
