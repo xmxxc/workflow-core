@@ -1,5 +1,6 @@
 """Tests for router.py through its command-line interface."""
 
+import calendar
 import fcntl
 import json
 import os
@@ -33,7 +34,9 @@ class Env:
         self.bin = root / "bin"
         self.bin.mkdir()
         # Each fake logs its argv; FAKE_FAIL=<subcommand> makes that subcommand exit 1.
-        # On an Enter, FAKE_ENTER_SCREEN's file replaces FAKE_SCREEN's (what the TUI drew in answer)
+        # On an Enter, FAKE_ENTER_SCREEN's file replaces FAKE_SCREEN's (what the TUI drew in answer);
+        # FAKE_ENTER_SCREENS (paths joined by os.pathsep) does so per Enter: the nth Enter draws the
+        # nth file, the last one from then on. FAKE_SCREEN_ALT makes every other capture print that file.
         # and FAKE_ENTER_SQL runs against router.db (something that happened meanwhile).
         # The fake tmux keeps one marker file per session: new-session creates it (after
         # FAKE_LAUNCH_DELAY seconds) and has-session checks it. capture-pane prints FAKE_SCREEN's
@@ -60,6 +63,12 @@ class Env:
                 f"if {name!r} == 'tmux' and sys.argv[1:2] == ['send-keys'] and sys.argv[-1] == 'Enter':\n"
                 f"    if os.environ.get('FAKE_ENTER_SCREEN'):\n"
                 f"        open(os.environ['FAKE_SCREEN'], 'w').write(open(os.environ['FAKE_ENTER_SCREEN']).read())\n"
+                f"    if os.environ.get('FAKE_ENTER_SCREENS'):\n"
+                f"        counter = os.environ['FAKE_SCREEN'] + '.enters'\n"
+                f"        n = int(open(counter).read()) if os.path.exists(counter) else 0\n"
+                f"        open(counter, 'w').write(str(n + 1))\n"
+                f"        screens = os.environ['FAKE_ENTER_SCREENS'].split(os.pathsep)\n"
+                f"        open(os.environ['FAKE_SCREEN'], 'w').write(open(screens[min(n, len(screens) - 1)]).read())\n"
                 f"    if os.environ.get('FAKE_ENTER_SQL'):\n"
                 f"        import sqlite3; db = sqlite3.connect(os.path.join(os.environ['WFC_STATE'], 'router.db'))\n"
                 f"        db.executescript(os.environ['FAKE_ENTER_SQL']); db.close()\n"
@@ -79,6 +88,11 @@ class Env:
                 f"    os.unlink(os.path.join(sessions, target))\n"
                 f"if {name!r} == 'tmux' and sys.argv[1] == 'capture-pane':\n"
                 f"    screen = os.environ.get('FAKE_SCREEN')\n"
+                f"    if screen and os.environ.get('FAKE_SCREEN_ALT'):\n"
+                f"        counter = screen + '.captures'\n"
+                f"        n = int(open(counter).read()) if os.path.exists(counter) else 0\n"
+                f"        open(counter, 'w').write(str(n + 1))\n"
+                f"        screen = os.environ['FAKE_SCREEN_ALT'] if n % 2 else screen\n"
                 f"    print(open(screen).read() if screen else f'Working ({{time.time_ns()}})')\n")
             fake.chmod(0o755)
 
@@ -2435,6 +2449,244 @@ class ReadOnlySessions(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("no operation was sent", result.stderr)
         self.assertIn("dispatch a new worker", result.stderr)
+
+
+# Codex 0.167.0, example-project 2026-11-10, message 176: the answer to question 174 still in the input
+# box at the bottom (the last `›` paragraph above the footer), its Enter dropped (#18).
+ENTER_DROPPED_174 = """\
+• 已向总控提交 ETF 母 ETF 映射来源裁决请求（消息 174），等待决策后继续。
+  Worked for 16m 47s • 3:14 AM
+› [router] Answer to question 174: 批准page-scrape，通过现有统一UpstreamFetcher
+  只读抓取官方基金页。条件：必须核实页面明确属于请求的基金代码，并定位明确“查看
+  相关ETF”语义的链接关系，不是从任意六位href猜；接受目标官方同域https基金详情
+  URL且代码不同于联接基金，仅允许固定主机/路径拼接，不跟随任意外部href，避免引
+  入任意URL访问。映射代码需通过母ETF基础信息或可信股票/ETF行情响应核实其身份/市
+  场，不能仅语法六位就证明是ETF。失败/多义/同页冲突/身份不符unavailable，不能名
+  称猜测。样本优先保存真实原始页面或可复核完整相关区块及URL/请求基金/母ETF/采集
+  时刻/hash，片段若裁剪必须标明并保留原文到报告证据目录，不能把片段称原始完整响
+  应。页面一般没有可靠来源更新时间；采集时间只是fetchedAt，不能当作映射官方发布
+  时间或估值quote.time，按明确缓存TTL缓存映射并说明刷新策略。HTTP回归覆盖
+  110020→510310真实成功、错误页面基金代码、无/多相关链接、外域/假链接、母ETF非
+  ETF/无报价、坏响应及恢复。无需等统一API，继续原#7任务。
+  GPT-6.1-Sol medium · /path/to/workspace/.worktrees/…  ⚠ 1 warning · f2 to view
+"""
+# The same answer once submitted: Codex repeats it in the transcript, also after a `›`, and the
+# input box below is empty again (its placeholder shows).
+SUBMITTED_174 = ("\n".join(ENTER_DROPPED_174.splitlines()[:-1])
+                 + "\n\n• Working (3s • esc to interrupt)\n\n\n› Ask Codex to do anything\n\n"
+                 + ENTER_DROPPED_174.splitlines()[-1] + "\n")
+ANSWER_174 = "".join(line.strip() for line in ENTER_DROPPED_174.splitlines()[2:14]).split(": ", 1)[1]
+
+
+def codex_box(*lines):
+    """A Codex screen whose input box holds `lines` (the first after `› `, the rest indented)."""
+    box = "\n".join(["› " + lines[0], *("  " + line for line in lines[1:])])
+    return "• Done.\n\n\n" + box + "\n\n  GPT-6.1-Sol low · /tmp/worktree\n"
+
+
+NUDGED = "[router] Message from the controller: continue"
+
+
+class DroppedEnter(unittest.TestCase):
+    """A long text can arrive after its Enter, which the TUI then drops: the text stays in Codex's
+    input box. The router looks at that box (not the transcript), presses Enter again while the box
+    still holds the text, and reports PARTIAL when it never leaves (#18)."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+
+    def screen(self, name, text):
+        path = self.env.bin.parent / name
+        path.write_text(text)
+        return str(path)
+
+    def enters(self):
+        return [c for c in self.env.host_calls() if c[:2] == ["tmux", "send-keys"] and c[-1] == "Enter"]
+
+    def texts(self):
+        return [c for c in self.env.host_calls() if c[:2] == ["tmux", "send-keys"] and "-l" in c]
+
+    def question_174(self, dispatch):
+        db = sqlite3.connect(self.env.state / "router.db")
+        db.execute("INSERT INTO message (id, dispatch, recipient, type, body, created) VALUES "
+                   "(174, ?, 'controller', 'question', ?, ?)",
+                   (dispatch, json.dumps({"question": "Which source?", "options": None}), time.time()))
+        db.commit()
+        db.close()
+
+    def test_the_sample_answer_left_in_the_box_gets_one_more_enter(self):
+        dispatch = self.env.dispatch()
+        self.question_174(dispatch)
+        env = {"FAKE_SCREEN": self.screen("now.txt", ENTER_DROPPED_174),
+               "FAKE_ENTER_SCREENS": os.pathsep.join([self.screen("dropped.txt", ENTER_DROPPED_174),
+                                                      self.screen("submitted.txt", SUBMITTED_174)])}
+
+        result = self.env.run("reply", "174", ANSWER_174, env=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.texts()), 1)
+        self.assertEqual(len(self.enters()), 2)
+
+    def test_an_answer_that_never_leaves_the_box_is_partial_and_not_typed_again(self):
+        dispatch = self.env.dispatch()
+        self.question_174(dispatch)
+        env = {"FAKE_SCREEN": self.screen("now.txt", ENTER_DROPPED_174)}
+
+        first = self.env.run("reply", "174", ANSWER_174, env=env)
+        second = self.env.run("reply", "174", ANSWER_174, env=env)
+
+        self.assertNotEqual(first.returncode, 0)
+        self.assertIn("its Enter was not confirmed", first.stderr)
+        self.assertIn("tmux attach", first.stderr)
+        self.assertIn("already answered", second.stderr)  # the claim stays
+        self.assertEqual(len(self.texts()), 1)
+        self.assertEqual(len(self.enters()), 3)  # the first Enter and at most two more
+
+    def test_the_submitted_answer_in_the_transcript_does_not_count_as_the_box(self):
+        dispatch = self.env.dispatch()
+        self.question_174(dispatch)
+        env = {"FAKE_SCREEN": self.screen("now.txt", ENTER_DROPPED_174),
+               "FAKE_ENTER_SCREEN": self.screen("submitted.txt", SUBMITTED_174)}
+
+        result = self.env.run("reply", "174", ANSWER_174, env=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.enters()), 1)
+
+    def test_no_enter_into_an_empty_box(self):
+        # An Enter into an empty box is never pressed, so a late first Enter cannot be doubled.
+        dispatch = self.env.dispatch()
+        env = {"FAKE_SCREEN": self.screen("now.txt", PROMPT)}
+
+        result = self.env.run("nudge", dispatch, "--text", "continue", env=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.enters()), 1)
+
+    def test_no_enter_while_the_box_holds_text_the_router_did_not_type(self):
+        dispatch = self.env.dispatch()
+        env = {"FAKE_SCREEN": self.screen("now.txt", codex_box("fix the flaky test"))}
+
+        result = self.env.run("nudge", dispatch, "--text", "continue", env=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.enters()), 1)
+
+    def test_no_enter_while_the_box_is_still_changing(self):
+        dispatch = self.env.dispatch()
+        env = {"FAKE_SCREEN": self.screen("now.txt", codex_box(NUDGED)),
+               "FAKE_SCREEN_ALT": self.screen("drawing.txt", codex_box("[router] Message from the"))}
+
+        result = self.env.run("nudge", dispatch, "--text", "continue", env=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.enters()), 1)
+
+    def test_a_box_scrolled_past_its_first_line_still_counts(self):
+        # Codex scrolls a tall box and marks it with ↑ at the right edge (probe, Codex 0.167.0).
+        dispatch = self.env.dispatch()
+        long_text = "x" * 40 + " " + "y" * 40
+        env = {"FAKE_SCREEN": self.screen("now.txt", codex_box("y" * 40 + "  ↑")),
+               "FAKE_ENTER_SCREENS": os.pathsep.join([self.screen("dropped.txt", codex_box("y" * 40 + "  ↑")),
+                                                      self.screen("submitted.txt", PROMPT)])}
+
+        result = self.env.run("nudge", dispatch, "--text", long_text, env=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.enters()), 2)
+
+    def test_a_refusal_answering_the_extra_enter_is_read_only(self):
+        dispatch = self.env.dispatch()
+        env = {"FAKE_SCREEN": self.screen("now.txt", codex_box(NUDGED)),
+               "FAKE_ENTER_SCREENS": os.pathsep.join([self.screen("dropped.txt", codex_box(NUDGED)),
+                                                      self.screen("refused.txt", NO_OPERATION + codex_box(NUDGED))])}
+
+        result = self.env.run("nudge", dispatch, "--text", "continue", env=env)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no operation was sent", result.stderr)
+        self.assertEqual(self.env.json("status", "--dispatch", dispatch)["dispatches"][0]["messages"], [])
+
+    def test_hosts_without_a_known_input_box_get_one_enter_as_before(self):
+        for host in ("claude", "opencode"):
+            with self.subTest(host=host):
+                dispatch = self.env.dispatch(host, extra_args=("--model", "m"))
+                before = len(self.enters())
+                env = {"FAKE_SCREEN": self.screen("now.txt", codex_box(NUDGED))}
+
+                result = self.env.run("nudge", dispatch, "--text", "continue", env=env)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(self.enters()) - before, 1)
+
+
+def ps_start(pid):
+    """`ps lstart` of `pid` in UTC, as a time; the format waiters were registered with up to 0.4.4."""
+    text = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                          env={**os.environ, "LC_ALL": "C", "TZ": "UTC"}).stdout.strip()
+    return calendar.timegm(time.strptime(text, "%a %b %d %H:%M:%S %Y"))
+
+
+def lstart_text(epoch):
+    t = time.gmtime(epoch)
+    return time.strftime("%a %b ", t) + f"{t.tm_mday:2d}" + time.strftime(" %H:%M:%S %Y", t)
+
+
+class WaiterLiveness(unittest.TestCase):
+    """`ps lstart` is the boot time plus the start offset, so it moves when the clock is corrected:
+    a waiter is matched on Linux by its /proc starttime, elsewhere by lstart within seconds (#18)."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+        self.env.dispatch()
+
+    def register(self, process_start):
+        db = sqlite3.connect(self.env.state / "router.db")
+        db.execute("INSERT INTO waiter (pid, kind, since, process_start) VALUES (?, 'relay', ?, ?)",
+                   (os.getpid(), time.time(), process_start))
+        db.commit()
+        db.close()
+
+    def test_an_older_row_whose_lstart_drifted_a_few_seconds_is_still_listed(self):
+        self.register(lstart_text(ps_start(os.getpid()) + 3))
+
+        self.assertEqual([w["pid"] for w in self.env.json("status")["waiters"]], [os.getpid()])
+
+    def test_an_older_row_whose_lstart_is_a_minute_off_is_another_process(self):
+        self.register(lstart_text(ps_start(os.getpid()) - 60))
+
+        self.assertEqual(self.env.json("status")["waiters"], [])
+
+    @unittest.skipUnless(Path("/proc/self/stat").exists(), "Linux /proc")
+    def test_on_linux_a_waiter_is_registered_and_matched_by_its_proc_starttime(self):
+        waiter = subprocess.Popen([sys.executable, str(ROUTER), "wait", "--timeout", "5"],
+                                  env=self.env.router_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(waiter.wait)
+        self.addCleanup(waiter.kill)
+        deadline = time.monotonic() + 5
+        row = None
+        while row is None and time.monotonic() < deadline:
+            db = sqlite3.connect(self.env.state / "router.db")
+            row = db.execute("SELECT process_start FROM waiter WHERE pid = ?", (waiter.pid,)).fetchone()
+            db.close()
+            time.sleep(0.05)
+        stat = Path(f"/proc/{waiter.pid}/stat").read_text()
+        ticks = stat[stat.rindex(")") + 2:].split()[19]
+
+        self.assertIsNotNone(row)
+        self.assertTrue(row[0].endswith(":" + ticks), row[0])
+        self.assertEqual([w["pid"] for w in self.env.json("status")["waiters"]], [waiter.pid])
+
+    @unittest.skipUnless(Path("/proc/self/stat").exists(), "Linux /proc")
+    def test_on_linux_a_row_with_another_starttime_is_another_process(self):
+        stat = Path("/proc/self/stat").read_text()
+        ticks = int(stat[stat.rindex(")") + 2:].split()[19])
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        self.register(f"linux:{boot}:{ticks + 1}")
+
+        self.assertEqual(self.env.json("status")["waiters"], [])
 
 
 def socket_free_port():

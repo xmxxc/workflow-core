@@ -727,18 +727,88 @@ def new_notice(session, before, seconds):
             return None
 
 
-def type_into(session, text):
+# Where a host's input box is on its screen. A long text can still be arriving when its Enter
+# does, and the TUI then drops the Enter: the text stays in the box, unsent (#18). Only the box
+# tells: Codex repeats each submitted message in the transcript after the same `›`. Claude Code and
+# OpenCode have no reader yet (see the README), so they get one Enter, as before.
+ENTER_RETRIES = 2
+_BOX_SCROLL = re.compile(r"\s*[↑↓]$")
+
+
+def codex_input_box(screen):
+    """The text in Codex's input box, or None when the screen shows no box we can tell apart.
+    Codex 0.167.0 draws the box as the last paragraph that starts with `›` at the left edge, its
+    further lines indented by two spaces, then (usually after a blank line) a footer of one or two
+    indented lines joined by ` · ` (model, cwd; shortcuts). A tall box scrolls and shows ↑ or ↓ at
+    its right edge. A message already submitted sits higher up in the transcript, after a `›` too,
+    but never directly above the footer: the box is always drawn below it."""
+    lines = [line.rstrip() for line in screen.splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
+    starts = [i for i, line in enumerate(lines) if line == "›" or line.startswith("› ")]
+    if not starts:
+        return None
+    end = starts[-1] + 1
+    while end < len(lines) and lines[end].startswith("  ") and lines[end].strip():
+        end += 1
+    box, below = lines[starts[-1]:end], lines[end:]
+    if not below:  # no blank line above the footer (message 176's screen): it ended the paragraph
+        while len(box) > 1 and len(below) < 2 and " · " in box[-1]:
+            below.insert(0, box.pop())
+    footer = [line for line in below if line]
+    if not 1 <= len(footer) <= 2 or not all(line.startswith("  ") and " · " in line for line in footer):
+        return None
+    box[0] = box[0][1:]
+    return " ".join(_BOX_SCROLL.sub("", line).strip() for line in box)
+
+
+INPUT_BOXES = {"codex": codex_input_box}
+
+
+def holds_typed_text(box, text):
+    """The box shows `text`, or a part of it (a scrolled box), ignoring how it was wrapped. An
+    empty box, its placeholder, or text the router did not type does not count."""
+    shown, typed = "".join(box.split()), "".join(text.split())
+    return bool(shown) and shown in typed and len(shown) >= min(len(typed), 8)
+
+
+def text_left_in_box(session, host, text):
+    """The screen when the host's input box still holds `text` and stays the same over two
+    captures 0.3 s apart, so it is not still being drawn or emptied; else None. Hosts without a
+    known box, and screens that cannot be captured or read, give None: nothing more is pressed."""
+    reader = INPUT_BOXES.get(host)
+    if reader is None:
+        return None
+    first = capture(session)
+    if first is None:
+        return None
+    time.sleep(0.3)
+    second = capture(session)
+    if second is None:
+        return None
+    box = reader(second)
+    if box is None or box != reader(first) or not holds_typed_text(box, text):
+        return None
+    return second
+
+
+def type_into(session, text, host=None):
     """Type one line into a TUI and submit it. Returns (state, notice), the state being
     SENT;
     NOT_SENT when the text certainly did not arrive (tmux could not be run at all): safe to type again;
     READ_ONLY when the host's screen says its conversation takes no input (`notice` is that line):
-      either it said so before anything was typed, or it answered the Enter with a new refusal.
+      either it said so before anything was typed, or it answered an Enter with a new refusal.
       Either way nothing was sent, and nothing typed later will be;
     UNCERTAIN when the text command ran but did not confirm (it may have handed the text over
       before failing, and a follow-up probe could fail the same way, so none is trusted);
-    PARTIAL when the text arrived but its Enter was not confirmed.
+    PARTIAL when the text arrived but its Enter was not confirmed: tmux failed to press it, or
+      the text was still in the host's input box after ENTER_RETRIES more Enters.
     After UNCERTAIN or PARTIAL, typing again could double the line: someone has to look.
-    A SENT costs the check window after the Enter (WFC_TYPED_CHECK_SECONDS, 1.5 s by default)."""
+    A SENT costs the check window after the Enter (WFC_TYPED_CHECK_SECONDS, 1.5 s by default).
+    For a host with a known input box (INPUT_BOXES), a dropped Enter is pressed again, at most
+    ENTER_RETRIES times, each only while the box still holds this text and stays unchanged: a box
+    that is empty, shows other text, or is still changing gets no Enter, so nothing is submitted
+    twice and no empty Enter is sent. Each extra Enter gets its own check window."""
     screen = capture(session)
     before = screen_notices(screen) if screen is not None else None
     if before and any(kind == "state" for kind, _ in before):
@@ -751,8 +821,20 @@ def type_into(session, text):
         return PARTIAL, None
     if before is None:  # no screen to compare with: tmux could not capture it
         return SENT, None
-    notice = new_notice(session, before, seconds_setting("WFC_TYPED_CHECK_SECONDS", 1.5))
-    return (READ_ONLY, notice) if notice else (SENT, None)
+    window = seconds_setting("WFC_TYPED_CHECK_SECONDS", 1.5)
+    notice = new_notice(session, before, window)
+    if notice:
+        return READ_ONLY, notice
+    for _ in range(ENTER_RETRIES):
+        left = text_left_in_box(session, host, text)
+        if left is None:
+            return SENT, None
+        if tmux("send-keys", "-t", session, "Enter").returncode != 0:
+            return PARTIAL, None
+        notice = new_notice(session, screen_notices(left), window)
+        if notice:
+            return READ_ONLY, notice
+    return (PARTIAL, None) if text_left_in_box(session, host, text) is not None else (SENT, None)
 
 
 def refusal(session, what, notice):
@@ -816,8 +898,10 @@ def cmd_reply(args):
     reply_id = post(db, question["dispatch"], "worker", "reply", {"to": question["id"], "answer": answer})
     db.execute("COMMIT")
     session = session_name(question["dispatch"])
+    host = db.execute("SELECT host FROM dispatch WHERE id = ?", (question["dispatch"],)).fetchone()
     with input_lock(question["dispatch"]):
-        typed, notice = type_into(session, f"[router] Answer to question {question['id']}: {answer}")
+        typed, notice = type_into(session, f"[router] Answer to question {question['id']}: {answer}",
+                                  host["host"] if host else None)
     if typed in (NOT_SENT, READ_ONLY):
         db.execute("DELETE FROM message WHERE id = ?", (reply_id,))
         if typed == READ_ONLY:
@@ -861,7 +945,7 @@ def cmd_continue(args):
     db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
     db.execute("COMMIT")
     brief = worker_brief(args.dispatch, task, report, opening="[router] New task for you")
-    typed, notice = type_into(session, brief)
+    typed, notice = type_into(session, brief, row["host"])
     if typed in (NOT_SENT, READ_ONLY):
         why = (refusal(session, "the next task", notice) if typed == READ_ONLY
                else f"could not type the next task into tmux session {session}")
@@ -904,7 +988,7 @@ def cmd_nudge(args):
     message_id = post(db, args.dispatch, "worker", "nudge", {"text": text})
     db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
     db.execute("COMMIT")
-    typed, notice = type_into(session, f"[router] Message from the controller: {text}")
+    typed, notice = type_into(session, f"[router] Message from the controller: {text}", row["host"])
     if typed in (NOT_SENT, READ_ONLY):
         db.execute("DELETE FROM message WHERE id = ?", (message_id,))
         if typed == READ_ONLY:
@@ -982,22 +1066,63 @@ def cmd_status(args):
                         "the next write command (wait, dispatch, ...) upgrades it"} if outdated else {})})
 
 
+# An lstart is the boot time plus the start offset, so it moves when the clock is corrected: a relay
+# registered at 17:15:10 read back as 17:15:07 (#18). How far an lstart may move and still name
+# the same process; a pid reused within that is taken for the old process.
+LSTART_SLACK = 10
+
+
 def waiter_alive(row):
-    """A row registered with its process start names that one process; an older row has only its pid."""
-    if row["process_start"]:
-        return process_start(row["pid"]) == row["process_start"]
-    return process_alive(row["pid"])
+    """A row registered with its process start names that one process; an older row has only its pid.
+    A Linux start (`linux:<boot id>:<starttime>`) must match exactly; an lstart, registered elsewhere
+    or by wfc up to 0.4.4, within LSTART_SLACK seconds."""
+    registered = row["process_start"]
+    if not registered:
+        return process_alive(row["pid"])
+    if registered.startswith("linux:"):
+        return process_start(row["pid"]) == registered
+    now = process_lstart(row["pid"])
+    if now is None:
+        return False
+    then_epoch, now_epoch = lstart_epoch(registered), lstart_epoch(now)
+    if then_epoch is None or now_epoch is None:
+        return now == registered
+    return abs(now_epoch - then_epoch) <= LSTART_SLACK
 
 
 def process_start(pid):
-    """When process `pid` started, as `ps` prints it, or None when there is no such process.
-    With the pid it names one process, so a reused pid does not pass for a gone one."""
+    """What names process `pid` among all that ever had its pid, or None when there is no such process.
+    On Linux `linux:<boot id>:<starttime>`, the starttime being field 22 of /proc/<pid>/stat (clock
+    ticks after boot), which no clock correction moves; elsewhere its lstart."""
+    if not Path("/proc/self/stat").exists():
+        return process_lstart(pid)
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    try:
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        boot = ""
+    # Field 2 (the command) is in parentheses and may hold spaces; field 3 follows the last `)`.
+    return f"linux:{boot}:{stat[stat.rindex(')') + 2:].split()[19]}"
+
+
+def process_lstart(pid):
+    """When process `pid` started, as `ps` prints it in UTC, or None when there is no such process."""
     try:
         result = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
                                 env={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
     except OSError:
         return None
     return result.stdout.strip() or None
+
+
+def lstart_epoch(text):
+    try:
+        return calendar.timegm(time.strptime(text, "%a %b %d %H:%M:%S %Y"))
+    except ValueError:
+        return None
 
 
 def process_alive(pid):
@@ -1097,7 +1222,7 @@ def cmd_resume(args):
                              f"`wait` reports it exited if it never started.")
         if row["host"] == "opencode":
             brief = worker_brief(args.dispatch, task, report, opening=opening)
-            typed, notice = type_into(session, brief) if wait_for_quiet_screen(session) else (NOT_SENT, None)
+            typed, notice = type_into(session, brief, row["host"]) if wait_for_quiet_screen(session) else (NOT_SENT, None)
             if typed in (PARTIAL, UNCERTAIN):
                 raise typing_error(session, "The brief", typed)
             if typed == READ_ONLY:
