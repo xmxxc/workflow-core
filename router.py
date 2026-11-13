@@ -55,7 +55,8 @@ def session_name(dispatch_id):
 
 # Each table's columns as a fresh database creates them.
 TABLES = {
-    "dispatch": "id TEXT PRIMARY KEY, host TEXT, cwd TEXT, task TEXT, created REAL",
+    "dispatch": "id TEXT PRIMARY KEY, host TEXT, cwd TEXT, task TEXT, created REAL, scope TEXT, role TEXT, current_round INTEGER DEFAULT 1, current_attempt TEXT",
+    "dispatch_round": "dispatch TEXT, round INTEGER, attempt TEXT, task TEXT, report TEXT, state TEXT DEFAULT 'running', result TEXT, created REAL, completed REAL, PRIMARY KEY (dispatch, round, attempt)",
     "message": "id INTEGER PRIMARY KEY AUTOINCREMENT, dispatch TEXT, recipient TEXT, "
                "type TEXT, body TEXT, created REAL, delivered INTEGER DEFAULT 0",
     "screen_watch": "dispatch TEXT PRIMARY KEY, screen TEXT, since REAL, reported_screen TEXT",
@@ -71,7 +72,8 @@ TABLES = {
 # `process_start` tells a waiter's own process from a later one that reuses its pid.
 ADDED_COLUMNS = {
     "dispatch": {"started": "REAL", "report_dir": "TEXT", "report": "TEXT", "model": "TEXT", "host_session": "TEXT",
-                 "effort": "TEXT", "network": "INTEGER", "label": "TEXT", "git": "INTEGER"},
+                 "effort": "TEXT", "network": "INTEGER", "label": "TEXT", "git": "INTEGER",
+                 "scope": "TEXT", "role": "TEXT", "current_round": "INTEGER", "current_attempt": "TEXT"},
     "waiter": {"process_start": "TEXT"},
 }
 
@@ -104,7 +106,37 @@ def connect():
         except BaseException:
             db.execute("ROLLBACK")
             raise
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        backfill_dispatch_identity(db)
+        db.execute("COMMIT")
+    except BaseException:
+        db.execute("ROLLBACK")
+        raise
     return db
+
+
+def backfill_dispatch_identity(db):
+    """Give rows written by pre-round databases a durable identity and first snapshot."""
+    rows = db.execute("SELECT id, created, task, report, report_dir, scope, role, current_round, current_attempt "
+                      "FROM dispatch").fetchall()
+    for row in rows:
+        scope = row["scope"] or "s-" + uuid.uuid4().hex[:8]
+        role = row["role"] or (clean_label(Path(row["report_dir"]).name).rpartition("-")[2]
+                                if row["report_dir"] else "") or "worker"
+        current_round = row["current_round"] or 1
+        attempt = row["current_attempt"] or "a-" + uuid.uuid4().hex[:12]
+        if (row["scope"], row["role"], row["current_round"], row["current_attempt"]) != (scope, role, current_round, attempt):
+            db.execute("UPDATE dispatch SET scope = ?, role = ?, current_round = ?, current_attempt = ? WHERE id = ?",
+                       (scope, role, current_round, attempt, row["id"]))
+        exists = db.execute("SELECT 1 FROM dispatch_round WHERE dispatch = ?", (row["id"],)).fetchone()
+        if not exists:
+            db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, created) VALUES (?, ?, ?, ?, ?, ?)",
+                       (row["id"], current_round, attempt, row["task"], row["report"], row["created"] or time.time()))
+    # A legacy dispatch may already have a done message. Reflect that in the synthesized snapshot.
+    db.execute("UPDATE dispatch_round SET state = 'completed', completed = COALESCE(completed, created) "
+               "WHERE state = 'running' AND EXISTS (SELECT 1 FROM message m WHERE m.dispatch = dispatch_round.dispatch "
+               "AND m.type = 'done' AND json_extract(m.body, '$.report') = dispatch_round.report)")
 
 
 def connect_read_only():
@@ -121,7 +153,9 @@ def connect_read_only():
     missing = missing_columns(db)
     for table, cols in TABLES.items():
         if table not in existing:
-            added = "".join(f", {column} {kind}" for column, kind in ADDED_COLUMNS.get(table, {}).items())
+            declared = {part.strip().split()[0] for part in cols.split(",")}
+            added = "".join(f", {column} {kind}" for column, kind in ADDED_COLUMNS.get(table, {}).items()
+                            if column not in declared)
             db.execute(f"CREATE TEMP TABLE {table} ({cols}{added})")
         elif table in missing:
             nulls = "".join(f", NULL AS {column}" for column in missing[table])
@@ -136,13 +170,14 @@ def emit(obj):
 FIRST_BRIEF = "You are a worker dispatched by the controller"
 
 
-def worker_brief(dispatch_id, task, report, opening=FIRST_BRIEF):
+def worker_brief(dispatch_id, task, report, opening=FIRST_BRIEF, attempt=None):
     router = f"{shlex.quote(sys.executable)} {shlex.quote(str(PROGRAM))}"
     return (f"{opening} (dispatch {dispatch_id}). "
             f"Read and do the task in {shlex.quote(str(task))}. "
             f"Stop any server or background process you started before you report. "
             f"When the task is finished, write your report and run: "
-            f"{router} done --report {shlex.quote(str(report))}. "
+            f"{router} done --report {shlex.quote(str(report))}"
+            f"{(' --attempt ' + shlex.quote(attempt)) if attempt else ''}. "
             f"If you need a decision, run: {router} ask \"<question>\" [--options a,b], then end your turn; "
             f"the answer arrives as your next message. Never ask questions in plain text "
             f"or with an interactive question tool; nobody watches this window.")
@@ -473,6 +508,7 @@ IGNORED_OPTIONS = {"opencode": {"network": "--network: OpenCode is not network-s
 def cmd_dispatch(args):
     db = connect()
     dispatch_id = "d-" + uuid.uuid4().hex[:8]
+    scope = clean_label(args.scope or "") or "s-" + uuid.uuid4().hex[:8]
     cwd = Path(args.cwd).resolve()
     task = Path(args.task).resolve()
     report = Path(args.report).resolve()
@@ -480,17 +516,23 @@ def cmd_dispatch(args):
     host_session = str(uuid.uuid4()) if args.host == "claude" else None
     # A --label that cleans to nothing (only blanks or control characters) gets the default too.
     label = clean_label(args.label or "") or default_label(cwd, report)
-    command, extra_env = LAUNCHERS[args.host](worker_brief(dispatch_id, task, report),
+    role = clean_label(args.role or "") or readable(report.parent.name).rpartition("-")[2] or "worker"
+    attempt = "a-" + uuid.uuid4().hex[:12]
+    command, extra_env = LAUNCHERS[args.host](worker_brief(dispatch_id, task, report, attempt=attempt),
                                               [state_dir(), report.parent], cwd, args.model, host_session,
                                               effort=args.effort, network=args.network, label=label, git=args.git)
     ignored = [note for option, note in IGNORED_OPTIONS.get(args.host, {}).items() if getattr(args, option)]
     trusted_by = trust_claude_worktree(cwd) if args.host == "claude" else None
+    created = time.time()
     db.execute("INSERT INTO dispatch (id, host, cwd, task, created, report_dir, report, model, host_session, "
-               "effort, network, label, git) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+               "effort, network, label, git, scope, role, current_round, current_attempt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                (dispatch_id, args.host, str(cwd), str(task), time.time(), str(report.parent), str(report),
-                args.model, host_session, args.effort, int(args.network), label, int(args.git)))
+                args.model, host_session, args.effort, int(args.network), label, int(args.git), scope, role, 1, attempt))
+    db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, created) VALUES (?, ?, ?, ?, ?, ?)",
+               (dispatch_id, 1, attempt, str(task), str(report), created))
     launched = launch(dispatch_id, cwd, command, extra_env, label)
     if launched == NOT_SENT:
+        db.execute("DELETE FROM dispatch_round WHERE dispatch = ?", (dispatch_id,))
         db.execute("DELETE FROM dispatch WHERE id = ?", (dispatch_id,))
         raise SystemExit("could not start the worker's tmux session; is tmux installed and on PATH?")
     db.execute("UPDATE dispatch SET started = ? WHERE id = ?", (time.time(), dispatch_id))
@@ -499,7 +541,8 @@ def cmd_dispatch(args):
         # `exited` if no session is there.
         raise SystemExit(f"tmux did not confirm the worker's session for dispatch {dispatch_id}; it is kept. "
                          f"Check `tmux ls`; `wait` reports it exited if it never started.")
-    emit({"dispatch": dispatch_id, "host": args.host, "label": label, "tmux": session_name(dispatch_id),
+    emit({"dispatch": dispatch_id, "scope": scope, "role": role, "round": 1, "attempt": attempt,
+          "host": args.host, "label": label, "tmux": session_name(dispatch_id),
           **({"trustedBy": trusted_by} if trusted_by else {}), **({"ignored": ignored} if ignored else {})})
 
 
@@ -596,7 +639,7 @@ def cmd_done(args):
     # Read before any lock: git may be slow, and it reads the worktree, not router.db.
     head = worktree_head(db.execute("SELECT cwd FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()["cwd"])
     with input_lock(dispatch_id):  # a nudge being typed lands before this done, as recorded
-        return finish_round(db, dispatch_id, report, head)
+        return finish_round(db, dispatch_id, report, head, expected_attempt=args.attempt)
 
 
 GIT_TIMEOUT = 5
@@ -623,14 +666,25 @@ def worktree_head(cwd):
     return {"head": head, "dirty": dirty}
 
 
-def finish_round(db, dispatch_id, report, head):
+def finish_round(db, dispatch_id, report, head, expected_attempt=None):
     db.execute("BEGIN IMMEDIATE")
-    current = db.execute("SELECT report FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()["report"]
+    current_row = db.execute("SELECT report, current_round, current_attempt FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
+    if expected_attempt and current_row["current_attempt"] != expected_attempt:
+        db.execute("ROLLBACK")
+        raise SystemExit(f"attempt {expected_attempt} is no longer current for {dispatch_id}; "
+                         f"current attempt is {current_row['current_attempt']}")
+    current = current_row["report"]
     # A retried `done` from an earlier round must not finish the round that followed it.
     if current and str(report) != current:
         db.execute("ROLLBACK")
         raise SystemExit(f"{report} is the report of an earlier round; the current round reports to {current}")
-    message_id = post(db, dispatch_id, "controller", "done", {"report": str(report), **head})
+    message_id = post(db, dispatch_id, "controller", "done", {"report": str(report),
+        "scope": db.execute("SELECT scope FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()[0],
+        "role": db.execute("SELECT role FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()[0],
+        "round": current_row["current_round"], "attempt": current_row["current_attempt"], **head})
+    db.execute("UPDATE dispatch_round SET state = 'completed', result = ?, completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?",
+               (json.dumps({"report": str(report), **head}, ensure_ascii=False), time.time(), dispatch_id,
+                current_row["current_round"], current_row["current_attempt"]))
     db.execute("COMMIT")
     emit({"message": message_id})
 
@@ -965,12 +1019,18 @@ def cmd_continue(args):
         raise SystemExit(f"dispatch {args.dispatch} has not done its current task yet")
     refuse_used_report(db, args.dispatch, report)
     # What this claim replaces, read under the same lock: a failed send restores exactly this.
-    previous = db.execute("SELECT task, report FROM dispatch WHERE id = ?", (args.dispatch,)).fetchone()
-    message_id = post(db, args.dispatch, "worker", "continue", {"task": str(task), "report": str(report)})
-    db.execute("UPDATE dispatch SET task = ?, report = ? WHERE id = ?", (str(task), str(report), args.dispatch))
+    previous = db.execute("SELECT task, report, current_round, current_attempt FROM dispatch WHERE id = ?", (args.dispatch,)).fetchone()
+    identity = db.execute("SELECT scope, role, current_round FROM dispatch WHERE id = ?", (args.dispatch,)).fetchone()
+    next_round, attempt = identity["current_round"] + 1, "a-" + uuid.uuid4().hex[:12]
+    message_id = post(db, args.dispatch, "worker", "continue", {"task": str(task), "report": str(report),
+        "scope": identity["scope"], "role": identity["role"], "round": next_round, "attempt": attempt})
+    db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, created) VALUES (?, ?, ?, ?, ?, ?)",
+               (args.dispatch, next_round, attempt, str(task), str(report), time.time()))
+    db.execute("UPDATE dispatch SET task = ?, report = ?, current_round = ?, current_attempt = ? WHERE id = ?",
+               (str(task), str(report), next_round, attempt, args.dispatch))
     db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
     db.execute("COMMIT")
-    brief = worker_brief(args.dispatch, task, report, opening="[router] New task for you")
+    brief = worker_brief(args.dispatch, task, report, opening="[router] New task for you", attempt=attempt)
     typed, notice = type_into(session, brief, row["host"])
     if typed in (NOT_SENT, READ_ONLY):
         why = (refusal(session, "the next task", notice) if typed == READ_ONLY
@@ -983,8 +1043,10 @@ def cmd_continue(args):
         current = db.execute("SELECT task, report FROM dispatch WHERE id = ?", (args.dispatch,)).fetchone()
         if round_mark(db, args.dispatch) == message_id and (current["task"], current["report"]) == (str(task), str(report)):
             db.execute("DELETE FROM message WHERE id = ?", (message_id,))
-            db.execute("UPDATE dispatch SET task = ?, report = ? WHERE id = ?",
-                       (previous["task"], previous["report"], args.dispatch))
+            db.execute("DELETE FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
+                       (args.dispatch, next_round, attempt))
+            db.execute("UPDATE dispatch SET task = ?, report = ?, current_round = ?, current_attempt = ? WHERE id = ?",
+                       (previous["task"], previous["report"], previous["current_round"], previous["current_attempt"], args.dispatch))
             db.execute("COMMIT")
             raise SystemExit(why)
         db.execute("COMMIT")
@@ -1070,7 +1132,11 @@ def cmd_status(args):
             continue
         last = db.execute("SELECT * FROM message WHERE dispatch = ? ORDER BY id DESC LIMIT 1", (row["id"],)).fetchone()
         watch = db.execute("SELECT since FROM screen_watch WHERE dispatch = ?", (row["id"],)).fetchone()
-        view = {"dispatch": row["id"], "label": row["label"], "host": row["host"], "model": row["model"],
+        rounds = [dict(r) for r in db.execute("SELECT round, attempt, task, report, state, result, created, completed "
+                                               "FROM dispatch_round WHERE dispatch = ? ORDER BY round, created", (row["id"],))]
+        view = {"dispatch": row["id"], "scope": row["scope"], "role": row["role"],
+                "round": row["current_round"], "attempt": row["current_attempt"], "rounds": rounds,
+                "label": row["label"], "host": row["host"], "model": row["model"],
                 "git": bool(row["git"]), "state": state,
                 "tmux": session_name(row["id"]), "tmuxAlive": session_alive(session_name(row["id"])),
                 "cwd": row["cwd"], "task": row["task"], "report": row["report"], "started": local_time(row["started"]),
@@ -1206,12 +1272,15 @@ def cmd_resume(args):
         raise SystemExit(f"dispatch {args.dispatch} predates resume support; give its task with --task and --report")
     else:
         task, report = Path(row["task"]), Path(row["report"])
+    resume_round = row["current_round"] + 1
+    resume_attempt = "a-" + uuid.uuid4().hex[:12]
     host_session = find_host_session(row)
     if not host_session:
         raise SystemExit(f"cannot find the {row['host']} conversation of dispatch {args.dispatch}; dispatch a new worker")
     opening = ("[router] Your session was interrupted and has been resumed. Check the worktree and what you "
                "already did, then continue" if not args.task else "[router] Resumed with a new task for you")
-    command, extra_env = LAUNCHERS[row["host"]](worker_brief(args.dispatch, task, report, opening=opening),
+    command, extra_env = LAUNCHERS[row["host"]](worker_brief(args.dispatch, task, report, opening=opening,
+                                                              attempt=resume_attempt),
                                                 [state_dir(), Path(row["report_dir"])], Path(row["cwd"]),
                                                 row["model"], host_session, resume=True,
                                                 effort=row["effort"], network=bool(row["network"]), label=row["label"],
@@ -1234,23 +1303,33 @@ def cmd_resume(args):
                              f"look at its state and run resume again if it is still needed")
         if args.task:
             refuse_used_report(db, args.dispatch, report)
-        post(db, args.dispatch, "worker", "resumed", {"session": host_session})
+        identity = db.execute("SELECT scope, role, current_round, current_attempt FROM dispatch WHERE id = ?",
+                              (args.dispatch,)).fetchone()
+        # Every resume is a new execution attempt and snapshot.  Keeping the same task/report
+        # for an interrupted worker still preserves the prior attempt for diagnosis.
+        next_round = identity["current_round"] + 1
+        attempt = resume_attempt
+        post(db, args.dispatch, "worker", "resumed", {"session": host_session, "scope": identity["scope"],
+             "role": identity["role"], "round": next_round, "attempt": attempt})
         if args.task:
-            post(db, args.dispatch, "worker", "continue", {"task": str(task), "report": str(report)})
+            post(db, args.dispatch, "worker", "continue", {"task": str(task), "report": str(report),
+                 "scope": identity["scope"], "role": identity["role"], "round": next_round, "attempt": attempt})
+        db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, created) VALUES (?, ?, ?, ?, ?, ?)",
+                   (args.dispatch, next_round, attempt, str(task), str(report), time.time()))
         db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
         launched = launch(args.dispatch, row["cwd"], command, extra_env, row["label"])
         if launched == NOT_SENT:
             db.execute("ROLLBACK")
             raise SystemExit(f"could not start tmux session {session}")
         # The session (possibly) runs this task: record it with the launch, before typing can fail.
-        db.execute("UPDATE dispatch SET task = ?, report = ?, host_session = ? WHERE id = ?",
-                   (str(task), str(report), host_session, args.dispatch))
+        db.execute("UPDATE dispatch SET task = ?, report = ?, host_session = ?, current_round = ?, current_attempt = ? WHERE id = ?",
+                   (str(task), str(report), host_session, next_round, attempt, args.dispatch))
         db.execute("COMMIT")
         if launched == UNCERTAIN:
             raise SystemExit(f"tmux did not confirm {session}; the resumed round is recorded. Check `tmux ls`; "
                              f"`wait` reports it exited if it never started.")
         if row["host"] == "opencode":
-            brief = worker_brief(args.dispatch, task, report, opening=opening)
+            brief = worker_brief(args.dispatch, task, report, opening=opening, attempt=attempt)
             typed, notice = type_into(session, brief, row["host"]) if wait_for_quiet_screen(session) else (NOT_SENT, None)
             if typed in (PARTIAL, UNCERTAIN):
                 raise typing_error(session, "The brief", typed)
@@ -1267,7 +1346,8 @@ def cmd_resume(args):
                 raise SystemExit(f"resumed {session}, but its screen says \"{notice}\" The brief was not sent, and "
                                  f"this conversation cannot go on; dispatch a new worker (the resumed round stays "
                                  f"recorded; close the session with tmux kill-session -t {session})")
-    emit({"resumed": args.dispatch, "session": host_session, "tmux": session})
+    emit({"resumed": args.dispatch, "session": host_session, "tmux": session,
+          "round": next_round, "attempt": attempt})
 
 
 def session_owner(session):
@@ -1715,6 +1795,8 @@ def main(argv):
     p.add_argument("--task", required=True)
     p.add_argument("--cwd", required=True)
     p.add_argument("--report", required=True, help="report path; its directory is made writable for the worker")
+    p.add_argument("--scope", help="stable controller scope identity (generated when omitted)")
+    p.add_argument("--role", help="stable worker role identity (derived from the report directory when omitted)")
     p.add_argument("--model", help="model for the worker; passed to the host's own model flag")
     p.add_argument("--effort", help="reasoning effort, passed to the host's own option "
                                     "(Codex model_reasoning_effort, Claude Code --effort, OpenCode --variant)")
@@ -1728,6 +1810,7 @@ def main(argv):
     p.set_defaults(func=cmd_dispatch)
     p = sub.add_parser("done")
     p.add_argument("--report", required=True)
+    p.add_argument("--attempt", help="execution attempt identity from the worker brief")
     p.set_defaults(func=cmd_done)
     p = sub.add_parser("ask")
     p.add_argument("question")

@@ -1608,6 +1608,23 @@ class RoundIdentity(unittest.TestCase):
         self.assertIn("earlier round", stale.stderr)
         self.assertEqual(self.env.json("wait", "--timeout", "0.5")["messages"], [])
 
+    def test_dispatch_identity_and_round_history_survive_a_status_restart(self):
+        dispatch = self.env.dispatch("codex", extra_args=["--scope", "scope-a", "--role", "reviewer"])
+        first = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((first["scope"], first["role"], first["round"]), ("scope-a", "reviewer", 1))
+        self.assertTrue(first["attempt"].startswith("a-"))
+        self.env.report.write_text("# r1\n")
+        self.env.run("done", "--report", str(self.env.report), dispatch=dispatch)
+        task2 = self.env.task.with_name("r2.md")
+        task2.write_text("# r2\n")
+        report2 = self.env.report.with_name("r2.md")
+        self.env.json("continue", dispatch, "--task", str(task2), "--report", str(report2))
+        current = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual(current["round"], 2)
+        self.assertEqual([r["round"] for r in current["rounds"]], [1, 2])
+        self.assertEqual(current["rounds"][0]["state"], "completed")
+        self.assertEqual(current["rounds"][0]["report"], str(self.env.report))
+
     def test_a_resume_decided_on_a_stale_view_does_not_relaunch_a_finished_task(self):
         import concurrent.futures
         dispatch = self.env.dispatch("codex")
