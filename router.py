@@ -133,10 +133,15 @@ def backfill_dispatch_identity(db):
         if not exists:
             db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, created) VALUES (?, ?, ?, ?, ?, ?)",
                        (row["id"], current_round, attempt, row["task"], row["report"], row["created"] or time.time()))
-    # A legacy dispatch may already have a done message. Reflect that in the synthesized snapshot.
-    db.execute("UPDATE dispatch_round SET state = 'completed', completed = COALESCE(completed, created) "
-               "WHERE state = 'running' AND EXISTS (SELECT 1 FROM message m WHERE m.dispatch = dispatch_round.dispatch "
-               "AND m.type = 'done' AND json_extract(m.body, '$.report') = dispatch_round.report)")
+    # A legacy dispatch may already have a done message. Preserve its complete result body.
+    for snapshot in db.execute("SELECT dispatch, round, attempt, report FROM dispatch_round WHERE state = 'running'"):
+        done = db.execute("SELECT body, created FROM message WHERE dispatch = ? AND type = 'done' "
+                          "AND json_extract(body, '$.report') = ? ORDER BY id LIMIT 1",
+                          (snapshot["dispatch"], snapshot["report"])).fetchone()
+        if done:
+            db.execute("UPDATE dispatch_round SET state = 'completed', result = ?, completed = ? "
+                       "WHERE dispatch = ? AND round = ? AND attempt = ?",
+                       (done["body"], done["created"], snapshot["dispatch"], snapshot["round"], snapshot["attempt"]))
 
 
 def connect_read_only():
@@ -178,7 +183,8 @@ def worker_brief(dispatch_id, task, report, opening=FIRST_BRIEF, attempt=None):
             f"When the task is finished, write your report and run: "
             f"{router} done --report {shlex.quote(str(report))}"
             f"{(' --attempt ' + shlex.quote(attempt)) if attempt else ''}. "
-            f"If you need a decision, run: {router} ask \"<question>\" [--options a,b], then end your turn; "
+            f"If you need a decision, run: {router} ask \"<question>\" [--options a,b]"
+            f"{(' --attempt ' + shlex.quote(attempt)) if attempt else ''}, then end your turn; "
             f"the answer arrives as your next message. Never ask questions in plain text "
             f"or with an interactive question tool; nobody watches this window.")
 
@@ -669,9 +675,12 @@ def worktree_head(cwd):
 def finish_round(db, dispatch_id, report, head, expected_attempt=None):
     db.execute("BEGIN IMMEDIATE")
     current_row = db.execute("SELECT report, current_round, current_attempt FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
-    if expected_attempt and current_row["current_attempt"] != expected_attempt:
+    attempts = db.execute("SELECT COUNT(*) FROM dispatch_round WHERE dispatch = ?", (dispatch_id,)).fetchone()[0]
+    same_report = db.execute("SELECT COUNT(*) FROM dispatch_round WHERE dispatch = ? AND report = ?",
+                             (dispatch_id, current_row["report"])).fetchone()[0]
+    if (expected_attempt and current_row["current_attempt"] != expected_attempt) or (not expected_attempt and same_report > 1):
         db.execute("ROLLBACK")
-        raise SystemExit(f"attempt {expected_attempt} is no longer current for {dispatch_id}; "
+        raise SystemExit(f"attempt {expected_attempt or '(missing)'} is no longer accepted for {dispatch_id}; "
                          f"current attempt is {current_row['current_attempt']}")
     current = current_row["report"]
     # A retried `done` from an earlier round must not finish the round that followed it.
@@ -692,8 +701,21 @@ def finish_round(db, dispatch_id, report, head, expected_attempt=None):
 def cmd_ask(args):
     db = connect()
     options = [o for o in (args.options or "").split(",") if o]
-    message_id = post(db, current_dispatch(db), "controller", "question",
-                      {"question": args.question, "options": options})
+    dispatch_id = current_dispatch(db)
+    db.execute("BEGIN IMMEDIATE")
+    identity = db.execute("SELECT scope, role, current_round, current_attempt, report FROM dispatch WHERE id = ?",
+                          (dispatch_id,)).fetchone()
+    same_report = db.execute("SELECT COUNT(*) FROM dispatch_round WHERE dispatch = ? AND report = ?",
+                             (dispatch_id, identity["report"])).fetchone()[0]
+    if (args.attempt and args.attempt != identity["current_attempt"]) or (not args.attempt and same_report > 1):
+        db.execute("ROLLBACK")
+        raise SystemExit(f"attempt {args.attempt or '(missing)'} is no longer accepted for {dispatch_id}; "
+                         f"current attempt is {identity['current_attempt']}")
+    message_id = post(db, dispatch_id, "controller", "question",
+                      {"question": args.question, "options": options, "scope": identity["scope"],
+                       "role": identity["role"], "round": identity["current_round"],
+                       "attempt": identity["current_attempt"]})
+    db.execute("COMMIT")
     emit({"message": message_id, "next": "End your turn now; the answer arrives as your next message."})
 
 
@@ -1272,7 +1294,7 @@ def cmd_resume(args):
         raise SystemExit(f"dispatch {args.dispatch} predates resume support; give its task with --task and --report")
     else:
         task, report = Path(row["task"]), Path(row["report"])
-    resume_round = row["current_round"] + 1
+    resume_round = row["current_round"] + (1 if args.task else 0)
     resume_attempt = "a-" + uuid.uuid4().hex[:12]
     host_session = find_host_session(row)
     if not host_session:
@@ -1307,8 +1329,11 @@ def cmd_resume(args):
                               (args.dispatch,)).fetchone()
         # Every resume is a new execution attempt and snapshot.  Keeping the same task/report
         # for an interrupted worker still preserves the prior attempt for diagnosis.
-        next_round = identity["current_round"] + 1
+        next_round = identity["current_round"] + (1 if args.task else 0)
         attempt = resume_attempt
+        if not args.task:
+            db.execute("UPDATE dispatch_round SET state = 'unknown', completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?",
+                       (time.time(), args.dispatch, identity["current_round"], identity["current_attempt"]))
         post(db, args.dispatch, "worker", "resumed", {"session": host_session, "scope": identity["scope"],
              "role": identity["role"], "round": next_round, "attempt": attempt})
         if args.task:
@@ -1815,6 +1840,7 @@ def main(argv):
     p = sub.add_parser("ask")
     p.add_argument("question")
     p.add_argument("--options")
+    p.add_argument("--attempt", help="execution attempt identity from the worker brief")
     p.set_defaults(func=cmd_ask)
     p = sub.add_parser("reply")
     p.add_argument("message", type=int)

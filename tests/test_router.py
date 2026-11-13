@@ -1625,6 +1625,28 @@ class RoundIdentity(unittest.TestCase):
         self.assertEqual(current["rounds"][0]["state"], "completed")
         self.assertEqual(current["rounds"][0]["report"], str(self.env.report))
 
+    def test_resume_retry_keeps_round_and_closes_old_attempt(self):
+        dispatch = self.env.dispatch("claude")
+        self.env.end_session(dispatch)
+        self.assertEqual(self.env.json("resume", dispatch)["round"], 1)
+        rounds = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]["rounds"]
+        self.assertEqual([r["round"] for r in rounds], [1, 1])
+        self.assertEqual([r["state"] for r in rounds], ["unknown", "running"])
+        stale = self.env.run("ask", "stale worker", dispatch=dispatch)
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertIn("missing", stale.stderr)
+
+    def test_done_from_old_attempt_is_rejected_after_retry(self):
+        dispatch = self.env.dispatch("claude")
+        first = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.env.end_session(dispatch)
+        self.env.json("resume", dispatch)
+        self.env.report.write_text("# report\n")
+        stale = self.env.run("done", "--report", str(self.env.report), "--attempt", first["attempt"],
+                             dispatch=dispatch)
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertIn("no longer accepted", stale.stderr)
+
     def test_a_resume_decided_on_a_stale_view_does_not_relaunch_a_finished_task(self):
         import concurrent.futures
         dispatch = self.env.dispatch("codex")
