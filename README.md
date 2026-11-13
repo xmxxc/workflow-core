@@ -367,15 +367,11 @@ The design of `super-coding` is recorded here, in `docs/decision-log.md` and `do
 
 ## Project status and roadmap
 
-Phase 1 is functional. Three tickets in xmxxc/example-project were taken through dispatch, review, release and live acceptance with it.
+The current release routes interactive Codex, Claude Code and OpenCode workers through tmux on Linux and macOS; native Windows support remains a proposed next step.
 
-1. **Completion wake**: a finished worker or reviewer wakes the controller window through its host's own entry point. Neither a resident scheduler nor a headless controller is required.
-2. **Different hosts for different roles**: GPT runs in Codex CLI, Claude in Claude Code, and other models in OpenCode.
-3. **Independent run**: the controller scans `ready-for-agent` issues, in observe mode first.
-4. **Lighter controller**: mechanical work moves into code.
-5. **More wake sources**: Hermes gateway, MCP and a panel.
+The product direction confirmed on 2026-11-13 is a small, complete router foundation: execution identity, reliable messages, observation, interruption and recovery. Workflow policies, workers and interfaces build on top; super-coding is the current workflow layer. Issue scanning, review gates and release decisions belong to those callers.
 
-Each phase adds to the previous one, and each phase can be used on its own.
+Read the [router foundation and implementation order](docs/router-foundation.md), [source comparison](docs/router-sources-20261113.md) and [native Windows assessment](docs/windows-router-assessment-20261113.md). Proposed backends and protocol paths have not been implemented or verified on Windows. The [documentation index](docs/README.md) and [research validation record](docs/research-validation-20261113.md) are the entry points for a new session.
 
 ## Development and releases
 
@@ -401,6 +397,7 @@ python3 build.py                        # writes dist/wfc
 
 ### Documents
 
+- [Documentation index](docs/README.md): current direction, source research and validation status.
 - [Decision log](docs/decision-log.md): user decisions, controller decisions and lessons.
 - [Handoff, 2026-11-04](docs/handoff-20261104-completion-wake.md): decisions made so far, the host wake matrix, the probes to run first, and the directions that were rejected.
 - `docs/probes-20261105-*.md`: measured wake and completion behaviour of [Claude Code](docs/probes-20261105-claude-code.md), [Codex](docs/probes-20261105-codex.md), [OpenCode](docs/probes-20261105-opencode.md) and [Orca](docs/probes-20261105-orca.md), plus [completion hooks](docs/probes-20261105-completion-hooks.md).

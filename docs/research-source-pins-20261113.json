@@ -1,0 +1,170 @@
+{
+  "schema_version": 1,
+  "observed_date": "2026-11-13",
+  "purpose": "Research evidence only; not a dependency or imported-code manifest",
+  "runtime_baseline": {
+    "repository": "https://github.com/xmxxc/workflow-core",
+    "commit": "22a3099be424ea94bdef2d575dce6344c00398ca",
+    "version": "0.4.5"
+  },
+  "upper_layer_baseline": {
+    "repository": "https://github.com/xmxxc/super-coding",
+    "commit": "7bcfa9ce05cea9ccd421b499d638f67deb6125d4",
+    "version": "0.5.1"
+  },
+  "sources": [
+    {
+      "repository": "https://github.com/stablyai/orca",
+      "commit": "075d6b3b507b8b6ce0c3202e72a5bb00c4045500",
+      "kind": "git_source",
+      "evidence": "Read selected source, tests and platform/build definitions; not executed",
+      "root_license_observed": "MIT",
+      "source_files_sha256": {
+        ".github/workflows/windows-native-preparation-benchmark.yml": "1112c617c48bff8655cb4699f1722e799c7230a2faec76cdd7f3becf8661a63e",
+        "LICENSE": "ff1b611f80580d49f4b97e93a97b24eb050b0671b26b8afe16341fab699112f3",
+        "README.md": "c301322d641ff73dc4e6830ca73dbf3b134ef89498049c6d74ddd6389897abb8",
+        "docs/site/content/docs/cli/orchestration.mdx": "ff1365e3c92e3f43a02edd8e8a1cd30e34659825384addf499c6021c6bb5cdb3",
+        "docs/site/content/docs/ssh.mdx": "15cb0016b05309b57c175a848a994f08b5a0950f953c849ae378f001e368f44d",
+        "src/main/runtime/orchestration/db/messages/mailbox-consumer.ts": "be876f77af5fe40b46018da9cf8becc7dbd65b712f398224144a0eecc0661251",
+        "src/main/runtime/orchestration/db/messages/role-mailbox-delivery.ts": "07845959ad7753a4af70d1dbd5456c0bcc2556d48c37e5d93578d4ddd2581a1e",
+        "src/main/runtime/orchestration/db/mutation-receipts/mutation-receipt-store.ts": "a49154e17b1112e4a50f48eae6a6cc98cdeac5a459469adb0f8f12596afdffbe",
+        "src/main/runtime/orchestration/mailbox/notifications/mailbox-notification-coordinator.ts": "b309fd0220eb2673a4aa7496e208144d6e2b35fa5dc3e9ac76ccf40488552123"
+      }
+    },
+    {
+      "repository": "https://github.com/KKKKhazix/agent-autoloop",
+      "commit": "c9ec4a187cab49627947e7e33db265ec143db3b8",
+      "kind": "git_source",
+      "evidence": "Read selected source, tests and platform/build definitions; not executed",
+      "root_license_observed": "MIT",
+      "source_files_sha256": {
+        "LICENSE": "b7f53d07ea4ae2eef26a4f8b28cb7d4df95586e2aa713df408f1ffde9f5a0fea",
+        "kernel/decide.ts": "17dba3f0c96dd3dbbbe755e2869cd55e0d9c7aee166a2f689566f2ca9ca14069",
+        "kernel/store.ts": "934f690ed6a8e84dd1c807175b900420f5d91c1204b743f6c83819054086deea",
+        "sim/crash.test.ts": "4e99e835ce197e2129e923ca326d5ff8d78e19d02f8ece4651abdf1b0c29c5e5",
+        "sim/invariants.ts": "d643f2cf22887ec0f2584d203422b1e714d510cd38177cbc2f16c9f9a6df1aa7",
+        "worker/worker.ts": "53d1c87cf20fbba07712d03cc5d3bf7dda27d92e9a41c32a1d112e032cd34d87"
+      }
+    },
+    {
+      "repository": "https://github.com/lobehub/lobehub",
+      "commit": "4c1b5434d999b3c6cfdbf83f246f9bd65b52aa78",
+      "kind": "git_source",
+      "evidence": "Read selected source, tests and platform/build definitions; not executed",
+      "root_license_observed": "LobeHub Community License; selected subpackage declarations differ",
+      "source_files_sha256": {
+        "LICENSE": "790a8c42f10beb4f5e9122e05a8e65d5522de49f89ac69cd31063c0f2be93ea4",
+        "apps/cli/src/utils/BatchIngester.ts": "c607646fbf19729d7309a78bf81a22e5ab85f1f2f4b42325f5fa6b0ddd35cc65",
+        "apps/server/src/services/heterogeneousAgent/HeterogeneousPersistenceHandler/index.ts": "a04a508073b73eccfa2a6bb2cae23ecb7b09a4c0641964da51d6cddca42c03b3",
+        "packages/agent-gateway-client/src/mux/GatewayMuxClient.ts": "d6d5d9ea5911b685e57e261537dfec7489282eed6650053b5b1c408dc97c1ae7",
+        "packages/heterogeneous-agents/src/codex/CodexThreadSession.ts": "48dc683758fdc1d4766ce32c1320eddd2206fc5c35ba9261697623955a7641f7"
+      }
+    },
+    {
+      "repository": "https://github.com/herdrdev/herdr",
+      "commit": "ee5bfb5041bb3e4a49d591c72308aae3c81ecdde",
+      "kind": "git_source",
+      "evidence": "Read selected source, tests and platform/build definitions; not executed",
+      "root_license_observed": "Apache-2.0",
+      "source_files_sha256": {
+        "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+        "src/agent_resume.rs": "8d94a2f518e0df34b53fe11310584bb07c047e1aa767637e05c25b6ed7f582e7",
+        "src/api/event_hub.rs": "b4f367da4283fd0b7778001433209f596543984e19c8dd64ea2c8f52fb47de82",
+        "src/api/schema/agents.rs": "e1e1f37ff2eeb09b37b16bf50d39e3aeccdb81579f3cb029e1be4a416a5d2429",
+        "src/api/schema/panes.rs": "e7908b37b9875d4a2064e61b8c7edb64f1fcf35aa2707cd1128ae9400f8f4a4d",
+        "src/api/schema/workspaces.rs": "859578a2fae38fa1f54a7cb0e6ee655d18b77f5951612a4d37f9ce2cc7739e24",
+        "src/app/actions.rs": "7d2f05e18514fb2528ce21c92f413172c96d1b54a6003003431510fb52b4a5b7",
+        "src/app/api/agents.rs": "3d1d53596bd6b0d414bd665817b6db7cc3152f1e1d25aac7fa5abe5987105cd1",
+        "src/platform/windows.rs": "201f6291059bd1dfb81f028b3a6dcadb3289ede704c818d72b68ae7be6cbe3a4",
+        "src/pty/backend.rs": "297cd7df1ce885709bbf3f704f4f44a3a1bb8870f30ee735a7b14247b8e8e7e4"
+      }
+    },
+    {
+      "repository": "https://github.com/nyldn/claude-octopus",
+      "commit": "a4191b7f60622c2543d8c06f2feda72ded8448a1",
+      "kind": "git_source",
+      "evidence": "Read selected source, tests and platform/build definitions; not executed",
+      "root_license_observed": "MIT",
+      "source_files_sha256": {
+        "LICENSE": "780d1304468f9853e7e7b37e01be188cafc84eefab71e5c96695fcbd7e12b65a",
+        "README.md": "e5a07480f37c0576d7102bdae54106c873f38087da883efb85cb535485e84229",
+        "scripts/lib/heartbeat.sh": "9c9af84d29476836e4135bd6619203c866f93d207b2712961ec4cda48f7ffd46",
+        "scripts/lib/session.sh": "f3dbdf9e769e542f7e4d652852b490667323eaf060299bc9dcb26d0b1b6d74d0",
+        "scripts/lib/spawn.sh": "e2f5488bb98158e8866ea4663830f3f903f0f3605e839877b56e75b2dacc7d44"
+      }
+    },
+    {
+      "repository": "https://github.com/getpaseo/paseo",
+      "commit": "d13438ba50ed74c0d9057370b5f5c781aee0f687",
+      "kind": "git_source",
+      "evidence": "Read selected source, tests and platform/build definitions; not executed",
+      "root_license_observed": "Apache-2.0",
+      "source_files_sha256": {
+        ".github/workflows/ci.yml": "31446528a9ca76c996a48d1405031e06b2081392e5959c70cf86de1991d76000",
+        ".github/workflows/desktop-release.yml": "5c1d434722bba4b40c6e3ce704d9b8da3ae81b71feb858a23476527c63c1612d",
+        "LICENSE": "79d5aedce6aa0adc547336dc1bd34c5cc9308ba110fac7079ed97515ee573ad3",
+        "README.md": "0748adcf4c93e2e9e6868a6b0caadc9988503bcd2f10f555f69b70f26931cbe9",
+        "packages/server/src/server/agent/agent-manager.ts": "5251e2422d184c228c1cba9690df9ca10b4ae147a883ad3fc1a2c6a16b9f35db",
+        "packages/server/src/server/agent/providers/codex/app-server-transport.ts": "b3c216fda0b70bc3b90cb5bf12d8728b8fe684846cc2e2e49662070815412ee8",
+        "packages/server/src/server/agent/providers/provider-runner.ts": "0792f25cd3c70c4318ff67003672f52521bf58a9e5a7ebd27ca20769748fe595",
+        "packages/server/src/server/agent/providers/provider-windows-launch.test.ts": "5d63b656391aab68c5d59f8d65a158bc4a24dd0f00070c8866ae34d230c5011e",
+        "packages/server/src/server/agent/restart-recovery/index.ts": "29276c5260502c3c4cbf1162b9b05c0c52a8a274d1b418d4a40725d916c41ec3"
+      }
+    },
+    {
+      "repository": "https://github.com/spacering-net/codeg",
+      "commit": "139ad96e5d54293a5833ccf2df825354ac2064ee",
+      "kind": "git_source",
+      "evidence": "Read selected source, tests and platform/build definitions; not executed",
+      "root_license_observed": "Apache-2.0",
+      "source_files_sha256": {
+        ".github/workflows/release.yml": "3d5a525ea3823e18197b2d2fe7fce0b496b735329ff153c7090ff6db2bf0ecb3",
+        ".github/workflows/test.yml": "d7934e51efbeae9304779d7538b0fa04380a2383efe594d71aeb159b3c8d25f5",
+        "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+        "src-tauri/Cargo.toml": "e5107720beba5ce0c220a7df68b269482df02495f37dff48e6471d237f3b6efe",
+        "src-tauri/src/acp/agent_process.rs": "5f9750848812912696e9c04989f10c1dcd40076c38afd504a571d052dfa3906e",
+        "src-tauri/src/acp/agent_session.rs": "5843d118d56ac6ebf916a1ec4e91620c62cf295ee2a02c2137681520c6d1255e",
+        "src-tauri/src/acp/delegation/broker.rs": "aad8b8cc136fdfcc07c181ab09be349761201ddec242bf2e106025d5845f8371",
+        "src-tauri/src/acp/delegation/listener.rs": "74d7aa0d2e7815c0b28634a31a63267f67a4ee019211eb84a1148b6093ad505c",
+        "src-tauri/src/acp/delegation/service.rs": "8162f20748b1311d1ef53879de31296bf81fd90ccbaef8e9a262dc344d7366a9",
+        "src-tauri/src/acp/delegation/spawner.rs": "9de18e28165a38f893e4f58c72c2f9a4b4a648ba4592087000a0ae32623b779a",
+        "src-tauri/src/acp/delegation/transport.rs": "490ce48e7908eacd970bab5e88567984e39ce95364b2921dc4c0106c83e1dbbf",
+        "src-tauri/src/acp/event_stream.rs": "efed3cf9a72c2731cfc26396485a4756631ce1a89bd60303fe99116f42198b0b",
+        "src-tauri/src/acp/internal_bus.rs": "0daf82ddb4b2e7683f785e7f7b6902c951038057a3e0046c502de2f5dd7ae4c9",
+        "src-tauri/src/acp/manager.rs": "b6c5fe61be530cce81c8b58bb37b02a2db4bfd984dd09acb8c36f4bf33bf5e6e",
+        "src-tauri/src/acp/registry.rs": "7403f8985a4caee7c00fbeb6da23285b69715bdbe59cc3cb8d532948f9c5a810",
+        "src-tauri/src/process.rs": "3bd25d3c8c6ebdec9c55b5531c17d8e8cf8f8e220d98f30aeeac91e14b8622fd",
+        "src-tauri/src/web/handlers/acp.rs": "bafd427ec7bdcc538b05ead1ffd40c13f0568490f244238faf75f4e2032d7cdb"
+      }
+    },
+    {
+      "name": "Pachat",
+      "kind": "public_client_and_official_docs",
+      "repository": null,
+      "server_source_status": "No verified public server repository located in this investigation",
+      "redistribution_license_status": "Not established for the downloadable client; no code imported",
+      "files": [
+        {
+          "url": "https://pachat.ai/pachat.mjs",
+          "sha256": "47acb61d28de7a47c2f3f993c7a6a97cff3ffcfbae8969aa8c5b95619b28f5d7"
+        },
+        {
+          "url": "https://pachat.ai/install.md",
+          "sha256": "83f1b817a220bbec01271948aaf1293996851cea341443cd46ee315d633346c2"
+        }
+      ],
+      "evidence": "Downloaded and read, never executed; mutable URLs, hashes identify observed bytes"
+    },
+    {
+      "name": "Tern.build",
+      "kind": "official_docs_only",
+      "core_source_status": "Official product FAQ states closed source",
+      "urls": [
+        "https://tern.build/",
+        "https://tern.build/docs",
+        "https://tern.build/docs/cli"
+      ],
+      "evidence": "Read official pages through web retrieval; direct installer/docs download attempt returned HTTP 403; no binary run or core source review"
+    }
+  ]
+}
