@@ -231,6 +231,28 @@ class MessageRoundTrip(unittest.TestCase):
         self.env.json("wait", "--timeout", "2")
         self.assertEqual(self.env.json("wait", "--timeout", "0.1"), {"messages": [], "timedOut": True})
 
+    def test_unknown_receipt_has_explicit_resolve_path(self):
+        dispatch = self.env.dispatch()
+        self.env.report.write_text("# report\n")
+        done = self.env.json("done", "--report", str(self.env.report), "--message-id", "receipt-4", dispatch=dispatch)
+        db = sqlite3.connect(self.env.state / "router.db")
+        db.execute("UPDATE message SET state='unknown', delivered=0, status_version=2 WHERE id=?", (done["message"],))
+        db.commit(); db.close()
+        resolved = self.env.json("resolve", done["messageId"])
+        self.assertEqual((resolved["state"], resolved["statusVersion"]), ("received", 3))
+
+    def test_done_replay_uses_stored_snapshot_when_worktree_changes(self):
+        subprocess.run(["git", "-C", str(self.env.cwd), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(self.env.cwd), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                        "commit", "-q", "--allow-empty", "-m", "one"], check=True)
+        dispatch = self.env.dispatch()
+        self.env.report.write_text("# report\n")
+        attempt = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]["attempt"]
+        first = self.env.json("done", "--report", str(self.env.report), "--attempt", attempt, dispatch=dispatch)
+        (self.env.cwd / "unrelated.txt").write_text("later\n")
+        second = self.env.json("done", "--report", str(self.env.report), "--attempt", attempt, dispatch=dispatch)
+        self.assertEqual((second["messageId"], second["duplicate"]), (first["messageId"], True))
+
 
 def make_repo(main, worktree=None):
     """A git repository at `main` with one commit and, if given, a linked worktree at `worktree`."""

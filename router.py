@@ -111,24 +111,30 @@ def connect():
         except BaseException:
             db.execute("ROLLBACK")
             raise
-    # Older message rows predate the receipt ledger. Give them stable identities and a
-    # conservative received/processed state based on the old delivery bit.
-    for message in db.execute("SELECT id, body, message_uid, body_hash, delivered, state, status_version FROM message").fetchall():
-        state = message["state"]
+    # Older message rows predate the receipt ledger. Serialize identity allocation and
+    # state repair so concurrent first-use commands cannot return different UUIDs.
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        for message in db.execute("SELECT id, body, message_uid, body_hash, delivered, state, status_version FROM message").fetchall():
+            state = message["state"]
         # A committed DDL default can expose delivered=1/state=unsent before the
         # backfill ran. Reconcile the old delivery bit on every startup.
-        if message["delivered"] and state == "unsent":
-            state = "received"
-        elif not message["delivered"] and state == "received":
-            state = "unsent"
-        if message["message_uid"] and message["body_hash"] and state and message["status_version"]:
-            if state == message["state"]:
+            if message["delivered"] and state == "unsent":
+                state = "received"
+            elif not message["delivered"] and state == "received":
+                state = "unsent"
+            repaired = state != message["state"]
+            if message["message_uid"] and message["body_hash"] and state and message["status_version"] and not repaired:
                 continue
-        db.execute("UPDATE message SET message_uid = ?, body_hash = ?, state = ?, status_version = ? WHERE id = ?",
-                   (message["message_uid"] or "m-" + uuid.uuid4().hex,
-                    message["body_hash"] or hashlib.sha256(message["body"].encode()).hexdigest(),
-                    state or ("received" if message["delivered"] else "unsent"),
-                    message["status_version"] or 1, message["id"]))
+            db.execute("UPDATE message SET message_uid = ?, body_hash = ?, state = ?, status_version = ? WHERE id = ?",
+                       (message["message_uid"] or "m-" + uuid.uuid4().hex,
+                        message["body_hash"] or hashlib.sha256(message["body"].encode()).hexdigest(),
+                        state or ("received" if message["delivered"] else "unsent"),
+                        (message["status_version"] or 1) + int(repaired), message["id"]))
+        db.execute("COMMIT")
+    except BaseException:
+        db.execute("ROLLBACK")
+        raise
     db.execute("BEGIN IMMEDIATE")
     try:
         backfill_dispatch_identity(db)
@@ -689,10 +695,21 @@ def cmd_done(args):
         raise SystemExit(f"report not found: {report}")
     db = connect()
     dispatch_id = current_dispatch(db)
+    request_key = args.message_id or (("done:" + dispatch_id + ":" + args.attempt) if args.attempt else None)
+    # Resolve an existing stable receipt before reading volatile worktree metadata.
+    # A retry must return its original head/dirty snapshot even if the worktree moved.
+    if request_key:
+        prior = db.execute("SELECT * FROM message WHERE dispatch = ? AND request_key = ?",
+                           (dispatch_id, request_key)).fetchone()
+        if prior:
+            old = json.loads(prior["body"])
+            if old.get("report") != str(report):
+                raise SystemExit(f"message request {request_key} conflicts with an existing receipt")
+            emit(receipt_response(db, prior["id"], duplicate=True))
+            return
     # Read before any lock: git may be slow, and it reads the worktree, not router.db.
     head = worktree_head(db.execute("SELECT cwd FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()["cwd"])
     with input_lock(dispatch_id):  # a nudge being typed lands before this done, as recorded
-        request_key = args.message_id or (("done:" + dispatch_id + ":" + args.attempt) if args.attempt else None)
         return finish_round(db, dispatch_id, report, head, expected_attempt=args.attempt,
                             request_key=request_key)
 
@@ -822,6 +839,30 @@ def cmd_ack(args):
             db.execute("ROLLBACK")
             raise SystemExit(f"message {args.message} ACK conflicts with its body")
     db.execute("UPDATE message SET state = 'processed', status_version = status_version + 1 WHERE id = ?",
+               (row["id"],))
+    db.execute("COMMIT")
+    emit(receipt_response(db, row["id"]))
+
+
+def cmd_resolve(args):
+    """Record an operator-confirmed external delivery for an unknown receipt.
+
+    This is deliberately explicit: unknown messages are never replayed automatically.
+    """
+    db = connect()
+    db.execute("BEGIN IMMEDIATE")
+    row = db.execute("SELECT * FROM message WHERE id = ? OR message_uid = ?", (args.message, args.message)).fetchone()
+    if row is None or row["recipient"] != "controller":
+        db.execute("ROLLBACK")
+        raise SystemExit(f"no controller message with id {args.message}")
+    if row["state"] == "received" or row["state"] == "processed":
+        db.execute("ROLLBACK")
+        emit({**receipt_response(db, row["id"], duplicate=True)})
+        return
+    if row["state"] != "unknown":
+        db.execute("ROLLBACK")
+        raise SystemExit(f"message {args.message} is {row['state']}; resolve requires unknown")
+    db.execute("UPDATE message SET delivered = 1, state = 'received', status_version = status_version + 1 WHERE id = ?",
                (row["id"],))
     db.execute("COMMIT")
     emit(receipt_response(db, row["id"]))
@@ -1981,6 +2022,9 @@ def main(argv):
     p.add_argument("message", help="numeric message id or stable message id")
     p.add_argument("--body", help="canonical receipt body, when available")
     p.set_defaults(func=cmd_ack)
+    p = sub.add_parser("resolve", help="record an externally confirmed delivery for an unknown message")
+    p.add_argument("message", help="numeric message id or stable message id")
+    p.set_defaults(func=cmd_resolve)
     p = sub.add_parser("reply")
     p.add_argument("message", type=int)
     p.add_argument("answer")
