@@ -56,6 +56,7 @@ def session_name(dispatch_id):
 
 # Each table's columns as a fresh database creates them.
 TABLES = {
+    "controller_owner": "scope TEXT PRIMARY KEY, owner TEXT NOT NULL, token TEXT NOT NULL, generation INTEGER NOT NULL DEFAULT 1, lease_until REAL NOT NULL, updated REAL NOT NULL",
     "dispatch": "id TEXT PRIMARY KEY, host TEXT, cwd TEXT, task TEXT, created REAL, scope TEXT, role TEXT, current_round INTEGER DEFAULT 1, current_attempt TEXT",
     "dispatch_round": "dispatch TEXT, round INTEGER, attempt TEXT, task TEXT, report TEXT, state TEXT DEFAULT 'running', result TEXT, created REAL, completed REAL, PRIMARY KEY (dispatch, round, attempt)",
     "message": "id INTEGER PRIMARY KEY AUTOINCREMENT, dispatch TEXT, recipient TEXT, "
@@ -199,6 +200,63 @@ def connect_read_only():
             nulls = "".join(f", NULL AS {column}" for column in missing[table])
             db.execute(f"CREATE TEMP VIEW {table} AS SELECT *{nulls} FROM main.{table}")
     return db, bool(set(TABLES) - existing or missing)
+
+
+OWNER_LEASE = 60.0
+
+
+def owner_token(args=None):
+    return (getattr(args, "owner_token", None) if args is not None else None) or os.environ.get("WFC_CONTROLLER_TOKEN") or os.environ.get("WFC_OWNER_TOKEN")
+
+
+def owner_scope(db, dispatch_id):
+    row = db.execute("SELECT scope FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
+    return row["scope"] if row else None
+
+
+def require_owner(db, scope, token, operation):
+    """Reject stale controller credentials while retaining compatibility with old scopes."""
+    row = db.execute("SELECT * FROM controller_owner WHERE scope = ?", (scope,)).fetchone()
+    if row is None:
+        return None
+    if not token or token != row["token"] or row["lease_until"] <= time.time():
+        raise SystemExit(json.dumps({"error": "stale_controller_owner", "operation": operation,
+                                     "scope": scope, "owner": row["owner"], "generation": row["generation"]}, ensure_ascii=False))
+    return row
+
+
+def cmd_owner(args):
+    db = connect()
+    scope = clean_label(args.scope or "")
+    if not scope:
+        raise SystemExit("--scope is required")
+    now = time.time()
+    lease = now + args.lease
+    db.execute("BEGIN IMMEDIATE")
+    current = db.execute("SELECT * FROM controller_owner WHERE scope = ?", (scope,)).fetchone()
+    token = args.token or ("ct-" + uuid.uuid4().hex)
+    if args.owner_action == "acquire":
+        if current and current["lease_until"] > now:
+            db.execute("ROLLBACK")
+            raise SystemExit(json.dumps({"error": "scope_owned", "scope": scope, "owner": current["owner"],
+                                         "generation": current["generation"]}))
+        generation = (current["generation"] + 1) if current else 1
+        db.execute("INSERT OR REPLACE INTO controller_owner(scope, owner, token, generation, lease_until, updated) VALUES (?, ?, ?, ?, ?, ?)",
+                   (scope, args.owner, token, generation, lease, now))
+    elif args.owner_action == "takeover":
+        generation = (current["generation"] + 1) if current else 1
+        db.execute("INSERT OR REPLACE INTO controller_owner(scope, owner, token, generation, lease_until, updated) VALUES (?, ?, ?, ?, ?, ?)",
+                   (scope, args.owner, token, generation, lease, now))
+    else:
+        if not current or current["token"] != token or current["lease_until"] <= now:
+            db.execute("ROLLBACK")
+            raise SystemExit(json.dumps({"error": "stale_controller_owner", "scope": scope}))
+        generation = current["generation"]
+        token = current["token"]
+        db.execute("UPDATE controller_owner SET lease_until = ?, updated = ? WHERE scope = ?", (lease, now, scope))
+    db.execute("COMMIT")
+    emit({"scope": scope, "owner": args.owner, "token": token, "generation": generation,
+          "leaseUntil": local_time(lease), "action": args.owner_action})
 
 
 def emit(obj):
@@ -549,6 +607,7 @@ def cmd_dispatch(args):
     db = connect()
     dispatch_id = "d-" + uuid.uuid4().hex[:8]
     scope = clean_label(args.scope or "") or "s-" + uuid.uuid4().hex[:8]
+    require_owner(db, scope, owner_token(args), "dispatch")
     cwd = Path(args.cwd).resolve()
     task = Path(args.task).resolve()
     report = Path(args.report).resolve()
@@ -704,6 +763,7 @@ def cmd_done(args):
         raise SystemExit(f"report not found: {report}")
     db = connect()
     dispatch_id = current_dispatch(db)
+    require_owner(db, owner_scope(db, dispatch_id), owner_token(args), "done")
     request_key = args.message_id or (("done:" + dispatch_id + ":" + args.attempt) if args.attempt else None)
     # Resolve an existing stable receipt before reading volatile worktree metadata.
     # A retry must return its original head/dirty snapshot even if the worktree moved.
@@ -790,6 +850,7 @@ def cmd_ask(args):
     db = connect()
     options = [o for o in (args.options or "").split(",") if o]
     dispatch_id = current_dispatch(db)
+    require_owner(db, owner_scope(db, dispatch_id), owner_token(args), "ask")
     db.execute("BEGIN IMMEDIATE")
     identity = db.execute("SELECT scope, role, current_round, current_attempt, report FROM dispatch WHERE id = ?",
                           (dispatch_id,)).fetchone()
@@ -1164,6 +1225,7 @@ def cmd_reply(args):
     question = db.execute("SELECT * FROM message WHERE id = ? AND type = 'question'", (args.message,)).fetchone()
     if question is None:
         raise SystemExit(f"no question with id {args.message}")
+    require_owner(db, owner_scope(db, question["dispatch"]), owner_token(args), "reply")
     # A newline would submit a partial answer in the worker's TUI, so the answer travels as one line.
     answer = " ".join(args.answer.splitlines())
     # Claim the question before typing, so two concurrent replies cannot both type an answer.
@@ -1196,6 +1258,7 @@ def cmd_continue(args):
     row = db.execute("SELECT * FROM dispatch WHERE id = ? AND started IS NOT NULL", (args.dispatch,)).fetchone()
     if row is None:
         raise SystemExit(f"unknown dispatch {args.dispatch} in {state_dir()}")
+    require_owner(db, row["scope"], owner_token(args), "continue")
     task = Path(args.task).resolve()
     report = Path(args.report).resolve()
     if row["report_dir"] and str(report.parent) != row["report_dir"]:
@@ -1261,6 +1324,7 @@ def cmd_nudge(args):
     row = db.execute("SELECT * FROM dispatch WHERE id = ? AND started IS NOT NULL", (args.dispatch,)).fetchone()
     if row is None:
         raise SystemExit(f"unknown dispatch {args.dispatch} in {state_dir()}")
+    require_owner(db, row["scope"], owner_token(args), "nudge")
     session = session_name(args.dispatch)
     if not session_alive(session):
         raise SystemExit(f"tmux session {session} has ended; use `resume` instead")
@@ -1345,6 +1409,11 @@ def cmd_status(args):
                 "last": message_view(last) if last else None,
                 **({"screenIdleSeconds": int(now - watch["since"])} if watch else {}),
                 **({"reclaimed": local_time(closed)} if closed else {})}
+        owner = db.execute("SELECT owner, generation, lease_until FROM controller_owner WHERE scope = ?", (row["scope"],)).fetchone()
+        if owner:
+            view["controllerOwner"] = {"owner": owner["owner"], "generation": owner["generation"],
+                                       "leaseUntil": local_time(owner["lease_until"]),
+                                       "active": owner["lease_until"] > now}
         if args.dispatch:
             view["messages"] = [message_view(m) for m in
                                 db.execute("SELECT * FROM message WHERE dispatch = ? ORDER BY id", (row["id"],))]
@@ -1833,6 +1902,10 @@ def watch_screen(db, dispatch_id, screen, now, stall_after):
 
 def cmd_wait(args):
     db = connect()
+    if args.scope:
+        require_owner(db, args.scope, owner_token(args), "wait")
+    elif db.execute("SELECT 1 FROM controller_owner WHERE lease_until > ? LIMIT 1", (time.time(),)).fetchone() and not owner_token(args):
+        raise SystemExit(json.dumps({"error": "controller_owner_required", "operation": "wait"}))
     deadline = time.monotonic() + args.timeout
     with registered_waiter(db, "wait"):
         while True:
@@ -1971,6 +2044,9 @@ def cmd_relay(args):
     """Like `wait`, but runs on and pushes each batch to a Codex or OpenCode controller, which then
     sleeps between turns instead of blocking on `wait`."""
     target_args, deliver = relay_target(args)
+    if args.scope:
+        db = connect()
+        require_owner(db, args.scope, owner_token(args), "relay")
     if args.detach:
         # A Codex controller's shell may end its background jobs; run in a new session instead.
         log = state_dir() / "relay.log"
@@ -2029,6 +2105,7 @@ def main(argv):
     p.add_argument("--cwd", required=True)
     p.add_argument("--report", required=True, help="report path; its directory is made writable for the worker")
     p.add_argument("--scope", help="stable controller scope identity (generated when omitted)")
+    p.add_argument("--owner-token", help="controller ownership token")
     p.add_argument("--role", help="stable worker role identity (derived from the report directory when omitted)")
     p.add_argument("--model", help="model for the worker; passed to the host's own model flag")
     p.add_argument("--effort", help="reasoning effort, passed to the host's own option "
@@ -2045,12 +2122,14 @@ def main(argv):
     p.add_argument("--report", required=True)
     p.add_argument("--attempt", help="execution attempt identity from the worker brief")
     p.add_argument("--message-id", help="stable worker receipt key; retries are idempotent")
+    p.add_argument("--owner-token")
     p.set_defaults(func=cmd_done)
     p = sub.add_parser("ask")
     p.add_argument("question")
     p.add_argument("--options")
     p.add_argument("--attempt", help="execution attempt identity from the worker brief")
     p.add_argument("--message-id", help="stable worker receipt key; retries are idempotent")
+    p.add_argument("--owner-token")
     p.set_defaults(func=cmd_ask)
     p = sub.add_parser("ack", help="mark a controller message processed")
     p.add_argument("message", help="numeric message id or stable message id")
@@ -2067,9 +2146,11 @@ def main(argv):
     p = sub.add_parser("reply")
     p.add_argument("message", type=int)
     p.add_argument("answer")
+    p.add_argument("--owner-token")
     p.set_defaults(func=cmd_reply)
     p = sub.add_parser("continue", help="give a worker its next task in the same session")
     p.add_argument("dispatch")
+    p.add_argument("--owner-token")
     p.add_argument("--task", required=True)
     p.add_argument("--report", required=True, help="must be in the dispatch's report directory")
     p.set_defaults(func=cmd_continue)
@@ -2081,6 +2162,7 @@ def main(argv):
     p = sub.add_parser("nudge", help="type a line into a worker that has not finished its task")
     p.add_argument("dispatch")
     p.add_argument("--text", required=True)
+    p.add_argument("--owner-token")
     p.set_defaults(func=cmd_nudge)
     p = sub.add_parser("status", help="show every dispatch, undelivered messages and running waiters")
     one = p.add_mutually_exclusive_group()
@@ -2096,10 +2178,14 @@ def main(argv):
     p.set_defaults(func=cmd_reclaim)
     p = sub.add_parser("wait")
     p.add_argument("--timeout", type=float, default=3600)
+    p.add_argument("--scope")
+    p.add_argument("--owner-token")
     p.add_argument("--stall-after", type=float, default=300,
                    help="seconds a worker's screen may stay unchanged before it is reported as stalled")
     p.set_defaults(func=cmd_wait)
     p = sub.add_parser("relay", help="push controller messages into a Codex or OpenCode controller session")
+    p.add_argument("--scope")
+    p.add_argument("--owner-token")
     p.add_argument("--codex", action="store_true",
                    help="relay into the Codex session this runs in ($CODEX_THREAD_ID)")
     p.add_argument("--codex-thread", help="the Codex controller's session UUID, checked against its rollout")
@@ -2110,6 +2196,20 @@ def main(argv):
     p.add_argument("--detach", action="store_true",
                    help="run in a new session with output to $WFC_STATE/relay.log; prints the pid")
     p.set_defaults(func=cmd_relay)
+    p = sub.add_parser("owner", help="acquire, renew, or take over a controller scope")
+    p.add_argument("owner_action", choices=("acquire", "renew", "takeover", "claim"), type=lambda x: "acquire" if x == "claim" else x)
+    p.add_argument("--scope", required=True)
+    p.add_argument("--owner", default=os.environ.get("WFC_CONTROLLER_ID", "controller"))
+    p.add_argument("--token")
+    p.add_argument("--lease", type=float, default=OWNER_LEASE)
+    p.set_defaults(func=cmd_owner)
+    for action in ("acquire", "renew", "takeover", "claim"):
+        p = sub.add_parser(action, help=f"{action} a controller scope")
+        p.add_argument("--scope", required=True)
+        p.add_argument("--owner", default=os.environ.get("WFC_CONTROLLER_ID", "controller"))
+        p.add_argument("--token")
+        p.add_argument("--lease", type=float, default=OWNER_LEASE)
+        p.set_defaults(func=cmd_owner, owner_action=("acquire" if action == "claim" else action))
     args = parser.parse_args(argv)
     return args.func(args) or 0
 
