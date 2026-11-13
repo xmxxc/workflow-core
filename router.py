@@ -227,6 +227,15 @@ def require_owner(db, scope, token, operation):
     return row
 
 
+def preflight_controller(db, scope, token, operation):
+    """Fence a controller before any watchdog scan or message claim."""
+    if scope:
+        return require_owner(db, scope, token, operation)
+    if db.execute("SELECT 1 FROM controller_owner LIMIT 1").fetchone():
+        raise SystemExit(json.dumps({"error": "controller_owner_required", "operation": operation}))
+    return None
+
+
 def cmd_owner(args):
     db = connect()
     scope = clean_label(args.scope or "")
@@ -244,10 +253,18 @@ def cmd_owner(args):
             db.execute("ROLLBACK")
             raise SystemExit(json.dumps({"error": "scope_owned", "scope": scope, "owner": current["owner"],
                                          "generation": current["generation"]}))
+        if current and token == current["token"]:
+            db.execute("ROLLBACK")
+            raise SystemExit(json.dumps({"error": "owner_token_conflict", "operation": "acquire",
+                                         "scope": scope, "generation": current["generation"]}))
         generation = (current["generation"] + 1) if current else 1
         db.execute("INSERT OR REPLACE INTO controller_owner(scope, owner, token, generation, lease_until, updated) VALUES (?, ?, ?, ?, ?, ?)",
                    (scope, args.owner, token, generation, lease, now))
     elif args.owner_action == "takeover":
+        if current and token == current["token"]:
+            db.execute("ROLLBACK")
+            raise SystemExit(json.dumps({"error": "owner_token_conflict", "operation": "takeover",
+                                         "scope": scope, "generation": current["generation"]}))
         generation = (current["generation"] + 1) if current else 1
         db.execute("INSERT OR REPLACE INTO controller_owner(scope, owner, token, generation, lease_until, updated) VALUES (?, ?, ?, ?, ?, ?)",
                    (scope, args.owner, token, generation, lease, now))
@@ -1941,13 +1958,11 @@ def watch_screen(db, dispatch_id, screen, now, stall_after):
 
 def cmd_wait(args):
     db = connect()
-    if args.scope:
-        require_owner(db, args.scope, owner_token(args), "wait")
-    elif db.execute("SELECT 1 FROM controller_owner WHERE lease_until > ? LIMIT 1", (time.time(),)).fetchone() and not owner_token(args):
-        raise SystemExit(json.dumps({"error": "controller_owner_required", "operation": "wait"}))
+    preflight_controller(db, args.scope, owner_token(args), "wait")
     deadline = time.monotonic() + args.timeout
     with registered_waiter(db, "wait"):
         while True:
+            preflight_controller(db, args.scope, owner_token(args), "wait")
             check_workers(db, args.stall_after, scope=args.scope, token=owner_token(args))
             # At-most-once: messages are marked delivered before they are printed; `status` shows them again.
             messages = take_controller_messages(db, scope=args.scope, token=owner_token(args))
@@ -2082,10 +2097,9 @@ def relay_target(args):
 def cmd_relay(args):
     """Like `wait`, but runs on and pushes each batch to a Codex or OpenCode controller, which then
     sleeps between turns instead of blocking on `wait`."""
+    db = connect()
+    preflight_controller(db, args.scope, owner_token(args), "relay")
     target_args, deliver = relay_target(args)
-    if args.scope:
-        db = connect()
-        require_owner(db, args.scope, owner_token(args), "relay")
     if args.detach:
         # A Codex controller's shell may end its background jobs; run in a new session instead.
         log = state_dir() / "relay.log"
@@ -2102,6 +2116,7 @@ def cmd_relay(args):
     deadline = time.monotonic() + args.for_seconds if args.for_seconds else None
     with registered_waiter(db, "relay"):
         while deadline is None or time.monotonic() < deadline:
+            preflight_controller(db, args.scope, owner_token(args), "relay")
             check_workers(db, args.stall_after, scope=args.scope, token=owner_token(args))
             messages = take_controller_messages(db, relay=True, scope=args.scope, token=owner_token(args))
             # The internal claim and the external envelope both remain explicitly
