@@ -62,6 +62,8 @@ TABLES = {
                "type TEXT, body TEXT, created REAL, delivered INTEGER DEFAULT 0, "
                "message_uid TEXT, request_key TEXT, body_hash TEXT, state TEXT DEFAULT 'unsent', "
                "status_version INTEGER DEFAULT 1",
+    "message_resolution": "id INTEGER PRIMARY KEY AUTOINCREMENT, message INTEGER, actor TEXT, source TEXT, "
+                          "reason TEXT, evidence TEXT, body_hash TEXT, from_state TEXT, to_state TEXT, created REAL",
     "screen_watch": "dispatch TEXT PRIMARY KEY, screen TEXT, since REAL, reported_screen TEXT",
     "host_error": "dispatch TEXT PRIMARY KEY, turn TEXT",
     "waiter": "pid INTEGER PRIMARY KEY, kind TEXT, since REAL",
@@ -78,7 +80,9 @@ ADDED_COLUMNS = {
                  "effort": "TEXT", "network": "INTEGER", "label": "TEXT", "git": "INTEGER",
                  "scope": "TEXT", "role": "TEXT", "current_round": "INTEGER", "current_attempt": "TEXT"},
     "message": {"message_uid": "TEXT", "request_key": "TEXT", "body_hash": "TEXT",
-                "state": "TEXT", "status_version": "INTEGER"},
+                "state": "TEXT", "status_version": "INTEGER", "resolver_actor": "TEXT",
+                "resolution_source": "TEXT", "resolution_reason": "TEXT", "resolution_evidence": "TEXT",
+                "resolved_at": "REAL"},
     "waiter": {"process_start": "TEXT"},
 }
 
@@ -684,9 +688,14 @@ def post(db, dispatch_id, recipient, type_, body, request_key=None):
 
 def receipt_response(db, message_id, duplicate=False):
     row = db.execute("SELECT * FROM message WHERE id = ?", (message_id,)).fetchone()
-    return {"message": row["id"], "messageId": row["message_uid"],
+    result = {"message": row["id"], "messageId": row["message_uid"],
             "state": row["state"] or ("received" if row["delivered"] else "unsent"),
             "statusVersion": row["status_version"] or 1, "duplicate": bool(duplicate)}
+    if row["resolver_actor"]:
+        result["resolution"] = {"actor": row["resolver_actor"], "source": row["resolution_source"],
+                                "reason": row["resolution_reason"], "evidence": row["resolution_evidence"],
+                                "at": local_time(row["resolved_at"])}
+    return result
 
 
 def cmd_done(args):
@@ -850,6 +859,8 @@ def cmd_resolve(args):
     This is deliberately explicit: unknown messages are never replayed automatically.
     """
     db = connect()
+    if not args.actor or not args.reason or not args.evidence or not args.body_hash:
+        raise SystemExit("resolve requires --actor, --reason, --evidence and --body-hash")
     db.execute("BEGIN IMMEDIATE")
     row = db.execute("SELECT * FROM message WHERE id = ? OR message_uid = ?", (args.message, args.message)).fetchone()
     if row is None or row["recipient"] != "controller":
@@ -862,8 +873,16 @@ def cmd_resolve(args):
     if row["state"] != "unknown":
         db.execute("ROLLBACK")
         raise SystemExit(f"message {args.message} is {row['state']}; resolve requires unknown")
-    db.execute("UPDATE message SET delivered = 1, state = 'received', status_version = status_version + 1 WHERE id = ?",
-               (row["id"],))
+    if args.body_hash != row["body_hash"]:
+        db.execute("ROLLBACK")
+        raise SystemExit(f"message {args.message} body hash does not match the stored receipt")
+    now = time.time()
+    db.execute("UPDATE message SET delivered = 1, state = 'received', status_version = status_version + 1, "
+               "resolver_actor = ?, resolution_source = ?, resolution_reason = ?, resolution_evidence = ?, resolved_at = ? WHERE id = ?",
+               (args.actor, args.source, args.reason, args.evidence, now, row["id"]))
+    db.execute("INSERT INTO message_resolution (message, actor, source, reason, evidence, body_hash, from_state, to_state, created) "
+               "VALUES (?, ?, ?, ?, ?, ?, 'unknown', 'received', ?)",
+               (row["id"], args.actor, args.source, args.reason, args.evidence, args.body_hash, now))
     db.execute("COMMIT")
     emit(receipt_response(db, row["id"]))
 
@@ -1268,6 +1287,9 @@ def message_view(r):
             "dispatch": r["dispatch"], "type": r["type"], "to": r["recipient"], "at": local_time(r["created"]),
             "state": r["state"] or ("received" if r["delivered"] else "unsent"),
             "statusVersion": r["status_version"] or 1,
+            **({"resolution": {"actor": r["resolver_actor"], "source": r["resolution_source"],
+                                "reason": r["resolution_reason"], "evidence": r["resolution_evidence"],
+                                "at": local_time(r["resolved_at"])} } if r["resolver_actor"] else {}),
             **({"delivered": bool(r["delivered"])} if r["recipient"] == "controller" else {}), **json.loads(r["body"])}
 
 
@@ -1960,7 +1982,11 @@ def cmd_relay(args):
         while deadline is None or time.monotonic() < deadline:
             check_workers(db, args.stall_after)
             messages = take_controller_messages(db, relay=True)
-            outcome = deliver(messages) if messages else None
+            # The internal claim is unknown; the external envelope describes the
+            # acceptance version that will be durable if the call returns success.
+            envelope = [{**message, "state": "received", "delivery": "accepted",
+                          "statusVersion": message["statusVersion"] + 1} for message in messages]
+            outcome = deliver(envelope) if envelope else None
             if messages and outcome == "delivered":
                 db.execute("BEGIN IMMEDIATE")
                 db.executemany("UPDATE message SET delivered = 1, state = 'received', status_version = status_version + 1 "
@@ -2024,6 +2050,11 @@ def main(argv):
     p.set_defaults(func=cmd_ack)
     p = sub.add_parser("resolve", help="record an externally confirmed delivery for an unknown message")
     p.add_argument("message", help="numeric message id or stable message id")
+    p.add_argument("--actor", required=True, help="controller/operator identity authorizing reconciliation")
+    p.add_argument("--source", default="operator", help="authorization source")
+    p.add_argument("--reason", required=True, help="why external delivery was confirmed")
+    p.add_argument("--evidence", required=True, help="external receipt/token or verification reference")
+    p.add_argument("--body-hash", required=True, help="SHA-256 of the canonical stored message body")
     p.set_defaults(func=cmd_resolve)
     p = sub.add_parser("reply")
     p.add_argument("message", type=int)

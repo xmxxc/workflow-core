@@ -238,8 +238,19 @@ class MessageRoundTrip(unittest.TestCase):
         db = sqlite3.connect(self.env.state / "router.db")
         db.execute("UPDATE message SET state='unknown', delivered=0, status_version=2 WHERE id=?", (done["message"],))
         db.commit(); db.close()
-        resolved = self.env.json("resolve", done["messageId"])
-        self.assertEqual((resolved["state"], resolved["statusVersion"]), ("received", 3))
+        db = sqlite3.connect(self.env.state / "router.db")
+        body_hash = db.execute("SELECT body_hash FROM message WHERE id=?", (done["message"],)).fetchone()[0]
+        db.close()
+        rejected = self.env.run("resolve", done["messageId"], "--actor", "controller-1", "--reason", "verified",
+                                "--evidence", "queue-receipt-1", "--body-hash", "bad")
+        self.assertNotEqual(rejected.returncode, 0)
+        resolved = self.env.json("resolve", done["messageId"], "--actor", "controller-1", "--reason", "verified",
+                                 "--evidence", "queue-receipt-1", "--body-hash", body_hash)
+        self.assertEqual((resolved["state"], resolved["statusVersion"], resolved["resolution"]["actor"]),
+                         ("received", 3, "controller-1"))
+        duplicate = self.env.json("resolve", done["messageId"], "--actor", "controller-1", "--reason", "verified",
+                                  "--evidence", "queue-receipt-1", "--body-hash", body_hash)
+        self.assertTrue(duplicate["duplicate"])
 
     def test_done_replay_uses_stored_snapshot_when_worktree_changes(self):
         subprocess.run(["git", "-C", str(self.env.cwd), "init", "-q"], check=True)
