@@ -1647,6 +1647,18 @@ class RoundIdentity(unittest.TestCase):
         self.assertNotEqual(stale.returncode, 0)
         self.assertIn("no longer accepted", stale.stderr)
 
+    def test_missing_attempt_question_is_rejected_after_continue_round(self):
+        dispatch = self.env.dispatch()
+        self.env.report.write_text("# r1\n")
+        self.env.run("done", "--report", str(self.env.report), dispatch=dispatch)
+        task2 = self.env.task.with_name("r2.md")
+        task2.write_text("# r2\n")
+        self.env.json("continue", dispatch, "--task", str(task2),
+                      "--report", str(self.env.report.with_name("r2.md")))
+        stale = self.env.run("ask", "old worker", dispatch=dispatch)
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertIn("missing", stale.stderr)
+
     def test_a_resume_decided_on_a_stale_view_does_not_relaunch_a_finished_task(self):
         import concurrent.futures
         dispatch = self.env.dispatch("codex")

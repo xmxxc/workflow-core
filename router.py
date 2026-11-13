@@ -707,7 +707,10 @@ def cmd_ask(args):
                           (dispatch_id,)).fetchone()
     same_report = db.execute("SELECT COUNT(*) FROM dispatch_round WHERE dispatch = ? AND report = ?",
                              (dispatch_id, identity["report"])).fetchone()[0]
-    if (args.attempt and args.attempt != identity["current_attempt"]) or (not args.attempt and same_report > 1):
+    # Missing attempt is accepted only for a truly legacy first attempt. Once the
+    # dispatch has moved to another round, an old worker's question is ambiguous.
+    legacy_missing = identity["current_round"] == 1 and same_report == 1
+    if (args.attempt and args.attempt != identity["current_attempt"]) or (not args.attempt and not legacy_missing):
         db.execute("ROLLBACK")
         raise SystemExit(f"attempt {args.attempt or '(missing)'} is no longer accepted for {dispatch_id}; "
                          f"current attempt is {identity['current_attempt']}")
