@@ -251,6 +251,10 @@ class MessageRoundTrip(unittest.TestCase):
         duplicate = self.env.json("resolve", done["messageId"], "--actor", "controller-1", "--reason", "verified",
                                   "--evidence", "queue-receipt-1", "--body-hash", body_hash)
         self.assertTrue(duplicate["duplicate"])
+        conflict = self.env.run("resolve", done["messageId"], "--actor", "controller-2", "--reason", "verified",
+                                "--evidence", "queue-receipt-2", "--body-hash", body_hash)
+        self.assertNotEqual(conflict.returncode, 0)
+        self.assertIn("conflicts", conflict.stderr)
 
     def test_done_replay_uses_stored_snapshot_when_worktree_changes(self):
         subprocess.run(["git", "-C", str(self.env.cwd), "init", "-q"], check=True)
@@ -1001,6 +1005,10 @@ class CodexRelay(unittest.TestCase):
         message = call[call.index("--message") + 1]
         self.assertIn('"type": "done"', message)
         self.assertIn(self.dispatch, message)
+        self.assertIn('"state": "unknown"', message)
+        self.assertIn('"delivery": "pending"', message)
+        self.assertEqual(self.env.json("status", "--dispatch", self.dispatch)["dispatches"][0]["messages"][0]["state"],
+                         "received")
 
     def test_a_queue_that_exited_non_zero_is_not_retried(self):
         # A non-zero exit does not prove codex did not take the batch (it may die after accepting),
@@ -1012,6 +1020,8 @@ class CodexRelay(unittest.TestCase):
         self.assertEqual(len([c for c in self.env.host_calls() if c[:2] == ["codex", "queue"]]), 1)
         self.assertIn("uncertain", result.stdout)
         self.assertEqual(self.env.json("wait", "--timeout", "0.5")["messages"], [])
+        self.assertEqual(self.env.json("status", "--dispatch", self.dispatch)["dispatches"][0]["messages"][0]["state"],
+                         "unknown")
 
     def test_messages_stay_waiting_when_codex_is_not_installed(self):
         self.env.run("done", "--report", str(self.env.report), dispatch=self.dispatch)

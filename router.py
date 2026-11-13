@@ -867,9 +867,15 @@ def cmd_resolve(args):
         db.execute("ROLLBACK")
         raise SystemExit(f"no controller message with id {args.message}")
     if row["state"] == "received" or row["state"] == "processed":
+        same_claim = (row["resolver_actor"] == args.actor and row["resolution_source"] == args.source
+                      and row["resolution_reason"] == args.reason and row["resolution_evidence"] == args.evidence
+                      and args.body_hash == row["body_hash"])
+        if same_claim:
+            db.execute("ROLLBACK")
+            emit({**receipt_response(db, row["id"], duplicate=True)})
+            return
         db.execute("ROLLBACK")
-        emit({**receipt_response(db, row["id"], duplicate=True)})
-        return
+        raise SystemExit(f"message {args.message} conflicts with its existing resolution")
     if row["state"] != "unknown":
         db.execute("ROLLBACK")
         raise SystemExit(f"message {args.message} is {row['state']}; resolve requires unknown")
@@ -1982,10 +1988,12 @@ def cmd_relay(args):
         while deadline is None or time.monotonic() < deadline:
             check_workers(db, args.stall_after)
             messages = take_controller_messages(db, relay=True)
-            # The internal claim is unknown; the external envelope describes the
-            # acceptance version that will be durable if the call returns success.
-            envelope = [{**message, "state": "received", "delivery": "accepted",
-                          "statusVersion": message["statusVersion"] + 1} for message in messages]
+            # The internal claim and the external envelope both remain explicitly
+            # uncertain until the backend call returns. A later durable transition
+            # records received; this envelope cannot pre-claim that outcome.
+            envelope = [{**message, "state": "unknown", "delivery": "pending",
+                          "deliveryAttempt": "relay:" + message["messageId"] + ":" + str(message["statusVersion"])}
+                         for message in messages]
             outcome = deliver(envelope) if envelope else None
             if messages and outcome == "delivered":
                 db.execute("BEGIN IMMEDIATE")
