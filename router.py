@@ -11,6 +11,7 @@ import argparse
 import collections
 import calendar
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -58,7 +59,9 @@ TABLES = {
     "dispatch": "id TEXT PRIMARY KEY, host TEXT, cwd TEXT, task TEXT, created REAL, scope TEXT, role TEXT, current_round INTEGER DEFAULT 1, current_attempt TEXT",
     "dispatch_round": "dispatch TEXT, round INTEGER, attempt TEXT, task TEXT, report TEXT, state TEXT DEFAULT 'running', result TEXT, created REAL, completed REAL, PRIMARY KEY (dispatch, round, attempt)",
     "message": "id INTEGER PRIMARY KEY AUTOINCREMENT, dispatch TEXT, recipient TEXT, "
-               "type TEXT, body TEXT, created REAL, delivered INTEGER DEFAULT 0",
+               "type TEXT, body TEXT, created REAL, delivered INTEGER DEFAULT 0, "
+               "message_uid TEXT, request_key TEXT, body_hash TEXT, state TEXT DEFAULT 'unsent', "
+               "status_version INTEGER DEFAULT 1",
     "screen_watch": "dispatch TEXT PRIMARY KEY, screen TEXT, since REAL, reported_screen TEXT",
     "host_error": "dispatch TEXT PRIMARY KEY, turn TEXT",
     "waiter": "pid INTEGER PRIMARY KEY, kind TEXT, since REAL",
@@ -74,6 +77,8 @@ ADDED_COLUMNS = {
     "dispatch": {"started": "REAL", "report_dir": "TEXT", "report": "TEXT", "model": "TEXT", "host_session": "TEXT",
                  "effort": "TEXT", "network": "INTEGER", "label": "TEXT", "git": "INTEGER",
                  "scope": "TEXT", "role": "TEXT", "current_round": "INTEGER", "current_attempt": "TEXT"},
+    "message": {"message_uid": "TEXT", "request_key": "TEXT", "body_hash": "TEXT",
+                "state": "TEXT", "status_version": "INTEGER"},
     "waiter": {"process_start": "TEXT"},
 }
 
@@ -106,6 +111,16 @@ def connect():
         except BaseException:
             db.execute("ROLLBACK")
             raise
+    # Older message rows predate the receipt ledger. Give them stable identities and a
+    # conservative received/processed state based on the old delivery bit.
+    for message in db.execute("SELECT id, body, message_uid, body_hash, delivered, state, status_version FROM message").fetchall():
+        if message["message_uid"] and message["body_hash"] and message["state"] and message["status_version"]:
+            continue
+        db.execute("UPDATE message SET message_uid = ?, body_hash = ?, state = ?, status_version = ? WHERE id = ?",
+                   (message["message_uid"] or "m-" + uuid.uuid4().hex,
+                    message["body_hash"] or hashlib.sha256(message["body"].encode()).hexdigest(),
+                    message["state"] or ("received" if message["delivered"] else "unsent"),
+                    message["status_version"] or 1, message["id"]))
     db.execute("BEGIN IMMEDIATE")
     try:
         backfill_dispatch_identity(db)
@@ -630,9 +645,25 @@ def current_dispatch(db):
     return dispatch_id
 
 
-def post(db, dispatch_id, recipient, type_, body):
-    cur = db.execute("INSERT INTO message (dispatch, recipient, type, body, created) VALUES (?, ?, ?, ?, ?)",
-                     (dispatch_id, recipient, type_, json.dumps(body, ensure_ascii=False), time.time()))
+def post(db, dispatch_id, recipient, type_, body, request_key=None):
+    """Append a message, or replay the existing receipt for the same request key.
+
+    A key is the caller's stable idempotency identity. Reusing it with another payload is
+    a conflict; reusing it with the same payload returns the original message id.
+    """
+    encoded = json.dumps(body, ensure_ascii=False, sort_keys=True)
+    digest = hashlib.sha256(encoded.encode()).hexdigest()
+    if request_key:
+        prior = db.execute("SELECT id, body_hash FROM message WHERE dispatch = ? AND request_key = ?",
+                           (dispatch_id, request_key)).fetchone()
+        if prior:
+            if prior["body_hash"] != digest:
+                raise SystemExit(f"message request {request_key} conflicts with an existing receipt")
+            return prior["id"]
+    cur = db.execute("INSERT INTO message (dispatch, recipient, type, body, created, message_uid, request_key, body_hash, state, status_version) "
+                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'unsent', 1)",
+                     (dispatch_id, recipient, type_, encoded, time.time(), "m-" + uuid.uuid4().hex,
+                      request_key, digest))
     return cur.lastrowid
 
 
@@ -645,7 +676,8 @@ def cmd_done(args):
     # Read before any lock: git may be slow, and it reads the worktree, not router.db.
     head = worktree_head(db.execute("SELECT cwd FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()["cwd"])
     with input_lock(dispatch_id):  # a nudge being typed lands before this done, as recorded
-        return finish_round(db, dispatch_id, report, head, expected_attempt=args.attempt)
+        return finish_round(db, dispatch_id, report, head, expected_attempt=args.attempt,
+                            request_key=args.message_id)
 
 
 GIT_TIMEOUT = 5
@@ -672,7 +704,7 @@ def worktree_head(cwd):
     return {"head": head, "dirty": dirty}
 
 
-def finish_round(db, dispatch_id, report, head, expected_attempt=None):
+def finish_round(db, dispatch_id, report, head, expected_attempt=None, request_key=None):
     db.execute("BEGIN IMMEDIATE")
     current_row = db.execute("SELECT report, current_round, current_attempt FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
     attempts = db.execute("SELECT COUNT(*) FROM dispatch_round WHERE dispatch = ?", (dispatch_id,)).fetchone()[0]
@@ -687,15 +719,17 @@ def finish_round(db, dispatch_id, report, head, expected_attempt=None):
     if current and str(report) != current:
         db.execute("ROLLBACK")
         raise SystemExit(f"{report} is the report of an earlier round; the current round reports to {current}")
-    message_id = post(db, dispatch_id, "controller", "done", {"report": str(report),
+    body = {"report": str(report),
         "scope": db.execute("SELECT scope FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()[0],
         "role": db.execute("SELECT role FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()[0],
-        "round": current_row["current_round"], "attempt": current_row["current_attempt"], **head})
+        "round": current_row["current_round"], "attempt": current_row["current_attempt"], **head}
+    message_id = post(db, dispatch_id, "controller", "done", body, request_key=request_key)
     db.execute("UPDATE dispatch_round SET state = 'completed', result = ?, completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?",
                (json.dumps({"report": str(report), **head}, ensure_ascii=False), time.time(), dispatch_id,
                 current_row["current_round"], current_row["current_attempt"]))
     db.execute("COMMIT")
-    emit({"message": message_id})
+    message_uid = db.execute("SELECT message_uid FROM message WHERE id = ?", (message_id,)).fetchone()[0]
+    emit({"message": message_id, "messageId": message_uid, "state": "unsent", "statusVersion": 1})
 
 
 def cmd_ask(args):
@@ -714,12 +748,38 @@ def cmd_ask(args):
         db.execute("ROLLBACK")
         raise SystemExit(f"attempt {args.attempt or '(missing)'} is no longer accepted for {dispatch_id}; "
                          f"current attempt is {identity['current_attempt']}")
-    message_id = post(db, dispatch_id, "controller", "question",
-                      {"question": args.question, "options": options, "scope": identity["scope"],
+    body = {"question": args.question, "options": options, "scope": identity["scope"],
                        "role": identity["role"], "round": identity["current_round"],
-                       "attempt": identity["current_attempt"]})
+                       "attempt": identity["current_attempt"]}
+    request_key = args.message_id
+    message_id = post(db, dispatch_id, "controller", "question", body, request_key=request_key)
     db.execute("COMMIT")
-    emit({"message": message_id, "next": "End your turn now; the answer arrives as your next message."})
+    message_uid = db.execute("SELECT message_uid FROM message WHERE id = ?", (message_id,)).fetchone()[0]
+    emit({"message": message_id, "messageId": message_uid, "state": "unsent", "statusVersion": 1,
+          "next": "End your turn now; the answer arrives as your next message."})
+
+
+def cmd_ack(args):
+    """Mark a controller message processed. Repeating the same ACK is harmless."""
+    db = connect()
+    db.execute("BEGIN IMMEDIATE")
+    row = db.execute("SELECT * FROM message WHERE id = ? OR message_uid = ?", (args.message, args.message)).fetchone()
+    if row is None or row["recipient"] != "controller":
+        db.execute("ROLLBACK")
+        raise SystemExit(f"no controller message with id {args.message}")
+    if args.body is not None:
+        digest = hashlib.sha256(args.body.encode()).hexdigest()
+        if digest != row["body_hash"]:
+            db.execute("ROLLBACK")
+            raise SystemExit(f"message {args.message} ACK conflicts with its body")
+    changed = row["state"] != "processed"
+    if changed:
+        db.execute("UPDATE message SET state = 'processed', status_version = status_version + 1 WHERE id = ?",
+                   (row["id"],))
+    db.execute("COMMIT")
+    emit({"message": row["id"], "messageId": row["message_uid"] or str(row["id"]),
+          "state": "processed", "statusVersion": (row["status_version"] or 1) + (1 if changed else 0),
+          "duplicate": not changed})
 
 
 SENT, NOT_SENT, UNCERTAIN, PARTIAL = "sent", "not-sent", "uncertain", "partial"
@@ -1118,7 +1178,10 @@ def local_time(epoch):
 
 
 def message_view(r):
-    return {"id": r["id"], "dispatch": r["dispatch"], "type": r["type"], "to": r["recipient"], "at": local_time(r["created"]),
+    return {"id": r["id"], "messageId": r["message_uid"] or str(r["id"]),
+            "dispatch": r["dispatch"], "type": r["type"], "to": r["recipient"], "at": local_time(r["created"]),
+            "state": r["state"] or ("received" if r["delivered"] else "unsent"),
+            "statusVersion": r["status_version"] or 1,
             **({"delivered": bool(r["delivered"])} if r["recipient"] == "controller" else {}), **json.loads(r["body"])}
 
 
@@ -1489,9 +1552,12 @@ def reclaim_session(db, row, named):
 def take_controller_messages(db):
     db.execute("BEGIN IMMEDIATE")
     rows = db.execute("SELECT * FROM message WHERE recipient = 'controller' AND delivered = 0 ORDER BY id").fetchall()
-    db.executemany("UPDATE message SET delivered = 1 WHERE id = ?", [(r["id"],) for r in rows])
+    db.executemany("UPDATE message SET delivered = 1, state = 'received', status_version = status_version + 1 WHERE id = ?",
+                   [(r["id"],) for r in rows])
     db.execute("COMMIT")
-    return [{"id": r["id"], "dispatch": r["dispatch"], "type": r["type"], **json.loads(r["body"])} for r in rows]
+    return [{"id": r["id"], "messageId": r["message_uid"] or str(r["id"]), "dispatch": r["dispatch"],
+             "type": r["type"], "state": "received", "statusVersion": (r["status_version"] or 1) + 1,
+             **json.loads(r["body"])} for r in rows]
 
 
 def answered(db, question_id):
@@ -1839,12 +1905,18 @@ def main(argv):
     p = sub.add_parser("done")
     p.add_argument("--report", required=True)
     p.add_argument("--attempt", help="execution attempt identity from the worker brief")
+    p.add_argument("--message-id", help="stable worker receipt key; retries are idempotent")
     p.set_defaults(func=cmd_done)
     p = sub.add_parser("ask")
     p.add_argument("question")
     p.add_argument("--options")
     p.add_argument("--attempt", help="execution attempt identity from the worker brief")
+    p.add_argument("--message-id", help="stable worker receipt key; retries are idempotent")
     p.set_defaults(func=cmd_ask)
+    p = sub.add_parser("ack", help="mark a controller message processed")
+    p.add_argument("message", help="numeric message id or stable message id")
+    p.add_argument("--body", help="canonical receipt body, when available")
+    p.set_defaults(func=cmd_ack)
     p = sub.add_parser("reply")
     p.add_argument("message", type=int)
     p.add_argument("answer")

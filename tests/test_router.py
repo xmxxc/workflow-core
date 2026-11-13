@@ -184,6 +184,32 @@ class MessageRoundTrip(unittest.TestCase):
         self.assertIn(str(question["id"]), text_call[-1])
         self.assertEqual(enter_call, ["tmux", "send-keys", "-t", f"wfc-{dispatch}", "Enter"])
 
+    def test_stable_done_receipt_is_idempotent_and_ack_is_versioned(self):
+        dispatch = self.env.dispatch()
+        self.env.report.write_text("# report\n")
+        first = self.env.run("done", "--report", str(self.env.report), "--message-id", "receipt-1", dispatch=dispatch)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        first_json = json.loads(first.stdout)
+        delivered = self.env.json("wait", "--timeout", "2")["messages"]
+        self.assertEqual(delivered[0]["messageId"], first_json["messageId"])
+        self.assertEqual(delivered[0]["state"], "received")
+        duplicate = self.env.run("done", "--report", str(self.env.report), "--message-id", "receipt-1", dispatch=dispatch)
+        self.assertEqual(duplicate.returncode, 0, duplicate.stderr)
+        self.assertEqual(json.loads(duplicate.stdout)["messageId"], first_json["messageId"])
+        self.assertEqual(self.env.json("wait", "--timeout", "0.1"), {"messages": [], "timedOut": True})
+        ack = self.env.json("ack", first_json["messageId"])
+        self.assertEqual((ack["state"], ack["statusVersion"], ack["duplicate"]), ("processed", 3, False))
+        again = self.env.json("ack", first_json["messageId"])
+        self.assertTrue(again["duplicate"])
+
+    def test_stable_receipt_with_different_content_is_rejected(self):
+        dispatch = self.env.dispatch()
+        first = self.env.run("ask", "first", "--message-id", "receipt-2", dispatch=dispatch)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        result = self.env.run("ask", "second", "--message-id", "receipt-2", dispatch=dispatch)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("conflicts", result.stderr)
+
 
 def make_repo(main, worktree=None):
     """A git repository at `main` with one commit and, if given, a linked worktree at `worktree`."""
