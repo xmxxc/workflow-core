@@ -210,6 +210,27 @@ class MessageRoundTrip(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("conflicts", result.stderr)
 
+    def test_ack_before_receive_is_rejected_and_does_not_regress(self):
+        dispatch = self.env.dispatch()
+        self.env.report.write_text("# report\n")
+        done = self.env.run("done", "--report", str(self.env.report), "--message-id", "receipt-3", dispatch=dispatch)
+        message_id = json.loads(done.stdout)["messageId"]
+        rejected = self.env.run("ack", message_id)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("requires received", rejected.stderr)
+        received = self.env.json("wait", "--timeout", "2")["messages"][0]
+        self.assertEqual(received["state"], "received")
+
+    def test_attempt_aware_legacy_shape_gets_a_stable_default_receipt_key(self):
+        dispatch = self.env.dispatch()
+        self.env.report.write_text("# report\n")
+        attempt = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]["attempt"]
+        first = self.env.run("done", "--report", str(self.env.report), "--attempt", attempt, dispatch=dispatch)
+        second = self.env.run("done", "--report", str(self.env.report), "--attempt", attempt, dispatch=dispatch)
+        self.assertEqual((first.returncode, second.returncode), (0, 0))
+        self.env.json("wait", "--timeout", "2")
+        self.assertEqual(self.env.json("wait", "--timeout", "0.1"), {"messages": [], "timedOut": True})
+
 
 def make_repo(main, worktree=None):
     """A git repository at `main` with one commit and, if given, a linked worktree at `worktree`."""

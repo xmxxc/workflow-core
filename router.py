@@ -114,12 +114,20 @@ def connect():
     # Older message rows predate the receipt ledger. Give them stable identities and a
     # conservative received/processed state based on the old delivery bit.
     for message in db.execute("SELECT id, body, message_uid, body_hash, delivered, state, status_version FROM message").fetchall():
-        if message["message_uid"] and message["body_hash"] and message["state"] and message["status_version"]:
-            continue
+        state = message["state"]
+        # A committed DDL default can expose delivered=1/state=unsent before the
+        # backfill ran. Reconcile the old delivery bit on every startup.
+        if message["delivered"] and state == "unsent":
+            state = "received"
+        elif not message["delivered"] and state == "received":
+            state = "unsent"
+        if message["message_uid"] and message["body_hash"] and state and message["status_version"]:
+            if state == message["state"]:
+                continue
         db.execute("UPDATE message SET message_uid = ?, body_hash = ?, state = ?, status_version = ? WHERE id = ?",
                    (message["message_uid"] or "m-" + uuid.uuid4().hex,
                     message["body_hash"] or hashlib.sha256(message["body"].encode()).hexdigest(),
-                    message["state"] or ("received" if message["delivered"] else "unsent"),
+                    state or ("received" if message["delivered"] else "unsent"),
                     message["status_version"] or 1, message["id"]))
     db.execute("BEGIN IMMEDIATE")
     try:
@@ -197,7 +205,8 @@ def worker_brief(dispatch_id, task, report, opening=FIRST_BRIEF, attempt=None):
             f"Stop any server or background process you started before you report. "
             f"When the task is finished, write your report and run: "
             f"{router} done --report {shlex.quote(str(report))}"
-            f"{(' --attempt ' + shlex.quote(attempt)) if attempt else ''}. "
+            f"{(' --attempt ' + shlex.quote(attempt)) if attempt else ''}"
+            f"{(' --message-id done:' + shlex.quote(dispatch_id) + ':' + shlex.quote(attempt)) if attempt else ''}. "
             f"If you need a decision, run: {router} ask \"<question>\" [--options a,b]"
             f"{(' --attempt ' + shlex.quote(attempt)) if attempt else ''}, then end your turn; "
             f"the answer arrives as your next message. Never ask questions in plain text "
@@ -667,6 +676,13 @@ def post(db, dispatch_id, recipient, type_, body, request_key=None):
     return cur.lastrowid
 
 
+def receipt_response(db, message_id, duplicate=False):
+    row = db.execute("SELECT * FROM message WHERE id = ?", (message_id,)).fetchone()
+    return {"message": row["id"], "messageId": row["message_uid"],
+            "state": row["state"] or ("received" if row["delivered"] else "unsent"),
+            "statusVersion": row["status_version"] or 1, "duplicate": bool(duplicate)}
+
+
 def cmd_done(args):
     report = Path(args.report).resolve()
     if not report.is_file():
@@ -676,8 +692,9 @@ def cmd_done(args):
     # Read before any lock: git may be slow, and it reads the worktree, not router.db.
     head = worktree_head(db.execute("SELECT cwd FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()["cwd"])
     with input_lock(dispatch_id):  # a nudge being typed lands before this done, as recorded
+        request_key = args.message_id or (("done:" + dispatch_id + ":" + args.attempt) if args.attempt else None)
         return finish_round(db, dispatch_id, report, head, expected_attempt=args.attempt,
-                            request_key=args.message_id)
+                            request_key=request_key)
 
 
 GIT_TIMEOUT = 5
@@ -707,6 +724,20 @@ def worktree_head(cwd):
 def finish_round(db, dispatch_id, report, head, expected_attempt=None, request_key=None):
     db.execute("BEGIN IMMEDIATE")
     current_row = db.execute("SELECT report, current_round, current_attempt FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
+    scope, role = db.execute("SELECT scope, role FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
+    if request_key:
+        prior = db.execute("SELECT * FROM message WHERE dispatch = ? AND request_key = ?",
+                           (dispatch_id, request_key)).fetchone()
+        if prior:
+            old = json.loads(prior["body"])
+            candidate = {"report": str(report), "scope": scope, "role": role,
+                         "round": old.get("round"), "attempt": old.get("attempt"), **head}
+            if prior["body_hash"] != hashlib.sha256(json.dumps(candidate, ensure_ascii=False, sort_keys=True).encode()).hexdigest():
+                db.execute("ROLLBACK")
+                raise SystemExit(f"message request {request_key} conflicts with an existing receipt")
+            db.execute("ROLLBACK")
+            emit({**receipt_response(db, prior["id"], duplicate=True)})
+            return
     attempts = db.execute("SELECT COUNT(*) FROM dispatch_round WHERE dispatch = ?", (dispatch_id,)).fetchone()[0]
     same_report = db.execute("SELECT COUNT(*) FROM dispatch_round WHERE dispatch = ? AND report = ?",
                              (dispatch_id, current_row["report"])).fetchone()[0]
@@ -719,17 +750,14 @@ def finish_round(db, dispatch_id, report, head, expected_attempt=None, request_k
     if current and str(report) != current:
         db.execute("ROLLBACK")
         raise SystemExit(f"{report} is the report of an earlier round; the current round reports to {current}")
-    body = {"report": str(report),
-        "scope": db.execute("SELECT scope FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()[0],
-        "role": db.execute("SELECT role FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()[0],
+    body = {"report": str(report), "scope": scope, "role": role,
         "round": current_row["current_round"], "attempt": current_row["current_attempt"], **head}
     message_id = post(db, dispatch_id, "controller", "done", body, request_key=request_key)
     db.execute("UPDATE dispatch_round SET state = 'completed', result = ?, completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?",
                (json.dumps({"report": str(report), **head}, ensure_ascii=False), time.time(), dispatch_id,
                 current_row["current_round"], current_row["current_attempt"]))
     db.execute("COMMIT")
-    message_uid = db.execute("SELECT message_uid FROM message WHERE id = ?", (message_id,)).fetchone()[0]
-    emit({"message": message_id, "messageId": message_uid, "state": "unsent", "statusVersion": 1})
+    emit(receipt_response(db, message_id))
 
 
 def cmd_ask(args):
@@ -739,6 +767,25 @@ def cmd_ask(args):
     db.execute("BEGIN IMMEDIATE")
     identity = db.execute("SELECT scope, role, current_round, current_attempt, report FROM dispatch WHERE id = ?",
                           (dispatch_id,)).fetchone()
+    body = {"question": args.question, "options": options, "scope": identity["scope"],
+            "role": identity["role"], "round": identity["current_round"],
+            "attempt": identity["current_attempt"]}
+    request_key = args.message_id
+    if not request_key and args.attempt:
+        request_key = "ask:" + dispatch_id + ":" + args.attempt + ":" + hashlib.sha256(
+            json.dumps({"question": args.question, "options": options}, sort_keys=True).encode()).hexdigest()[:16]
+    if request_key:
+        prior = db.execute("SELECT * FROM message WHERE dispatch = ? AND request_key = ?",
+                           (dispatch_id, request_key)).fetchone()
+        if prior:
+            old = json.loads(prior["body"])
+            compare = {**body, "round": old.get("round"), "attempt": old.get("attempt")}
+            if prior["body_hash"] != hashlib.sha256(json.dumps(compare, ensure_ascii=False, sort_keys=True).encode()).hexdigest():
+                db.execute("ROLLBACK")
+                raise SystemExit(f"message request {request_key} conflicts with an existing receipt")
+            db.execute("ROLLBACK")
+            emit(receipt_response(db, prior["id"], duplicate=True))
+            return
     same_report = db.execute("SELECT COUNT(*) FROM dispatch_round WHERE dispatch = ? AND report = ?",
                              (dispatch_id, identity["report"])).fetchone()[0]
     # Missing attempt is accepted only for a truly legacy first attempt. Once the
@@ -748,14 +795,9 @@ def cmd_ask(args):
         db.execute("ROLLBACK")
         raise SystemExit(f"attempt {args.attempt or '(missing)'} is no longer accepted for {dispatch_id}; "
                          f"current attempt is {identity['current_attempt']}")
-    body = {"question": args.question, "options": options, "scope": identity["scope"],
-                       "role": identity["role"], "round": identity["current_round"],
-                       "attempt": identity["current_attempt"]}
-    request_key = args.message_id
     message_id = post(db, dispatch_id, "controller", "question", body, request_key=request_key)
     db.execute("COMMIT")
-    message_uid = db.execute("SELECT message_uid FROM message WHERE id = ?", (message_id,)).fetchone()[0]
-    emit({"message": message_id, "messageId": message_uid, "state": "unsent", "statusVersion": 1,
+    emit({**receipt_response(db, message_id),
           "next": "End your turn now; the answer arrives as your next message."})
 
 
@@ -767,19 +809,22 @@ def cmd_ack(args):
     if row is None or row["recipient"] != "controller":
         db.execute("ROLLBACK")
         raise SystemExit(f"no controller message with id {args.message}")
+    if row["state"] == "processed":
+        db.execute("ROLLBACK")
+        emit({**receipt_response(db, row["id"], duplicate=True)})
+        return
+    if row["state"] != "received":
+        db.execute("ROLLBACK")
+        raise SystemExit(f"message {args.message} is {row['state']}; ACK requires received")
     if args.body is not None:
         digest = hashlib.sha256(args.body.encode()).hexdigest()
         if digest != row["body_hash"]:
             db.execute("ROLLBACK")
             raise SystemExit(f"message {args.message} ACK conflicts with its body")
-    changed = row["state"] != "processed"
-    if changed:
-        db.execute("UPDATE message SET state = 'processed', status_version = status_version + 1 WHERE id = ?",
-                   (row["id"],))
+    db.execute("UPDATE message SET state = 'processed', status_version = status_version + 1 WHERE id = ?",
+               (row["id"],))
     db.execute("COMMIT")
-    emit({"message": row["id"], "messageId": row["message_uid"] or str(row["id"]),
-          "state": "processed", "statusVersion": (row["status_version"] or 1) + (1 if changed else 0),
-          "duplicate": not changed})
+    emit(receipt_response(db, row["id"]))
 
 
 SENT, NOT_SENT, UNCERTAIN, PARTIAL = "sent", "not-sent", "uncertain", "partial"
@@ -1549,14 +1594,20 @@ def reclaim_session(db, row, named):
     return {"result": "reclaimed", "message": message_id}
 
 
-def take_controller_messages(db):
+def take_controller_messages(db, relay=False):
     db.execute("BEGIN IMMEDIATE")
-    rows = db.execute("SELECT * FROM message WHERE recipient = 'controller' AND delivered = 0 ORDER BY id").fetchall()
-    db.executemany("UPDATE message SET delivered = 1, state = 'received', status_version = status_version + 1 WHERE id = ?",
-                   [(r["id"],) for r in rows])
+    rows = db.execute("SELECT * FROM message WHERE recipient = 'controller' AND delivered = 0 AND state = 'unsent' ORDER BY id").fetchall()
+    if relay:
+        # Claim as unknown before crossing the external boundary. A process exit now
+        # leaves an auditable result that is never silently replayed.
+        db.executemany("UPDATE message SET state = 'unknown', status_version = status_version + 1 WHERE id = ?",
+                       [(r["id"],) for r in rows])
+    else:
+        db.executemany("UPDATE message SET delivered = 1, state = 'received', status_version = status_version + 1 WHERE id = ?",
+                       [(r["id"],) for r in rows])
     db.execute("COMMIT")
     return [{"id": r["id"], "messageId": r["message_uid"] or str(r["id"]), "dispatch": r["dispatch"],
-             "type": r["type"], "state": "received", "statusVersion": (r["status_version"] or 1) + 1,
+             "type": r["type"], "state": ("unknown" if relay else "received"), "statusVersion": (r["status_version"] or 1) + 1,
              **json.loads(r["body"])} for r in rows]
 
 
@@ -1867,13 +1918,26 @@ def cmd_relay(args):
     with registered_waiter(db, "relay"):
         while deadline is None or time.monotonic() < deadline:
             check_workers(db, args.stall_after)
-            messages = take_controller_messages(db)
+            messages = take_controller_messages(db, relay=True)
             outcome = deliver(messages) if messages else None
-            if outcome in ("failed", "missing"):
-                # Put the batch back so the next pass, or a `wait`, delivers it.
-                db.executemany("UPDATE message SET delivered = 0 WHERE id = ?", [(m["id"],) for m in messages])
+            if messages and outcome == "delivered":
+                db.execute("BEGIN IMMEDIATE")
+                db.executemany("UPDATE message SET delivered = 1, state = 'received', status_version = status_version + 1 "
+                               "WHERE id = ? AND state = 'unknown'", [(m["id"],) for m in messages])
+                db.execute("COMMIT")
+            elif messages and outcome in ("failed", "missing"):
+                # Definitely not sent: make it available to a later explicit attempt.
+                db.execute("BEGIN IMMEDIATE")
+                db.executemany("UPDATE message SET delivered = 0, state = 'unsent', status_version = status_version + 1 "
+                               "WHERE id = ? AND state = 'unknown'",
+                               [(m["id"],) for m in messages])
+                db.execute("COMMIT")
                 if outcome == "missing":
                     return 1  # the thread is gone or wrong: every later batch would be lost too
+            elif messages and outcome == "uncertain":
+                # Keep unknown and undelivered. It is queryable, but wait/relay will not
+                # silently replay it after an external timeout.
+                pass
                 time.sleep(5)
             time.sleep(0.5)
     return 0
