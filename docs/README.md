@@ -3,6 +3,8 @@
 新会话从这里恢复产品方向与研究，不依赖旧聊天或临时文件。
 
 - [Router 定位与补齐顺序](router-foundation.md)：2026-11-13 用户确认的小型通用基础层定位；实现次序、核心/外壳职责、下一步验收条件。
+- [核心规格](specs/router-core-foundation-20261113.md)：已确认的任务派发、唤醒、宿主故障和恢复契约。
+- [9 张工作票](tickets/router-core/)：按依赖顺序拆分的实现票据；GitHub Issues #2–#10 为公开入口。
 - [外部实现比较](router-sources-20261113.md)：Agent Autoloop、LobeHub、Herdr、Octopus，以及 Orca、Paseo、Codeg、Tern.build、Pachat 的证据与采用方式。
 - [Windows 评估](windows-router-assessment-20261113.md)：当前平台障碍、Herdr 路线、最小接口和待验证矩阵。
 - [Orca / Paseo 源码研究](orca-paseo-router-research-20261113.md)。
