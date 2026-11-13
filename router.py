@@ -1122,6 +1122,63 @@ def message_view(r):
             **({"delivered": bool(r["delivered"])} if r["recipient"] == "controller" else {}), **json.loads(r["body"])}
 
 
+# Public, stable fault categories.  Host-specific ``kind`` values remain in the message as raw
+# diagnostics; callers must decide whether a category is retryable, needs a human, or is terminal.
+def fault_category(kind, message=""):
+    text = f"{kind or ''} {message or ''}".lower()
+    if any(word in text for word in ("quota", "usage_limit", "rate_limit", "rate limit", "balance", "credit")):
+        return "quota"
+    if any(word in text for word in ("auth", "unauthor", "credential", "login", "token", "401")):
+        return "authentication"
+    if any(word in text for word in ("policy", "safety", "forbidden", "not allowed")):
+        return "policy_rejected"
+    if any(word in text for word in ("permission", "approval", "approve", "trust", "allow")):
+        return "permission_required"
+    if any(word in text for word in ("protocol", "disconnect", "connection reset", "broken pipe")):
+        return "protocol_disconnected"
+    if any(word in text for word in ("input", "send-keys", "not delivered", "partial", "uncertain")):
+        return "input_not_delivered"
+    if any(word in text for word in ("timeout", "timed out", "stall", "stalled")):
+        return "timeout"
+    if any(word in text for word in ("exit", "session ended", "process")):
+        return "process_exited"
+    return "host_error"
+
+
+def canonical_status(db, row, legacy_state, last, alive, watch):
+    """Return the multi-signal status contract while retaining legacy ``state``."""
+    latest_type = last["type"] if last else None
+    body = json.loads(last["body"]) if last else {}
+    if latest_type == "done" or legacy_state == "done":
+        status = "completed"
+    elif latest_type == "question" or legacy_state == "asking":
+        status = "waiting-human"
+    elif latest_type == "blocked":
+        status = "blocked"
+    elif latest_type in ("stalled", "unknown"):
+        status = "unknown"
+    elif latest_type in ("exited", "failed") or legacy_state == "exited":
+        status = "failed"
+    elif alive:
+        status = "online"
+    else:
+        status = "unknown"
+    activity_after = seconds_setting("WFC_ACTIVITY_AFTER", 300)
+    idle = bool(watch and time.time() - watch["since"] >= activity_after)
+    host_active = bool(alive and status in ("online", "waiting-human") and not idle)
+    fault = None
+    if latest_type in ("blocked", "stalled", "exited", "failed"):
+        kind = body.get("kind") or latest_type
+        diagnostic = body.get("message") or body.get("reason") or body.get("screen")
+        fault = {"category": fault_category(kind, diagnostic), "kind": kind, "diagnostic": diagnostic,
+                 "requiresDecision": True}
+    activity = "active" if host_active else ("idle" if alive else "unknown")
+    return status, {"processOnline": bool(alive), "online": bool(alive), "hostActive": host_active,
+                    "activity": activity,
+                    "waitingHuman": status == "waiting-human", "blocked": status == "blocked",
+                    "idle": idle, "fault": fault}
+
+
 def dispatch_state(db, dispatch_id):
     if done_current_task(db, dispatch_id):
         return "done"
@@ -1157,13 +1214,15 @@ def cmd_status(args):
             continue
         last = db.execute("SELECT * FROM message WHERE dispatch = ? ORDER BY id DESC LIMIT 1", (row["id"],)).fetchone()
         watch = db.execute("SELECT since FROM screen_watch WHERE dispatch = ?", (row["id"],)).fetchone()
+        alive = session_alive(session_name(row["id"]))
+        canonical, signals = canonical_status(db, row, state, last, alive, watch)
         rounds = [dict(r) for r in db.execute("SELECT round, attempt, task, report, state, result, created, completed "
                                                "FROM dispatch_round WHERE dispatch = ? ORDER BY round, created", (row["id"],))]
         view = {"dispatch": row["id"], "scope": row["scope"], "role": row["role"],
                 "round": row["current_round"], "attempt": row["current_attempt"], "rounds": rounds,
                 "label": row["label"], "host": row["host"], "model": row["model"],
-                "git": bool(row["git"]), "state": state,
-                "tmux": session_name(row["id"]), "tmuxAlive": session_alive(session_name(row["id"])),
+                "git": bool(row["git"]), "state": state, "status": canonical, "signals": signals,
+                "tmux": session_name(row["id"]), "tmuxAlive": alive,
                 "cwd": row["cwd"], "task": row["task"], "report": row["report"], "started": local_time(row["started"]),
                 "last": message_view(last) if last else None,
                 **({"screenIdleSeconds": int(now - watch["since"])} if watch else {}),
@@ -1584,20 +1643,25 @@ def check_workers(db, stall_after):
                 pass  # a stale sample: `resume` relaunched it while we sampled; look again next pass
             elif not alive:
                 post(db, dispatch_id, "controller", "exited",
-                     {"reason": f"tmux session {session} ended without done"})
+                     {"reason": f"tmux session {session} ended without done", "kind": "process_exit",
+                      "fault": {"category": "process_exited", "requiresDecision": True}})
             elif notice:
                 # Nothing typed into this session will arrive: report it now, once per screen.
                 watch = db.execute("SELECT reported_screen FROM screen_watch WHERE dispatch = ?",
                                    (dispatch_id,)).fetchone()
                 if watch is None or watch["reported_screen"] != captured.stdout:
                     post(db, dispatch_id, "controller", "blocked",
-                         {"host": row["host"], "kind": "session_read_only", "message": notice})
+                         {"host": row["host"], "kind": "session_read_only", "message": notice,
+                          "fault": {"category": "permission_required", "requiresDecision": True}})
                     db.execute("INSERT OR REPLACE INTO screen_watch (dispatch, screen, since, reported_screen) "
                                "VALUES (?, ?, ?, ?)", (dispatch_id, captured.stdout, now, captured.stdout))
             elif awaiting_answer(db, dispatch_id):
                 db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (dispatch_id,))
             elif blocked_turn(db, dispatch_id, turn_end):
-                post(db, dispatch_id, "controller", "blocked", {"host": row["host"], **turn_end["error"]})
+                error = turn_end["error"]
+                post(db, dispatch_id, "controller", "blocked", {"host": row["host"], **error,
+                     "fault": {"category": fault_category(error.get("kind"), error.get("message")),
+                               "requiresDecision": True}})
                 db.execute("INSERT OR REPLACE INTO host_error (dispatch, turn) VALUES (?, ?)",
                            (dispatch_id, turn_end["turn"]))
                 if captured.returncode == 0:  # the stall that follows on this screen is the same news
@@ -1641,7 +1705,8 @@ def watch_screen(db, dispatch_id, screen, now, stall_after):
     elif now - watch["since"] >= stall_after and watch["reported_screen"] != screen:
         tail = "\n".join([line for line in screen.splitlines() if line.strip()][-15:])
         post(db, dispatch_id, "controller", "stalled",
-             {"idleSeconds": int(now - watch["since"]), "screen": tail})
+             {"idleSeconds": int(now - watch["since"]), "screen": tail,
+              "kind": "stall_timeout", "fault": {"category": "timeout", "requiresDecision": True}})
         db.execute("UPDATE screen_watch SET reported_screen = ? WHERE dispatch = ?", (screen, dispatch_id))
 
 
