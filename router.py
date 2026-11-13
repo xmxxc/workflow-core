@@ -236,7 +236,9 @@ def cmd_owner(args):
     lease = now + args.lease
     db.execute("BEGIN IMMEDIATE")
     current = db.execute("SELECT * FROM controller_owner WHERE scope = ?", (scope,)).fetchone()
-    token = args.token or owner_token(args) or ("ct-" + uuid.uuid4().hex)
+    # takeover and expired acquire always fence the previous credential; only an
+    # explicitly supplied token may be reused.
+    token = args.token or (owner_token(args) if args.owner_action == "renew" else None) or ("ct-" + uuid.uuid4().hex)
     if args.owner_action == "acquire":
         if current and current["lease_until"] > now:
             db.execute("ROLLBACK")
@@ -281,10 +283,10 @@ def worker_brief(dispatch_id, task, report, opening=FIRST_BRIEF, attempt=None, o
             f"{router} done --report {shlex.quote(str(report))}"
             f"{(' --owner-token "$WFC_OWNER_TOKEN"') if owner else ''}"
             f"{(' --attempt ' + shlex.quote(attempt)) if attempt else ''}"
-            f"{(' --message-id done:' + shlex.quote(dispatch_id) + ':' + shlex.quote(attempt)) if attempt else ''}. "
+            f"{(' --message-id done:' + shlex.quote(dispatch_id) + ':' + shlex.quote(attempt)) if attempt else ''}; "
             f"If you need a decision, run: {router} ask \"<question>\" [--options a,b]"
             f"{(' --owner-token "$WFC_OWNER_TOKEN"') if owner else ''}"
-            f"{(' --attempt ' + shlex.quote(attempt)) if attempt else ''}, then end your turn; "
+            f"{(' --attempt ' + shlex.quote(attempt)) if attempt else ''}; then end your turn; "
             f"the answer arrives as your next message. Never ask questions in plain text "
             f"or with an interactive question tool; nobody watches this window.")
 
@@ -1713,7 +1715,7 @@ def cmd_reclaim(args):
         if not args.yes:
             item["result"] = "listed"
             continue
-        item.update(reclaim_session(db, row, named=bool(named)))
+        item.update(reclaim_session(db, row, named=bool(named), token=owner_token(args)))
         if item["result"] == "failed":
             errors.append(item["error"])
     emit({"state": str(state_dir()), "yes": bool(args.yes), "sessions": sessions})
@@ -1722,7 +1724,7 @@ def cmd_reclaim(args):
     return 1 if errors else 0
 
 
-def reclaim_session(db, row, named):
+def reclaim_session(db, row, named, token=None):
     """Close one session and record `reclaimed`, under the input lock and the write lock the
     watchdog takes, so it never sees the session gone without the record. A dispatch reclaim chose
     by itself (not `named` with --dispatch) must still be done and not reclaimed under the lock: one
@@ -1732,6 +1734,7 @@ def reclaim_session(db, row, named):
     with input_lock(dispatch_id):
         db.execute("BEGIN IMMEDIATE")
         try:
+            require_owner(db, row["scope"], token, "reclaim")
             if not named and (not done_current_task(db, dispatch_id) or reclaimed(db, dispatch_id)):
                 db.execute("ROLLBACK")
                 return {"result": "changed", "note": f"dispatch {dispatch_id} is no longer done and unreclaimed "
@@ -1761,7 +1764,7 @@ def take_controller_messages(db, relay=False, scope=None, token=None):
     db.execute("BEGIN IMMEDIATE")
     if scope:
         require_owner(db, scope, token, "relay" if relay else "wait")
-    owned = db.execute("SELECT scope FROM controller_owner WHERE lease_until > ?", (time.time(),)).fetchall()
+    owned = db.execute("SELECT scope FROM controller_owner").fetchall()
     if not scope and owned:
         db.execute("ROLLBACK")
         raise SystemExit(json.dumps({"error": "controller_owner_required", "operation": "relay" if relay else "wait"}))
@@ -1845,11 +1848,12 @@ def awaiting_answer(db, dispatch_id):
         "SELECT id FROM message WHERE dispatch = ? AND type = 'question'", (dispatch_id,)))
 
 
-def check_workers(db, stall_after):
+def check_workers(db, stall_after, scope=None, token=None):
     """Report workers whose tmux session ended, or whose screen stopped changing,
     without `done` or a pending question. A busy TUI redraws a timer or spinner;
     an idle prompt, a crash message or an approval dialog stays still."""
-    candidates = db.execute("SELECT * FROM dispatch WHERE started IS NOT NULL").fetchall()
+    candidates = (db.execute("SELECT * FROM dispatch WHERE started IS NOT NULL AND scope = ?", (scope,)).fetchall()
+                  if scope else db.execute("SELECT * FROM dispatch WHERE started IS NOT NULL").fetchall())
     for row in candidates:
         dispatch_id = row["id"]
         if not watched(db, dispatch_id) or reclaimed(db, dispatch_id):
@@ -1866,6 +1870,8 @@ def check_workers(db, stall_after):
         # Decide and post under one write lock, re-checking state a worker's `done` may have changed.
         db.execute("BEGIN IMMEDIATE")
         try:
+            if scope:
+                require_owner(db, scope, token, "watchdog")
             if not watched(db, dispatch_id) or reclaimed(db, dispatch_id):
                 pass
             elif not alive and session_alive(session):
@@ -1942,7 +1948,7 @@ def cmd_wait(args):
     deadline = time.monotonic() + args.timeout
     with registered_waiter(db, "wait"):
         while True:
-            check_workers(db, args.stall_after)
+            check_workers(db, args.stall_after, scope=args.scope, token=owner_token(args))
             # At-most-once: messages are marked delivered before they are printed; `status` shows them again.
             messages = take_controller_messages(db, scope=args.scope, token=owner_token(args))
             if messages:
@@ -2096,7 +2102,7 @@ def cmd_relay(args):
     deadline = time.monotonic() + args.for_seconds if args.for_seconds else None
     with registered_waiter(db, "relay"):
         while deadline is None or time.monotonic() < deadline:
-            check_workers(db, args.stall_after)
+            check_workers(db, args.stall_after, scope=args.scope, token=owner_token(args))
             messages = take_controller_messages(db, relay=True, scope=args.scope, token=owner_token(args))
             # The internal claim and the external envelope both remain explicitly
             # uncertain until the backend call returns. A later durable transition
