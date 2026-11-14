@@ -669,19 +669,29 @@ def cmd_dispatch(args):
                 args.model, host_session, args.effort, int(args.network), label, int(args.git), scope, role, 1, attempt))
     db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, created) VALUES (?, ?, ?, ?, ?, ?)",
                (dispatch_id, 1, attempt, str(task), str(report), created))
-    launched = _backend_status(backend.create(dispatch_id, cwd, command, extra_env, label))
-    if launched == NOT_SENT:
-        db.execute("DELETE FROM dispatch_round WHERE dispatch = ?", (dispatch_id,))
-        db.execute("DELETE FROM dispatch WHERE id = ?", (dispatch_id,))
+    created_result = backend.create(dispatch_id, cwd, command, extra_env, label)
+    if created_result["result"] != "accepted":
+        diagnostic = created_result.get("diagnostic") or f"backend create returned {created_result['result']}"
+        if created_result["result"] == DEFINITELY_NOT_SENT:
+            db.execute("DELETE FROM dispatch_round WHERE dispatch = ?", (dispatch_id,))
+            db.execute("DELETE FROM dispatch WHERE id = ?", (dispatch_id,))
+            db.execute("COMMIT")
+            raise SystemExit(diagnostic)
+        if created_result["result"] == UNCERTAIN:
+            db.execute("UPDATE dispatch SET started = ? WHERE id = ?", (time.time(), dispatch_id))
+        db.execute("UPDATE dispatch_round SET state = 'unknown', result = ? WHERE dispatch = ? AND round = 1 AND attempt = ?",
+                   (json.dumps({"backend": args.backend, "result": created_result["result"],
+                                "diagnostic": diagnostic}, ensure_ascii=False), dispatch_id, attempt))
+        if created_result["result"] == UNCERTAIN:
+            db.execute("UPDATE dispatch_round SET state = 'running' WHERE dispatch = ? AND round = 1 AND attempt = ?",
+                       (dispatch_id, attempt))
+        db.execute("INSERT OR REPLACE INTO fault_event (dispatch, operation, outcome, category, diagnostic, created) "
+                   "VALUES (?, 'create', ?, ?, ?, ?)",
+                   (dispatch_id, created_result["result"], "backend_create", diagnostic, time.time()))
         db.execute("COMMIT")
-        raise SystemExit("could not start the worker's tmux session; is tmux installed and on PATH?")
+        raise SystemExit(f"{diagnostic} for dispatch {dispatch_id}")
     db.execute("UPDATE dispatch SET started = ? WHERE id = ?", (time.time(), dispatch_id))
     db.execute("COMMIT")
-    if launched == UNCERTAIN:
-        # Keep the record: a live worker must still be able to report. The watchdog reports
-        # `exited` if no session is there.
-        raise SystemExit(f"tmux did not confirm the worker's session for dispatch {dispatch_id}; it is kept. "
-                         f"Check `tmux ls`; `wait` reports it exited if it never started.")
     emit({"dispatch": dispatch_id, "scope": scope, "role": role, "round": 1, "attempt": attempt,
           "host": args.host, "backend": args.backend, "label": label, "tmux": session_name(dispatch_id),
           **({"trustedBy": trusted_by} if trusted_by else {}), **({"ignored": ignored} if ignored else {})})
@@ -1374,12 +1384,20 @@ class TmuxBackend(ExecutionBackend):
         if state == SENT:
             return backend_result("accepted")
         if state == NOT_SENT:
-            return backend_result(DEFINITELY_NOT_SENT, diagnostic, legacy=state)
+            return backend_result(DEFINITELY_NOT_SENT, diagnostic, legacy=state,
+                                  recovery=f"backend could not send input to {session_name(dispatch_id)}; retry is safe")
         if state == READ_ONLY:
-            return backend_result("refused", diagnostic, notice=notice, legacy=state)
+            return backend_result("refused", diagnostic, notice=notice, legacy=state,
+                                  recovery=f"tmux session {session_name(dispatch_id)} refused input: {notice}; "
+                                           "dispatch a new worker")
         # ``partial`` is deliberately exposed as uncertain: a backend cannot
         # claim whether Enter was accepted after the text crossed its boundary.
-        return backend_result(UNCERTAIN, diagnostic, legacy=state)
+        recovery = (f"input was typed into, but its Enter was not confirmed in tmux session {session_name(dispatch_id)}; "
+                    f"attach (tmux attach -t {session_name(dispatch_id)}), inspect it, and do not send it again"
+                    if state == PARTIAL else
+                    f"input may or may not have reached tmux session {session_name(dispatch_id)}; "
+                    f"attach (tmux attach -t {session_name(dispatch_id)}), inspect it, and do not send it again")
+        return backend_result(UNCERTAIN, diagnostic, legacy=state, recovery=recovery)
 
     def interrupt(self, dispatch_id):
         inspected = self.inspect(dispatch_id)
@@ -1407,7 +1425,8 @@ class TmuxBackend(ExecutionBackend):
         if host == "codex" and probe_read_only:
             notice = new_notice(session, [], seconds_setting("WFC_RESUME_CHECK_SECONDS", 5))
             if notice:
-                return backend_result("refused", notice, notice=notice, legacy=READ_ONLY)
+                return backend_result("refused", notice, notice=notice, legacy=READ_ONLY,
+                                      recovery=f"tmux session {session} refused the brief: {notice}; dispatch a new worker")
         return created
 
     def close(self, dispatch_id):
@@ -1437,35 +1456,34 @@ def backend_for(dispatch_or_name):
 
 
 def backend_submit(row, text):
-    """Return the old input tuple while routing the operation through the backend seam."""
-    outcome = backend_for(row).submit(row["id"], text, row["host"])
-    legacy = outcome.get("legacy")
-    if legacy:
-        return legacy, outcome.get("notice"), outcome.get("diagnostic")
-    result = outcome["result"]
-    state = {"accepted": SENT, DEFINITELY_NOT_SENT: NOT_SENT,
-             "uncertain": UNCERTAIN, "refused": READ_ONLY}.get(result, result)
-    return state, outcome.get("notice"), outcome.get("diagnostic")
+    """Submit through the backend and return its generic result envelope."""
+    return backend_for(row).submit(row["id"], text, row["host"])
 
 
-def refusal(session, what, notice):
-    return (f"tmux session {session} did not take {what}: its screen says \"{notice}\" Nothing was sent, and this "
-            f"conversation cannot go on; dispatch a new worker")
+def backend_failure(outcome, action):
+    """Format a backend failure without assuming a terminal, screen, or tmux."""
+    recovery = outcome.get("recovery")
+    if recovery:
+        return SystemExit(recovery)
+    diagnostic = outcome.get("diagnostic") or f"backend returned {outcome['result']}"
+    return SystemExit(f"{action} failed with {outcome['result']}: {diagnostic}")
 
 
-def mark_screen_reported(db, dispatch_id, session):
-    """The command that met a read-only screen reports it, so the watchdog does not report it again."""
-    screen = capture(session)
+def backend_fault_state(outcome):
+    """Map a backend envelope to the legacy fault ledger vocabulary."""
+    if outcome.get("legacy"):
+        return outcome["legacy"]
+    return {DEFINITELY_NOT_SENT: NOT_SENT, "uncertain": UNCERTAIN,
+            "refused": READ_ONLY}.get(outcome["result"], outcome["result"])
+
+
+def mark_backend_reported(db, row):
+    """Record an observation supplied by the backend, when it exposes one."""
+    observation = backend_for(row).read(row["id"])
+    screen = observation.get("screen") if observation.get("result") == "accepted" else None
     if screen is not None:
         db.execute("INSERT OR REPLACE INTO screen_watch (dispatch, screen, since, reported_screen) VALUES (?, ?, ?, ?)",
-                   (dispatch_id, screen, time.time(), screen))
-
-
-def typing_error(session, what, typed):
-    state = ("may or may not have reached" if typed == UNCERTAIN
-             else "was typed into, but its Enter was not confirmed in,")
-    return SystemExit(f"{what} {state} tmux session {session}. Attach (tmux attach -t {session}), check the input "
-                      f"line, and press Enter or clear it yourself; do not send it again.")
+                   (row["id"], screen, time.time(), screen))
 
 
 def persist_input_fault(db, dispatch_id, operation, outcome, diagnostic=None):
@@ -1549,23 +1567,20 @@ def cmd_reply(args):
         raise SystemExit(f"question {question['id']} was already answered")
     reply_id = post(db, question["dispatch"], "worker", "reply", {"to": question["id"], "answer": answer})
     db.execute("COMMIT")
-    session = session_name(question["dispatch"])
-    host = db.execute("SELECT host FROM dispatch WHERE id = ?", (question["dispatch"],)).fetchone()
     with input_lock(question["dispatch"]):
         input_started = time.time()
-        typed, notice, diagnostic = backend_submit(
-            db.execute("SELECT * FROM dispatch WHERE id = ?", (question["dispatch"],)).fetchone(),
-            f"[router] Answer to question {question['id']}: {answer}")
-        if typed in (NOT_SENT, READ_ONLY):
+        dispatch_row = db.execute("SELECT * FROM dispatch WHERE id = ?", (question["dispatch"],)).fetchone()
+        outcome = backend_submit(dispatch_row, f"[router] Answer to question {question['id']}: {answer}")
+        if outcome["result"] in (DEFINITELY_NOT_SENT, "refused"):
             db.execute("DELETE FROM message WHERE id = ?", (reply_id,))
-            persist_input_fault(db, question["dispatch"], "reply", typed, diagnostic)
-            if typed == READ_ONLY:
-                mark_screen_reported(db, question["dispatch"], session)
-                raise SystemExit(refusal(session, "the answer", notice))
-            raise SystemExit(f"could not type the answer into tmux session {session}; is the worker still running?")
-        if typed in (PARTIAL, UNCERTAIN):
-            persist_input_fault(db, question["dispatch"], "reply", typed, diagnostic)
-            raise typing_error(session, f"The answer to question {question['id']}", typed)  # the claim stays
+            state = backend_fault_state(outcome)
+            persist_input_fault(db, question["dispatch"], "reply", state, outcome.get("diagnostic"))
+            if outcome["result"] == "refused":
+                mark_backend_reported(db, dispatch_row)
+            raise backend_failure(outcome, f"answer to question {question['id']}")
+        if outcome["result"] == UNCERTAIN:
+            persist_input_fault(db, question["dispatch"], "reply", backend_fault_state(outcome), outcome.get("diagnostic"))
+            raise backend_failure(outcome, f"answer to question {question['id']}")  # the claim stays
         clear_input_fault(db, question["dispatch"], input_started)
     emit({"replied": question["id"], "dispatch": question["dispatch"]})
 
@@ -1584,12 +1599,11 @@ def cmd_continue(args):
                          f"was given write access to at dispatch")
     if watched(db, args.dispatch):
         raise SystemExit(f"dispatch {args.dispatch} has not done its current task yet")
-    session = session_name(args.dispatch)
     inspection = backend_for(row).inspect(args.dispatch)
     if inspection["result"] != "accepted":
         raise SystemExit(inspection.get("diagnostic") or f"backend inspect returned {inspection['result']}")
     if not inspection.get("alive", False):
-        raise SystemExit(f"tmux session {session} has ended; dispatch a new worker instead")
+        raise SystemExit("execution backend reports the worker is not running; resume it instead")
     # Claim the next round under the write lock, re-checking that the current one is done, so two
     # concurrent `continue`s cannot both type a task. Recording first also keeps the new task's
     # `done` above its `continue`.
@@ -1612,15 +1626,15 @@ def cmd_continue(args):
     db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
     db.execute("COMMIT")
     brief = worker_brief(args.dispatch, task, report, opening="[router] New task for you", attempt=attempt)
-    typed, notice, diagnostic = backend_submit(row, brief)
-    if typed in (NOT_SENT, READ_ONLY):
-        why = (refusal(session, "the next task", notice) if typed == READ_ONLY
-               else f"could not type the next task into tmux session {session}")
+    outcome = backend_submit(row, brief)
+    typed, diagnostic = backend_fault_state(outcome), outcome.get("diagnostic")
+    if outcome["result"] in (DEFINITELY_NOT_SENT, "refused"):
+        why = str(backend_failure(outcome, "the next task"))
         # Undo the claim only while it is still the latest round event and its task is still the
         # current one: a `resume` may have taken the new round over in between.
         db.execute("BEGIN IMMEDIATE")
-        if typed == READ_ONLY:
-            mark_screen_reported(db, args.dispatch, session)
+        if outcome["result"] == "refused":
+            mark_backend_reported(db, row)
         current = db.execute("SELECT task, report FROM dispatch WHERE id = ?", (args.dispatch,)).fetchone()
         if round_mark(db, args.dispatch) == message_id and (current["task"], current["report"]) == (str(task), str(report)):
             db.execute("DELETE FROM message WHERE id = ?", (message_id,))
@@ -1635,9 +1649,9 @@ def cmd_continue(args):
         persist_input_fault(db, args.dispatch, "continue", typed, diagnostic)
         raise SystemExit(f"{why}. But dispatch {args.dispatch} moved on meanwhile (a resume took the round over); "
                          f"its current state is kept")
-    if typed in (PARTIAL, UNCERTAIN):
+    if outcome["result"] == UNCERTAIN:
         persist_input_fault(db, args.dispatch, "continue", typed, diagnostic)
-        raise typing_error(session, "The next task", typed)
+        raise backend_failure(outcome, "the next task")
     clear_input_fault(db, args.dispatch)
     emit({"continued": args.dispatch, "message": message_id})
 
@@ -1650,12 +1664,11 @@ def cmd_nudge(args):
     row = db.execute("SELECT * FROM dispatch WHERE id = ? AND started IS NOT NULL", (args.dispatch,)).fetchone()
     if row is None:
         raise SystemExit(f"unknown dispatch {args.dispatch} in {state_dir()}")
-    session = session_name(args.dispatch)
     inspection = backend_for(row).inspect(args.dispatch)
     if inspection["result"] != "accepted":
         raise SystemExit(inspection.get("diagnostic") or f"backend inspect returned {inspection['result']}")
     if not inspection.get("alive", False):
-        raise SystemExit(f"tmux session {session} has ended; use `resume` instead")
+        raise SystemExit("execution backend reports the worker is not running; use resume instead")
     text = " ".join(args.text.splitlines())  # a newline would submit half the line
     db.execute("BEGIN IMMEDIATE")
     require_owner(db, row["scope"], owner_token(args), "nudge")
@@ -1665,17 +1678,17 @@ def cmd_nudge(args):
     message_id = post(db, args.dispatch, "worker", "nudge", {"text": text})
     db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
     db.execute("COMMIT")
-    typed, notice, diagnostic = backend_submit(row, f"[router] Message from the controller: {text}")
-    if typed in (NOT_SENT, READ_ONLY):
+    outcome = backend_submit(row, f"[router] Message from the controller: {text}")
+    typed, diagnostic = backend_fault_state(outcome), outcome.get("diagnostic")
+    if outcome["result"] in (DEFINITELY_NOT_SENT, "refused"):
         db.execute("DELETE FROM message WHERE id = ?", (message_id,))
         persist_input_fault(db, args.dispatch, "nudge", typed, diagnostic)
-        if typed == READ_ONLY:
-            mark_screen_reported(db, args.dispatch, session)
-            raise SystemExit(refusal(session, "the message", notice))
-        raise SystemExit(f"could not type the message into tmux session {session}")
-    if typed in (PARTIAL, UNCERTAIN):
+        if outcome["result"] == "refused":
+            mark_backend_reported(db, row)
+        raise backend_failure(outcome, "the message")
+    if outcome["result"] == UNCERTAIN:
         persist_input_fault(db, args.dispatch, "nudge", typed, diagnostic)
-        raise typing_error(session, "The message", typed)
+        raise backend_failure(outcome, "the message")
     clear_input_fault(db, args.dispatch)
     emit({"nudged": args.dispatch, "message": message_id})
 
@@ -2359,10 +2372,9 @@ def cmd_resume(args):
             if legacy:
                 persist_input_fault(db, args.dispatch, "resume", legacy, diagnostic)
             if result == "refused":
-                raise SystemExit(f"resumed {session}, but the backend refused the brief: {diagnostic or 'no diagnostic'}; "
-                                 "dispatch a new worker")
+                raise backend_failure(resumed, "the resumed brief")
             if legacy in (PARTIAL, UNCERTAIN):
-                raise typing_error(session, "The brief", legacy)
+                raise backend_failure(resumed, "the brief")
             raise SystemExit(diagnostic or f"resume returned {result} for {args.dispatch}")
         clear_input_fault(db, args.dispatch, input_started)
         _set_lifecycle_result(db, resume_event, args.dispatch, "accepted", state="running",
@@ -2588,7 +2600,7 @@ def awaiting_answer(db, dispatch_id):
 
 
 def check_workers(db, stall_after, scope=None, token=None):
-    """Report workers whose tmux session ended, or whose screen stopped changing,
+    """Report workers whose execution unit ended, or whose activity stopped changing,
     without `done` or a pending question. A busy TUI redraws a timer or spinner;
     an idle prompt, a crash message or an approval dialog stays still."""
     candidates = (db.execute("SELECT * FROM dispatch WHERE started IS NOT NULL AND scope = ?", (scope,)).fetchall()
@@ -2598,22 +2610,25 @@ def check_workers(db, stall_after, scope=None, token=None):
         dispatch_id = row["id"]
         if not watched(db, dispatch_id) or reclaimed(db, dispatch_id):
             continue
-        session = session_name(dispatch_id)
         backend = backend_for(row)
         inspected = backend.inspect(dispatch_id)
-        alive = inspected.get("alive", False)
+        alive = inspected["result"] == "accepted" and inspected.get("alive", False)
         read_view = backend.read(dispatch_id) if alive else None
+        backend_fault = inspected if inspected["result"] == UNCERTAIN else None
+        if alive and read_view and read_view.get("result") != "accepted":
+            backend_fault = read_view
         captured = (subprocess.CompletedProcess(["backend", "read"], 0, read_view["screen"], "")
                     if read_view and read_view.get("result") == "accepted" else None)
         now = time.time()
         # A resume starts a fresh watch: the host may record the reopened conversation elsewhere.
         watch_key = (dispatch_id, db.execute("SELECT MAX(id) FROM message WHERE dispatch = ? AND type = 'resumed'",
                                              (dispatch_id,)).fetchone()[0])
-        turn_end = TURN_WATCHES.setdefault(watch_key, TurnWatch()).latest(row, now) if alive else None
+        turn_end = TURN_WATCHES.setdefault(watch_key, TurnWatch()).latest(row, now) if alive and not backend_fault else None
         notice = read_only_notice(captured.stdout) if alive and captured.returncode == 0 else None
         timeout_marker = f"timeout:{row['current_round']}:{row['current_attempt']}"
         prior_timeout = db.execute("SELECT turn FROM host_error WHERE dispatch = ?", (dispatch_id,)).fetchone()
         timeout_seen = bool(prior_timeout and prior_timeout["turn"] == timeout_marker)
+        recheck = backend.inspect(dispatch_id) if not alive and not backend_fault else None
         # Decide and post under one write lock, re-checking state a worker's `done` may have changed.
         db.execute("BEGIN IMMEDIATE")
         try:
@@ -2621,11 +2636,31 @@ def check_workers(db, stall_after, scope=None, token=None):
                 require_owner(db, scope, token, "watchdog")
             if not watched(db, dispatch_id) or reclaimed(db, dispatch_id):
                 pass
-            elif not alive and backend.inspect(dispatch_id).get("alive", False):
+            elif backend_fault:
+                prior_fault = db.execute("SELECT outcome, diagnostic FROM fault_event WHERE dispatch = ? AND operation = 'backend'",
+                                         (dispatch_id,)).fetchone()
+                if prior_fault is None or prior_fault["outcome"] != backend_fault["result"] \
+                        or prior_fault["diagnostic"] != backend_fault.get("diagnostic"):
+                    diagnostic = backend_fault.get("diagnostic") or f"backend returned {backend_fault['result']}"
+                    post(db, dispatch_id, "controller", "unknown",
+                         {"kind": "backend_observation", "message": diagnostic,
+                          "backendResult": backend_fault["result"],
+                          "fault": {"category": "backend_uncertain" if backend_fault["result"] == UNCERTAIN else "backend_error",
+                                    "kind": "backend_observation", "diagnostic": diagnostic,
+                                    "requiresDecision": True}})
+                    db.execute("INSERT OR REPLACE INTO fault_event (dispatch, operation, outcome, category, diagnostic, created) "
+                               "VALUES (?, 'backend', ?, ?, ?, ?)",
+                               (dispatch_id, backend_fault["result"],
+                                "backend_uncertain" if backend_fault["result"] == UNCERTAIN else "backend_error",
+                                diagnostic, now))
+            elif not alive and recheck and recheck["result"] == UNCERTAIN:
+                pass  # the recheck is itself uncertain; leave the backend fault queryable
+            elif not alive and recheck and recheck.get("alive", False):
                 pass  # a stale sample: `resume` relaunched it while we sampled; look again next pass
             elif not alive:
                 post(db, dispatch_id, "controller", "exited",
-                     {"reason": f"tmux session {session} ended without done", "kind": "process_exit",
+                     {"reason": "execution backend reports the worker ended without done", "kind": "process_exit",
+                      "backendResult": inspected["result"],
                       "fault": {"category": "process_exited", "requiresDecision": True}})
             elif notice:
                 # Nothing typed into this session will arrive: report it now, once per screen.
@@ -2657,10 +2692,10 @@ def check_workers(db, stall_after, scope=None, token=None):
                                "requiresDecision": True}})
                 db.execute("INSERT OR REPLACE INTO host_error (dispatch, turn) VALUES (?, ?)",
                            (dispatch_id, turn_end["turn"]))
-                if captured.returncode == 0:  # the stall that follows on this screen is the same news
+                if captured and captured.returncode == 0:  # the stall that follows on this screen is the same news
                     db.execute("INSERT OR REPLACE INTO screen_watch (dispatch, screen, since, reported_screen) "
                                "VALUES (?, ?, ?, ?)", (dispatch_id, captured.stdout, now, captured.stdout))
-            elif captured.returncode == 0:
+            elif captured and captured.returncode == 0:
                 watch_screen(db, dispatch_id, captured.stdout, now, stall_after)
             db.execute("COMMIT")
         except BaseException:
