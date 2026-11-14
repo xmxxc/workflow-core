@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -190,6 +191,38 @@ class BackendContract(unittest.TestCase):
         consumed = db.execute("SELECT consumed_at FROM lifecycle_event WHERE id = ?", (audit,)).fetchone()[0]
         self.assertNotEqual(current_attempt, "a-fake")
         self.assertIsNotNone(consumed)
+        db.close()
+
+    def test_stale_override_is_rejected_after_owner_takeover(self):
+        self.fake.inspect_result = "uncertain"
+        db = router.connect()
+        now = time.time()
+        db.execute("INSERT INTO controller_owner (scope, owner, token, generation, lease_until, updated) "
+                   "VALUES ('s-owner', 'old', 'old-token', 1, ?, ?)", (now + 60, now))
+        db.execute("INSERT INTO dispatch (id, host, backend, cwd, task, created, started, report_dir, report, "
+                   "model, host_session, effort, network, label, git, scope, role, current_round, current_attempt) "
+                   "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                   ("d-owner", "codex", "fake", str(self.cwd), "task", 1, 1, str(self.cwd), "report",
+                    None, "session", None, 0, "label", 0, "s-owner", "worker", 1, "a-owner"))
+        db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, state, created) "
+                   "VALUES (?, ?, ?, ?, ?, 'running', ?)",
+                   ("d-owner", 1, "a-owner", "task", "report", 1))
+        event = router.lifecycle_event(db, "d-owner", "resume", round=1, attempt="a-owner",
+                                      from_attempt="a-owner", to_attempt="a-owner", from_host="codex",
+                                      to_host="codex", result="pending")
+        router.finish_lifecycle_event(db, event, "accepted", "confirmed absent", "old", "old-proof")
+        db.execute("UPDATE controller_owner SET owner = 'new', token = 'new-token', generation = 2, updated = ?",
+                   (now,))
+        db.commit()
+        args = argparse.Namespace(dispatch="d-owner", owner_token="new-token", task=None, report=None)
+
+        with self.assertRaises(SystemExit) as raised:
+            router.cmd_resume(args)
+
+        self.assertIn("lifecycle_reconcile_required", str(raised.exception))
+        self.assertEqual(self.fake.resume_calls, 0)
+        self.assertEqual(db.execute("SELECT current_attempt FROM dispatch WHERE id = 'd-owner'").fetchone()[0],
+                         "a-owner")
         db.close()
 
 

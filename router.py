@@ -2294,7 +2294,8 @@ def cmd_resume(args):
     row = db.execute("SELECT * FROM dispatch WHERE id = ? AND started IS NOT NULL", (args.dispatch,)).fetchone()
     if row is None:
         raise SystemExit(f"unknown dispatch {args.dispatch} in {state_dir()}")
-    require_owner(db, row["scope"], owner_token(args), "resume")
+    current_owner = require_owner(db, row["scope"], owner_token(args), "resume")
+    owner_generation = current_owner["generation"] if current_owner else None
     require_no_unresolved_lifecycle(db, args.dispatch)
     backend = backend_for(row)
     mark = round_mark(db, args.dispatch)
@@ -2305,8 +2306,9 @@ def cmd_resume(args):
     session = session_name(args.dispatch)
     override = db.execute("SELECT id FROM lifecycle_event WHERE dispatch = ? AND operation = 'resume' "
                           "AND result = 'accepted' AND to_attempt = ? AND resolution_evidence IS NOT NULL "
-                          "AND consumed_at IS NULL ORDER BY id DESC LIMIT 1",
-                          (args.dispatch, row["current_attempt"])).fetchone()
+                          "AND consumed_at IS NULL AND (owner_generation IS NULL OR owner_generation = ?) "
+                          "ORDER BY id DESC LIMIT 1",
+                          (args.dispatch, row["current_attempt"], owner_generation)).fetchone()
     inspection = ({"result": "accepted", "alive": False, "confirmedAbsent": True}
                   if override else backend.inspect(args.dispatch))
     if inspection["result"] != "accepted" and not inspection.get("confirmedAbsent", False):
@@ -2354,7 +2356,8 @@ def cmd_resume(args):
         # after tmux creates a session therefore leaves a visible pending attempt instead of rolling
         # the identity back and orphaning an unaccounted writer.
         db.execute("BEGIN IMMEDIATE")
-        require_owner(db, row["scope"], owner_token(args), "resume")
+        locked_owner = require_owner(db, row["scope"], owner_token(args), "resume")
+        locked_generation = locked_owner["generation"] if locked_owner else None
         # Everything above was decided without the lock: give up if the round moved on meanwhile
         # (another resume, a continue, a done) or a session came back.
         # The row read before the lock must still be the current one, as must the round mark: an old
@@ -2365,8 +2368,9 @@ def cmd_resume(args):
                                (args.dispatch, now["current_round"], now["current_attempt"])).fetchone()
         override = db.execute("SELECT id FROM lifecycle_event WHERE dispatch = ? AND operation = 'resume' "
                               "AND result = 'accepted' AND to_attempt = ? AND resolution_evidence IS NOT NULL "
-                              "AND consumed_at IS NULL ORDER BY id DESC LIMIT 1",
-                              (args.dispatch, now["current_attempt"])).fetchone()
+                              "AND consumed_at IS NULL AND (owner_generation IS NULL OR owner_generation = ?) "
+                              "ORDER BY id DESC LIMIT 1",
+                              (args.dispatch, now["current_attempt"], locked_generation)).fetchone()
         locked_inspection = ({"result": "accepted", "alive": False, "confirmedAbsent": True}
                              if override else backend.inspect(args.dispatch))
         if locked_inspection["result"] != "accepted" and not locked_inspection.get("confirmedAbsent", False):
