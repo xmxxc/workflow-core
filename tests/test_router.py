@@ -57,7 +57,14 @@ class Env:
                 f"sessions = {str(self.sessions)!r}\n"
                 f"if {name!r} == 'tmux' and sys.argv[1] == 'new-session':\n"
                 f"    time.sleep(float(os.environ.get('FAKE_LAUNCH_DELAY', '0')))\n"
+                f"    if '_host-run' in sys.argv:\n"
+                f"        spec_path = sys.argv[sys.argv.index('_host-run') + 1]\n"
+                f"        spec = json.load(open(spec_path))\n"
+                f"        json.dump({{'category': 'started', 'diagnostic': 'fake host started'}}, open(spec['receipt'], 'w'))\n"
+                f"        os.unlink(spec_path)\n"
                 f"    session_env = dict(sys.argv[i + 1].split('=', 1) for i, a in enumerate(sys.argv) if a == '-e')\n"
+                f"    if '_host-run' in sys.argv and 'OPENCODE_CONFIG_CONTENT' in spec['env']:\n"
+                f"        session_env['OPENCODE_CONFIG_CONTENT'] = spec['env']['OPENCODE_CONFIG_CONTENT']\n"
                 f"    open(os.path.join(sessions, sys.argv[sys.argv.index('-s') + 1]), 'w').write(json.dumps(session_env))\n"
                 f"if {name!r} == 'tmux' and sys.argv[1] == 'has-session':\n"
                 f"    sys.exit(0 if os.path.exists(os.path.join(sessions, sys.argv[sys.argv.index('-t') + 1])) else 1)\n"
@@ -602,8 +609,8 @@ class Delivery(unittest.TestCase):
         self.env.dispatch("opencode")
 
         [call] = self.env.host_calls()
-        config = json.loads(next(a for a in call if a.startswith("OPENCODE_CONFIG_CONTENT="))
-                            .split("=", 1)[1])
+        marker = self.env.sessions / call[call.index("-s") + 1]
+        config = json.loads(json.loads(marker.read_text())["OPENCODE_CONFIG_CONTENT"])
         # User decision 2026-11-05: OpenCode's directory rules are tool prompts, not a sandbox
         # (shell writes bypass them), and git/pnpm touch ~ constantly, so unattended workers allow all.
         # "*" overrides any narrower rule in the user's own config, which OpenCode merges in.

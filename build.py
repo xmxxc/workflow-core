@@ -12,7 +12,7 @@ import zipapp
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-MODULES = ("router.py", "wfc.py")
+MODULES = ("router.py", "wfc.py", "host_launch.py")
 
 
 def build(out):
