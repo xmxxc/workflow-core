@@ -12,10 +12,12 @@ import collections
 import calendar
 import fcntl
 import hashlib
+import host_launch
 import json
 import os
 import re
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -84,7 +86,8 @@ TABLES = {
 ADDED_COLUMNS = {
     "dispatch": {"backend": "TEXT", "started": "REAL", "report_dir": "TEXT", "report": "TEXT", "model": "TEXT", "host_session": "TEXT",
                  "effort": "TEXT", "network": "INTEGER", "label": "TEXT", "git": "INTEGER",
-                 "scope": "TEXT", "role": "TEXT", "current_round": "INTEGER", "current_attempt": "TEXT"},
+                 "scope": "TEXT", "role": "TEXT", "current_round": "INTEGER", "current_attempt": "TEXT",
+                 "launch_config": "TEXT", "launch_receipt": "TEXT"},
     "message": {"message_uid": "TEXT", "request_key": "TEXT", "body_hash": "TEXT",
                 "state": "TEXT", "status_version": "INTEGER", "resolver_actor": "TEXT",
                 "resolution_source": "TEXT", "resolution_reason": "TEXT", "resolution_evidence": "TEXT",
@@ -659,8 +662,12 @@ def cmd_dispatch(args):
                                                            owner=bool(controller)),
                                               [state_dir(), report.parent], cwd, args.model, host_session,
                                               effort=args.effort, network=args.network, label=label, git=args.git)
+    config = getattr(args, "launch_config", None) or os.environ.get("WFC_LAUNCH_CONFIG")
+    config = str(Path(config).expanduser().resolve()) if config else None
+    command, extra_env = host_launch.configure(args.host, command, extra_env, config)
+    extra_env.update(WFC_DISPATCH=dispatch_id, WFC_STATE=str(state_dir()))
     if controller:
-        extra_env = {**extra_env, "WFC_OWNER_TOKEN": controller["token"]}
+        extra_env["WFC_OWNER_TOKEN"] = controller["token"]
     ignored = [note for option, note in IGNORED_OPTIONS.get(args.host, {}).items() if getattr(args, option)]
     trusted_by = trust_claude_worktree(cwd) if args.host == "claude" else None
     created = time.time()
@@ -670,10 +677,12 @@ def cmd_dispatch(args):
                 args.model, host_session, args.effort, int(args.network), label, int(args.git), scope, role, 1, attempt))
     db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, created) VALUES (?, ?, ?, ?, ?, ?)",
                (dispatch_id, 1, attempt, str(task), str(report), created))
+    db.execute("UPDATE dispatch SET launch_config = ? WHERE id = ?", (config, dispatch_id))
     created_result = backend.create(dispatch_id, cwd, command, extra_env, label)
+    db.execute("UPDATE dispatch SET launch_receipt = ? WHERE id = ?", (created_result.get("receipt"), dispatch_id))
     if created_result["result"] != "accepted":
         diagnostic = created_result.get("diagnostic") or f"backend create returned {created_result['result']}"
-        if created_result["result"] == DEFINITELY_NOT_SENT:
+        if created_result["result"] == DEFINITELY_NOT_SENT and not created_result.get("category"):
             db.execute("DELETE FROM dispatch_round WHERE dispatch = ?", (dispatch_id,))
             db.execute("DELETE FROM dispatch WHERE id = ?", (dispatch_id,))
             db.execute("COMMIT")
@@ -688,7 +697,10 @@ def cmd_dispatch(args):
                        (dispatch_id, attempt))
         db.execute("INSERT OR REPLACE INTO fault_event (dispatch, operation, outcome, category, diagnostic, created) "
                    "VALUES (?, 'create', ?, ?, ?, ?)",
-                   (dispatch_id, created_result["result"], "backend_create", diagnostic, time.time()))
+                   (dispatch_id, created_result["result"], created_result.get("category", "backend_create"), diagnostic, time.time()))
+        if created_result.get("category") == "unknown" and created_result["result"] == UNCERTAIN:
+            lifecycle_event(db, dispatch_id, "create", round=1, attempt=attempt, to_attempt=attempt,
+                            to_host=args.host, result=UNCERTAIN, diagnostic=diagnostic)
         db.execute("COMMIT")
         raise SystemExit(f"{diagnostic} for dispatch {dispatch_id}")
     db.execute("UPDATE dispatch SET started = ? WHERE id = ?", (time.time(), dispatch_id))
@@ -755,10 +767,10 @@ def _tmux_create(dispatch_id, cwd, command, extra_env, label=None):
     started = tmux("new-session", "-d", "-s", session_name(dispatch_id), *window, "-c", str(cwd),
                    *[arg for k, v in env.items() for arg in ("-e", f"{k}={v}")], *command)
     if started.returncode == 0:
-        return SENT
-    print(f"router: tmux new-session failed (exit {started.returncode}): {started.stderr.strip()}", file=sys.stderr)
+        return SENT, None
     # Like typing: only a tmux that could not run at all certainly started nothing.
-    return NOT_SENT if getattr(started, "not_run", False) else UNCERTAIN
+    return (NOT_SENT if getattr(started, "not_run", False) else UNCERTAIN,
+            f"tmux new-session failed (exit {started.returncode}): {started.stderr or started.stdout}")
 
 
 def wait_for_quiet_screen(session, timeout=30):
@@ -1357,12 +1369,45 @@ class TmuxBackend(ExecutionBackend):
     name = "tmux"
 
     def create(self, dispatch_id, cwd, command, extra_env, label=None):
-        status = _tmux_create(dispatch_id, cwd, command, extra_env, label)
-        if status == SENT:
-            return backend_result("accepted")
+        if not shutil.which("tmux"):
+            return backend_result(DEFINITELY_NOT_SENT, "tmux could not run: executable missing")
+        env = {**os.environ, **extra_env, "WFC_DISPATCH": dispatch_id, "WFC_STATE": str(state_dir())}
+        try:
+            argv = host_launch.prepare(command, env, cwd)
+        except host_launch.LaunchError as err:
+            return backend_result(DEFINITELY_NOT_SENT, host_launch.sanitize(err, env), category=err.category)
+        directory = state_dir() / "launches"
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        receipt = directory / f"{dispatch_id}-{uuid.uuid4().hex}.json"
+        spec = receipt.with_suffix(".spec")
+        host_launch.write_private(spec, {"argv": argv, "env": env, "cwd": str(cwd), "receipt": str(receipt)})
+        host_launch.write_private(receipt, {"category": "unknown", "diagnostic": "host startup not confirmed", "at": time.time()})
+        # tmux's multi-argument command form execs argv directly. No shell quoting of host/task data.
+        status, diagnostic = _tmux_create(dispatch_id, cwd, [sys.executable, str(PROGRAM), "_host-run", str(spec), *command],
+                              {"WFC_DISPATCH": dispatch_id, "WFC_STATE": str(state_dir()),
+                               **({"WFC_OWNER_TOKEN": env["WFC_OWNER_TOKEN"]} if "WFC_OWNER_TOKEN" in env else {})}, label)
         if status == NOT_SENT:
-            return backend_result(DEFINITELY_NOT_SENT, "tmux could not run")
-        return backend_result(UNCERTAIN, f"tmux did not confirm session {session_name(dispatch_id)}")
+            spec.unlink(missing_ok=True)
+            return backend_result(DEFINITELY_NOT_SENT, "tmux could not run", receipt=str(receipt))
+        if status != SENT:
+            diagnostic = host_launch.sanitize(diagnostic or f"tmux did not confirm session {session_name(dispatch_id)}", env)
+            host_launch.write_private(receipt, {"category": "unknown", "diagnostic": diagnostic, "at": time.time()})
+            return backend_result(UNCERTAIN, diagnostic, category="unknown", receipt=str(receipt))
+        deadline = time.monotonic() + 0.4
+        evidence = None
+        while time.monotonic() < deadline:
+            evidence = host_launch.read_receipt(receipt)
+            if evidence and evidence["category"] != "unknown":
+                # Observe immediate exit without equating a live terminal with a ready host.
+                time.sleep(0.3)
+                evidence = host_launch.read_receipt(receipt)
+                break
+            time.sleep(0.02)
+        if evidence and evidence["category"] == "started":
+            return backend_result("accepted", receipt=str(receipt))
+        category = evidence["category"] if evidence else "unknown"
+        return backend_result(UNCERTAIN, (evidence or {}).get("diagnostic", "host startup not confirmed"),
+                              category=category, receipt=str(receipt))
 
     def inspect(self, dispatch_id):
         session = session_name(dispatch_id)
@@ -1424,12 +1469,13 @@ class TmuxBackend(ExecutionBackend):
         session = session_name(dispatch_id)
         if host == "opencode":
             if not wait_for_quiet_screen(session):
-                return backend_result(DEFINITELY_NOT_SENT, "worker screen did not become ready")
-            return self.submit(dispatch_id, text or "", host)
+                return backend_result(UNCERTAIN, "worker screen did not become ready", receipt=created.get("receipt"))
+            return {**self.submit(dispatch_id, text or "", host), "receipt": created.get("receipt")}
         if host == "codex" and probe_read_only:
             notice = new_notice(session, [], seconds_setting("WFC_RESUME_CHECK_SECONDS", 5))
             if notice:
                 return backend_result("refused", notice, category="permission_required", notice=notice, legacy=READ_ONLY,
+                                      receipt=created.get("receipt"),
                                       recovery=f"tmux session {session} refused the brief: {notice}; dispatch a new worker")
         return created
 
@@ -1715,7 +1761,7 @@ def lifecycle_generation(db, dispatch_id):
 
 def require_no_unresolved_lifecycle(db, dispatch_id):
     event = db.execute("SELECT id, operation, result, diagnostic FROM lifecycle_event WHERE dispatch = ? "
-        "AND operation IN ('interrupt', 'close', 'handoff', 'resume') AND result IN ('pending', 'uncertain') "
+        "AND operation IN ('create', 'interrupt', 'close', 'handoff', 'resume') AND result IN ('pending', 'uncertain') "
                        "ORDER BY id DESC LIMIT 1", (dispatch_id,)).fetchone()
     if event:
         raise SystemExit(json.dumps({"error": "lifecycle_reconcile_required", "dispatch": dispatch_id,
@@ -1724,9 +1770,10 @@ def require_no_unresolved_lifecycle(db, dispatch_id):
                                     ensure_ascii=False))
 
 
-def _set_lifecycle_result(db, event_id, dispatch_id, result, diagnostic=None, state=None, owner_credential=None):
+def _set_lifecycle_result(db, event_id, dispatch_id, result, diagnostic=None, state=None, owner_credential=None,
+                          launch_result=None):
     db.execute("BEGIN IMMEDIATE")
-    event = db.execute("SELECT operation, owner_generation FROM lifecycle_event WHERE id = ? AND dispatch = ?",
+    event = db.execute("SELECT operation, owner_generation, to_attempt, created FROM lifecycle_event WHERE id = ? AND dispatch = ?",
                        (event_id, dispatch_id)).fetchone()
     if event is None:
         db.execute("ROLLBACK")
@@ -1738,6 +1785,15 @@ def _set_lifecycle_result(db, event_id, dispatch_id, result, diagnostic=None, st
         raise SystemExit(json.dumps({"error": "stale_controller_owner", "operation": event["operation"],
                                      "scope": scope, "generation": event["owner_generation"]}, ensure_ascii=False))
     finish_lifecycle_event(db, event_id, result, diagnostic)
+    if launch_result is not None:
+        if result == "accepted":
+            clear_input_fault(db, dispatch_id, event["created"])
+        db.execute("UPDATE dispatch SET launch_receipt = ? WHERE id = ? AND current_attempt = ?",
+                   (launch_result.get("receipt"), dispatch_id, event["to_attempt"]))
+        if launch_result.get("category"):
+            db.execute("INSERT OR REPLACE INTO fault_event (dispatch, operation, outcome, category, diagnostic, created) "
+                       "VALUES (?, 'launch', ?, ?, ?, ?)",
+                       (dispatch_id, result, launch_result["category"], diagnostic, time.time()))
     if state:
         current = db.execute("SELECT current_round, current_attempt FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
         db.execute("UPDATE dispatch_round SET state = ?, completed = CASE WHEN ? IN ('cancelled', 'completed') THEN ? ELSE completed END "
@@ -1847,7 +1903,7 @@ def cmd_reconcile(args):
         db.execute("BEGIN IMMEDIATE")
         current_owner = require_owner(db, row["scope"], owner_token(args), "reconcile")
         event = db.execute("SELECT * FROM lifecycle_event WHERE id = ? AND dispatch = ? "
-                           "AND operation IN ('interrupt', 'close', 'handoff', 'resume')",
+                           "AND operation IN ('create', 'interrupt', 'close', 'handoff', 'resume')",
                            (args.audit, args.dispatch)).fetchone()
         if event is None:
             db.execute("ROLLBACK")
@@ -1871,7 +1927,7 @@ def cmd_reconcile(args):
         if current["attempt"] != expected_attempt:
             db.execute("ROLLBACK")
             raise SystemExit(f"handoff audit {args.audit} is no longer the current attempt")
-        if args.result == "accepted" and event["operation"] in ("handoff", "resume"):
+        if args.result == "accepted" and event["operation"] in ("create", "handoff", "resume"):
             state = "running"
         elif args.result == "accepted" and event["operation"] == "close":
             state = "cancelled"
@@ -1879,6 +1935,9 @@ def cmd_reconcile(args):
             state = "unknown"
         finish_lifecycle_event(db, event["id"], args.result,
                                f"reconciled by {args.actor}: {args.evidence}", args.actor, args.evidence)
+        if args.result == "accepted" and event["operation"] in ("create", "handoff", "resume"):
+            db.execute("DELETE FROM fault_event WHERE dispatch = ? AND operation IN ('create', 'launch') "
+                       "AND category = 'unknown'", (args.dispatch,))
         db.execute("UPDATE dispatch_round SET state = ?, completed = CASE WHEN ? = 'unknown' THEN ? ELSE completed END "
                    "WHERE dispatch = ? AND round = ? AND attempt = ?",
                    (state, state, time.time(), args.dispatch, event["round"], expected_attempt))
@@ -1950,8 +2009,10 @@ def cmd_handoff(args):
                          attempt=attempt, owner=bool(controller)),
             [state_dir(), Path(row["report_dir"])], Path(row["cwd"]), args.model or row["model"], host_session,
             effort=row["effort"], network=bool(row["network"]), label=row["label"], git=bool(row["git"]))
+        command, extra_env = host_launch.configure(args.host, command, extra_env, row["launch_config"])
+        extra_env.update(WFC_DISPATCH=args.dispatch, WFC_STATE=str(state_dir()))
         if controller:
-            extra_env = {**extra_env, "WFC_OWNER_TOKEN": controller["token"]}
+            extra_env["WFC_OWNER_TOKEN"] = controller["token"]
         db.execute("BEGIN IMMEDIATE")
         require_owner(db, row["scope"], owner_token(args), "handoff")
         latest, _ = _current_attempt(db, args.dispatch)
@@ -1994,13 +2055,13 @@ def cmd_handoff(args):
         result, diagnostic = resumed["result"], resumed.get("diagnostic")
         if result != "accepted":
             _set_lifecycle_result(db, event, args.dispatch, result, diagnostic, state="unknown",
-                                  owner_credential=owner_token(args))
+                                  owner_credential=owner_token(args), launch_result=resumed)
             emit({"dispatch": args.dispatch, "operation": "handoff", "result": result,
                   "fromAttempt": current["attempt"], "attempt": attempt, "host": args.host,
                   **({"diagnostic": diagnostic} if diagnostic else {})})
             return
         _set_lifecycle_result(db, event, args.dispatch, "accepted", state="running",
-                              owner_credential=owner_token(args))
+                              owner_credential=owner_token(args), launch_result=resumed)
     emit({"dispatch": args.dispatch, "operation": "handoff", "result": "accepted",
           "fromAttempt": current["attempt"], "attempt": attempt, "host": args.host,
           "round": next_round})
@@ -2083,13 +2144,22 @@ def canonical_status(db, row, legacy_state, last, alive, watch):
         fault = {"category": persisted_fault["category"], "kind": persisted_fault["outcome"],
                  "diagnostic": persisted_fault["diagnostic"], "operation": persisted_fault["operation"],
                  "requiresDecision": True}
-        status = "unknown"
+        status = "failed" if persisted_fault["category"] in ("executable_missing", "runtime_missing", "permission_denied", "process_exited") else "unknown"
     if latest_type in ("blocked", "stalled", "unknown", "exited", "failed", "fault"):
         stored_fault = body.get("fault") if isinstance(body.get("fault"), dict) else None
         kind = body.get("kind") or latest_type
         diagnostic = body.get("message") or body.get("reason") or body.get("screen")
         fault = stored_fault or {"category": fault_category(kind, diagnostic), "kind": kind,
                                  "diagnostic": diagnostic, "requiresDecision": True}
+    launch = host_launch.read_receipt(row["launch_receipt"])
+    reconciled_launch = bool(launch and launch["category"] == "unknown" and db.execute(
+        "SELECT 1 FROM lifecycle_event WHERE dispatch = ? AND to_attempt = ? "
+        "AND operation IN ('create', 'resume', 'handoff') AND result = 'accepted' AND resolved_at IS NOT NULL",
+        (row["id"], current["current_attempt"])).fetchone())
+    if launch and launch["category"] != "started" and not reconciled_launch and status not in ("completed", "cancelled", "reclaimed"):
+        fault = {"category": launch["category"], "kind": "host_launch", "diagnostic": launch["diagnostic"],
+                 "operation": "launch", "requiresDecision": True}
+        status = "unknown" if launch["category"] == "unknown" else "failed"
     host_active = bool(alive and status in ("online", "waiting-human") and not idle)
     activity = "active" if host_active else ("idle" if alive else "unknown")
     return status, {"processOnline": bool(alive), "online": bool(alive), "hostActive": host_active,
@@ -2126,7 +2196,7 @@ def cmd_status(args):
         emit({"state": str(state_dir()), "dispatches": [], **({"reclaimable": []} if args.active else {}),
               "undelivered": [], "waiters": []})
         return
-    query = "SELECT * FROM dispatch WHERE started IS NOT NULL" + (" AND id = ?" if args.dispatch else "") + " ORDER BY created"
+    query = "SELECT * FROM dispatch WHERE (started IS NOT NULL OR id IN (SELECT dispatch FROM fault_event WHERE operation = 'create'))" + (" AND id = ?" if args.dispatch else "") + " ORDER BY created"
     rows = db.execute(query, (args.dispatch,) if args.dispatch else ()).fetchall()
     if args.dispatch and not rows:
         raise SystemExit(f"unknown dispatch {args.dispatch} in {state_dir()}")
@@ -2157,6 +2227,7 @@ def cmd_status(args):
                 # the stable state contract exposed here.
                 "canonicalStates": ["running", "online", "waiting-human", "blocked", "unknown",
                                     "completed", "failed", "cancelled", "reclaimed"], "signals": signals,
+                "launch": host_launch.read_receipt(row["launch_receipt"]),
                 "backendResult": inspection["result"],
                 "tmux": session_name(row["id"]), "tmuxAlive": alive,
                 "cwd": row["cwd"], "task": row["task"], "report": row["report"], "started": local_time(row["started"]),
@@ -2347,8 +2418,10 @@ def cmd_resume(args):
                                                 row["model"], host_session, resume=True,
                                                 effort=row["effort"], network=bool(row["network"]), label=row["label"],
                                                 git=bool(row["git"]))
+    command, extra_env = host_launch.configure(row["host"], command, extra_env, row["launch_config"])
+    extra_env.update(WFC_DISPATCH=args.dispatch, WFC_STATE=str(state_dir()))
     if controller:
-        extra_env = {**extra_env, "WFC_OWNER_TOKEN": controller["token"]}
+        extra_env["WFC_OWNER_TOKEN"] = controller["token"]
     # From the locked re-check to the last keystroke under the input lock (taken before the SQLite
     # lock, as everywhere), so no nudge, done or continue can come between the launch and the brief.
     with input_lock(args.dispatch):
@@ -2419,7 +2492,7 @@ def cmd_resume(args):
         result, diagnostic = resumed["result"], resumed.get("diagnostic")
         if result != "accepted":
             _set_lifecycle_result(db, resume_event, args.dispatch, result, diagnostic, state="unknown",
-                                  owner_credential=owner_token(args))
+                                  owner_credential=owner_token(args), launch_result=resumed)
             legacy = resumed.get("legacy")
             if legacy:
                 persist_input_fault(db, args.dispatch, "resume", legacy, diagnostic, resumed.get("category"))
@@ -2430,7 +2503,7 @@ def cmd_resume(args):
             raise SystemExit(diagnostic or f"resume returned {result} for {args.dispatch}")
         clear_input_fault(db, args.dispatch, input_started)
         _set_lifecycle_result(db, resume_event, args.dispatch, "accepted", state="running",
-                              owner_credential=owner_token(args))
+                              owner_credential=owner_token(args), launch_result=resumed)
     emit({"resumed": args.dispatch, "operation": "resume", "result": "accepted",
           "session": host_session, "tmux": session, "round": next_round, "attempt": attempt})
 
@@ -2985,6 +3058,8 @@ def cmd_relay(args):
 
 
 def main(argv):
+    if argv[:1] == ["_host-run"]:
+        return host_launch.supervise(argv[1])
     parser = argparse.ArgumentParser(prog="router.py", allow_abbrev=False)
     sub = parser.add_subparsers(dest="command", required=True)
     add_parser = sub.add_parser
@@ -2993,6 +3068,7 @@ def main(argv):
     p.add_argument("--host", required=True, choices=sorted(LAUNCHERS))
     p.add_argument("--backend", choices=sorted(BACKENDS), default="tmux",
                    help="execution backend (stored with the dispatch; default: tmux)")
+    p.add_argument("--launch-config", help="JSON host argv/runtime/environment configuration (overrides WFC_LAUNCH_CONFIG)")
     p.add_argument("--task", required=True)
     p.add_argument("--cwd", required=True)
     p.add_argument("--report", required=True, help="report path; its directory is made writable for the worker")

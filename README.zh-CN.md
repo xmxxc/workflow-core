@@ -128,6 +128,8 @@ tmux attach -t wfc-d-1a2b3c4d   # 按 Ctrl-b d 离开
 
 命令的结果以 JSON 输出；例如 `dispatch` 会输出 dispatch id、标签和 tmux 会话名。
 
+宿主命令路径、runtime argv、环境优先级与启动诊断见 [宿主启动配置](docs/host-launch.md)。桌面、后台 shell 或既有 tmux server 的 PATH 不同时，可使用 `dispatch --launch-config launch.json` 或 `WFC_LAUNCH_CONFIG`。
+
 ## 支持的宿主
 
 | | Codex | Claude Code | OpenCode |

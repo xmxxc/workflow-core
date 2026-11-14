@@ -146,6 +146,8 @@ Commands print their result as JSON; `dispatch`, for one, prints the dispatch id
 
 Pin `--model` for OpenCode: its default model can be a rate-limited free one.
 
+Host executable paths, explicit runtime argv, environment precedence and launch diagnostics are documented in [Host launch configuration](docs/host-launch.md). Use `dispatch --launch-config launch.json` or `WFC_LAUNCH_CONFIG` when a desktop/background shell or an existing tmux server has a different PATH.
+
 ## Command reference
 
 ```sh
