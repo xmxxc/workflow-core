@@ -11,6 +11,7 @@ import argparse
 import collections
 import calendar
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -55,13 +56,22 @@ def session_name(dispatch_id):
 
 # Each table's columns as a fresh database creates them.
 TABLES = {
+    "controller_owner": "scope TEXT PRIMARY KEY, owner TEXT NOT NULL, token TEXT NOT NULL, generation INTEGER NOT NULL DEFAULT 1, lease_until REAL NOT NULL, updated REAL NOT NULL",
     "dispatch": "id TEXT PRIMARY KEY, host TEXT, cwd TEXT, task TEXT, created REAL, scope TEXT, role TEXT, current_round INTEGER DEFAULT 1, current_attempt TEXT",
     "dispatch_round": "dispatch TEXT, round INTEGER, attempt TEXT, task TEXT, report TEXT, state TEXT DEFAULT 'running', result TEXT, created REAL, completed REAL, PRIMARY KEY (dispatch, round, attempt)",
     "message": "id INTEGER PRIMARY KEY AUTOINCREMENT, dispatch TEXT, recipient TEXT, "
-               "type TEXT, body TEXT, created REAL, delivered INTEGER DEFAULT 0",
+               "type TEXT, body TEXT, created REAL, delivered INTEGER DEFAULT 0, "
+               "message_uid TEXT, request_key TEXT, body_hash TEXT, state TEXT DEFAULT 'unsent', "
+               "status_version INTEGER DEFAULT 1",
+    "message_resolution": "id INTEGER PRIMARY KEY AUTOINCREMENT, message INTEGER, actor TEXT, source TEXT, "
+                          "reason TEXT, evidence TEXT, body_hash TEXT, from_state TEXT, to_state TEXT, created REAL",
     "screen_watch": "dispatch TEXT PRIMARY KEY, screen TEXT, since REAL, reported_screen TEXT",
     "host_error": "dispatch TEXT PRIMARY KEY, turn TEXT",
     "fault_event": "dispatch TEXT PRIMARY KEY, operation TEXT, outcome TEXT, category TEXT, diagnostic TEXT, created REAL",
+    # Durable lifecycle operations are separate from worker/controller messages.  An
+    # operation can cross a tmux boundary after the router has committed its fencing
+    # decision, so its pending/accepted/uncertain result must survive a router restart.
+    "lifecycle_event": "id INTEGER PRIMARY KEY AUTOINCREMENT, dispatch TEXT, operation TEXT, round INTEGER, attempt TEXT, from_attempt TEXT, to_attempt TEXT, from_host TEXT, to_host TEXT, result TEXT, diagnostic TEXT, owner_generation INTEGER, owner_token TEXT, resolver_actor TEXT, resolution_evidence TEXT, resolved_at REAL, created REAL",
     "waiter": "pid INTEGER PRIMARY KEY, kind TEXT, since REAL",
 }
 # Column upgrades: `started` is set once the worker's tmux session exists (the watchdog ignores
@@ -75,6 +85,11 @@ ADDED_COLUMNS = {
     "dispatch": {"started": "REAL", "report_dir": "TEXT", "report": "TEXT", "model": "TEXT", "host_session": "TEXT",
                  "effort": "TEXT", "network": "INTEGER", "label": "TEXT", "git": "INTEGER",
                  "scope": "TEXT", "role": "TEXT", "current_round": "INTEGER", "current_attempt": "TEXT"},
+    "message": {"message_uid": "TEXT", "request_key": "TEXT", "body_hash": "TEXT",
+                "state": "TEXT", "status_version": "INTEGER", "resolver_actor": "TEXT",
+                "resolution_source": "TEXT", "resolution_reason": "TEXT", "resolution_evidence": "TEXT",
+                "resolved_at": "REAL"},
+    "lifecycle_event": {"owner_generation": "INTEGER", "owner_token": "TEXT", "resolver_actor": "TEXT", "resolution_evidence": "TEXT", "resolved_at": "REAL"},
     "waiter": {"process_start": "TEXT"},
 }
 
@@ -107,6 +122,30 @@ def connect():
         except BaseException:
             db.execute("ROLLBACK")
             raise
+    # Older message rows predate the receipt ledger. Serialize identity allocation and
+    # state repair so concurrent first-use commands cannot return different UUIDs.
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        for message in db.execute("SELECT id, body, message_uid, body_hash, delivered, state, status_version FROM message").fetchall():
+            state = message["state"]
+        # A committed DDL default can expose delivered=1/state=unsent before the
+        # backfill ran. Reconcile the old delivery bit on every startup.
+            if message["delivered"] and state == "unsent":
+                state = "received"
+            elif not message["delivered"] and state == "received":
+                state = "unsent"
+            repaired = state != message["state"]
+            if message["message_uid"] and message["body_hash"] and state and message["status_version"] and not repaired:
+                continue
+            db.execute("UPDATE message SET message_uid = ?, body_hash = ?, state = ?, status_version = ? WHERE id = ?",
+                       (message["message_uid"] or "m-" + uuid.uuid4().hex,
+                        message["body_hash"] or hashlib.sha256(message["body"].encode()).hexdigest(),
+                        state or ("received" if message["delivered"] else "unsent"),
+                        (message["status_version"] or 1) + int(repaired), message["id"]))
+        db.execute("COMMIT")
+    except BaseException:
+        db.execute("ROLLBACK")
+        raise
     db.execute("BEGIN IMMEDIATE")
     try:
         backfill_dispatch_identity(db)
@@ -169,6 +208,88 @@ def connect_read_only():
     return db, bool(set(TABLES) - existing or missing)
 
 
+OWNER_LEASE = 60.0
+
+
+def owner_token(args=None):
+    return (getattr(args, "owner_token", None) if args is not None else None) or os.environ.get("WFC_CONTROLLER_TOKEN") or os.environ.get("WFC_OWNER_TOKEN")
+
+
+def owner_scope(db, dispatch_id):
+    row = db.execute("SELECT scope FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
+    return row["scope"] if row else None
+
+
+def require_owner(db, scope, token, operation):
+    """Reject stale controller credentials while retaining compatibility with old scopes."""
+    row = db.execute("SELECT * FROM controller_owner WHERE scope = ?", (scope,)).fetchone()
+    if row is None:
+        return None
+    active = row["lease_until"] > time.time()
+    if not token or token != row["token"] or not active:
+        raise SystemExit(json.dumps({"error": "stale_controller_owner", "operation": operation,
+                                     "scope": scope, "owner": row["owner"], "generation": row["generation"],
+                                     "active": active, "leaseUntil": local_time(row["lease_until"])}, ensure_ascii=False))
+    return row
+
+
+def preflight_controller(db, scope, token, operation):
+    """Fence a controller before any watchdog scan or message claim."""
+    if scope:
+        return require_owner(db, scope, token, operation)
+    if db.execute("SELECT 1 FROM controller_owner LIMIT 1").fetchone():
+        raise SystemExit(json.dumps({"error": "controller_owner_required", "operation": operation}))
+    return None
+
+
+def cmd_owner(args):
+    db = connect()
+    scope = clean_label(args.scope or "")
+    if not scope:
+        raise SystemExit("--scope is required")
+    now = time.time()
+    lease = now + args.lease
+    db.execute("BEGIN IMMEDIATE")
+    current = db.execute("SELECT * FROM controller_owner WHERE scope = ?", (scope,)).fetchone()
+    # takeover and expired acquire always fence the previous credential; only an
+    # explicitly supplied token may be reused.
+    token = args.token or (owner_token(args) if args.owner_action == "renew" else None) or ("ct-" + uuid.uuid4().hex)
+    if args.owner_action == "acquire":
+        if current and current["lease_until"] > now:
+            db.execute("ROLLBACK")
+            raise SystemExit(json.dumps({"error": "scope_owned", "scope": scope, "owner": current["owner"],
+                                         "generation": current["generation"]}))
+        if current and token == current["token"]:
+            db.execute("ROLLBACK")
+            raise SystemExit(json.dumps({"error": "owner_token_conflict", "operation": "acquire",
+                                         "scope": scope, "generation": current["generation"]}))
+        generation = (current["generation"] + 1) if current else 1
+        db.execute("INSERT OR REPLACE INTO controller_owner(scope, owner, token, generation, lease_until, updated) VALUES (?, ?, ?, ?, ?, ?)",
+                   (scope, args.owner, token, generation, lease, now))
+    elif args.owner_action == "takeover":
+        if current and token == current["token"]:
+            db.execute("ROLLBACK")
+            raise SystemExit(json.dumps({"error": "owner_token_conflict", "operation": "takeover",
+                                         "scope": scope, "generation": current["generation"]}))
+        generation = (current["generation"] + 1) if current else 1
+        db.execute("INSERT OR REPLACE INTO controller_owner(scope, owner, token, generation, lease_until, updated) VALUES (?, ?, ?, ?, ?, ?)",
+                   (scope, args.owner, token, generation, lease, now))
+    else:
+        if not current or current["token"] != token or current["lease_until"] <= now:
+            db.execute("ROLLBACK")
+            raise SystemExit(json.dumps({"error": "stale_controller_owner", "operation": "renew", "scope": scope,
+                                         "owner": current["owner"] if current else None,
+                                         "generation": current["generation"] if current else None,
+                                         "active": bool(current and current["lease_until"] > now),
+                                         "leaseUntil": local_time(current["lease_until"]) if current else None}))
+        generation = current["generation"]
+        token = current["token"]
+        db.execute("UPDATE controller_owner SET lease_until = ?, updated = ? WHERE scope = ?", (lease, now, scope))
+    db.execute("COMMIT")
+    emit({"scope": scope, "owner": args.owner, "token": token, "generation": generation,
+          "leaseUntil": local_time(lease), "action": args.owner_action})
+
+
 def emit(obj):
     print(json.dumps(obj, ensure_ascii=False))
 
@@ -176,16 +297,20 @@ def emit(obj):
 FIRST_BRIEF = "You are a worker dispatched by the controller"
 
 
-def worker_brief(dispatch_id, task, report, opening=FIRST_BRIEF, attempt=None):
+def worker_brief(dispatch_id, task, report, opening=FIRST_BRIEF, attempt=None, owner=False):
     router = f"{shlex.quote(sys.executable)} {shlex.quote(str(PROGRAM))}"
+    owner_arg = ' --owner-token "$WFC_OWNER_TOKEN"' if owner else ""
+    attempt_arg = " --attempt " + shlex.quote(attempt) if attempt else ""
+    message_arg = (" --message-id done:" + shlex.quote(dispatch_id) + ":" + shlex.quote(attempt)
+                   if attempt else "")
     return (f"{opening} (dispatch {dispatch_id}). "
             f"Read and do the task in {shlex.quote(str(task))}. "
             f"Stop any server or background process you started before you report. "
             f"When the task is finished, write your report and run: "
             f"{router} done --report {shlex.quote(str(report))}"
-            f"{(' --attempt ' + shlex.quote(attempt)) if attempt else ''}. "
+            f"{owner_arg}{attempt_arg}{message_arg}; "
             f"If you need a decision, run: {router} ask \"<question>\" [--options a,b]"
-            f"{(' --attempt ' + shlex.quote(attempt)) if attempt else ''}, then end your turn; "
+            f"{owner_arg}{attempt_arg}; then end your turn; "
             f"the answer arrives as your next message. Never ask questions in plain text "
             f"or with an interactive question tool; nobody watches this window.")
 
@@ -516,6 +641,9 @@ def cmd_dispatch(args):
     db = connect()
     dispatch_id = "d-" + uuid.uuid4().hex[:8]
     scope = clean_label(args.scope or "") or "s-" + uuid.uuid4().hex[:8]
+    db.execute("BEGIN IMMEDIATE")
+    controller = db.execute("SELECT token FROM controller_owner WHERE scope = ?", (scope,)).fetchone()
+    require_owner(db, scope, owner_token(args), "dispatch")
     cwd = Path(args.cwd).resolve()
     task = Path(args.task).resolve()
     report = Path(args.report).resolve()
@@ -525,9 +653,12 @@ def cmd_dispatch(args):
     label = clean_label(args.label or "") or default_label(cwd, report)
     role = clean_label(args.role or "") or readable(report.parent.name).rpartition("-")[2] or "worker"
     attempt = "a-" + uuid.uuid4().hex[:12]
-    command, extra_env = LAUNCHERS[args.host](worker_brief(dispatch_id, task, report, attempt=attempt),
+    command, extra_env = LAUNCHERS[args.host](worker_brief(dispatch_id, task, report, attempt=attempt,
+                                                           owner=bool(controller)),
                                               [state_dir(), report.parent], cwd, args.model, host_session,
                                               effort=args.effort, network=args.network, label=label, git=args.git)
+    if controller:
+        extra_env = {**extra_env, "WFC_OWNER_TOKEN": controller["token"]}
     ignored = [note for option, note in IGNORED_OPTIONS.get(args.host, {}).items() if getattr(args, option)]
     trusted_by = trust_claude_worktree(cwd) if args.host == "claude" else None
     created = time.time()
@@ -541,8 +672,10 @@ def cmd_dispatch(args):
     if launched == NOT_SENT:
         db.execute("DELETE FROM dispatch_round WHERE dispatch = ?", (dispatch_id,))
         db.execute("DELETE FROM dispatch WHERE id = ?", (dispatch_id,))
+        db.execute("COMMIT")
         raise SystemExit("could not start the worker's tmux session; is tmux installed and on PATH?")
     db.execute("UPDATE dispatch SET started = ? WHERE id = ?", (time.time(), dispatch_id))
+    db.execute("COMMIT")
     if launched == UNCERTAIN:
         # Keep the record: a live worker must still be able to report. The watchdog reports
         # `exited` if no session is there.
@@ -631,10 +764,79 @@ def current_dispatch(db):
     return dispatch_id
 
 
-def post(db, dispatch_id, recipient, type_, body):
-    cur = db.execute("INSERT INTO message (dispatch, recipient, type, body, created) VALUES (?, ?, ?, ?, ?)",
-                     (dispatch_id, recipient, type_, json.dumps(body, ensure_ascii=False), time.time()))
+def post(db, dispatch_id, recipient, type_, body, request_key=None):
+    """Append a message, or replay the existing receipt for the same request key.
+
+    A key is the caller's stable idempotency identity. Reusing it with another payload is
+    a conflict; reusing it with the same payload returns the original message id.
+    """
+    encoded = json.dumps(body, ensure_ascii=False, sort_keys=True)
+    digest = hashlib.sha256(encoded.encode()).hexdigest()
+    if request_key:
+        prior = db.execute("SELECT id, body_hash FROM message WHERE dispatch = ? AND request_key = ?",
+                           (dispatch_id, request_key)).fetchone()
+        if prior:
+            if prior["body_hash"] != digest:
+                raise SystemExit(f"message request {request_key} conflicts with an existing receipt")
+            return prior["id"]
+    cur = db.execute("INSERT INTO message (dispatch, recipient, type, body, created, message_uid, request_key, body_hash, state, status_version) "
+                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'unsent', 1)",
+                     (dispatch_id, recipient, type_, encoded, time.time(), "m-" + uuid.uuid4().hex,
+                      request_key, digest))
     return cur.lastrowid
+
+
+def lifecycle_event(db, dispatch_id, operation, *, round=None, attempt=None,
+                    from_attempt=None, to_attempt=None, from_host=None, to_host=None,
+                    result="pending", diagnostic=None, owner_generation=None, owner_token=None):
+    """Append an auditable control-plane operation and return its id.
+
+    The event is deliberately independent of ``message``: interrupt/close/handoff
+    may have no worker message to deliver, and their external tmux result can be
+    updated after the fencing transaction has committed.
+    """
+    if owner_generation is None or owner_token is None:
+        owner = db.execute("SELECT o.generation, o.token FROM controller_owner o JOIN dispatch d ON d.scope = o.scope "
+                           "WHERE d.id = ?", (dispatch_id,)).fetchone()
+        if owner:
+            owner_generation = owner_generation if owner_generation is not None else owner["generation"]
+            owner_token = owner_token if owner_token is not None else owner["token"]
+    cur = db.execute(
+        "INSERT INTO lifecycle_event (dispatch, operation, round, attempt, from_attempt, to_attempt, "
+        "from_host, to_host, result, diagnostic, owner_generation, owner_token, created) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (dispatch_id, operation, round, attempt, from_attempt, to_attempt, from_host, to_host,
+         result, diagnostic, owner_generation, owner_token, time.time()))
+    return cur.lastrowid
+
+
+def finish_lifecycle_event(db, event_id, result, diagnostic=None, actor=None, evidence=None):
+    db.execute("UPDATE lifecycle_event SET result = ?, diagnostic = COALESCE(?, diagnostic), "
+               "resolver_actor = COALESCE(?, resolver_actor), resolution_evidence = COALESCE(?, resolution_evidence), "
+               "resolved_at = CASE WHEN ? IS NULL THEN resolved_at ELSE ? END WHERE id = ?",
+               (result, diagnostic, actor, evidence, actor, time.time(), event_id))
+
+
+def lifecycle_view(row):
+    return {"id": row["id"], "operation": row["operation"], "round": row["round"],
+            "attempt": row["attempt"], "fromAttempt": row["from_attempt"], "toAttempt": row["to_attempt"],
+            "fromHost": row["from_host"], "toHost": row["to_host"], "result": row["result"],
+            **({"diagnostic": row["diagnostic"]} if row["diagnostic"] else {}),
+            **({"resolution": {"actor": row["resolver_actor"], "evidence": row["resolution_evidence"],
+                                "at": local_time(row["resolved_at"])}} if row["resolver_actor"] else {}),
+            "at": local_time(row["created"])}
+
+
+def receipt_response(db, message_id, duplicate=False):
+    row = db.execute("SELECT * FROM message WHERE id = ?", (message_id,)).fetchone()
+    result = {"message": row["id"], "messageId": row["message_uid"],
+            "state": row["state"] or ("received" if row["delivered"] else "unsent"),
+            "statusVersion": row["status_version"] or 1, "duplicate": bool(duplicate)}
+    if row["resolver_actor"]:
+        result["resolution"] = {"actor": row["resolver_actor"], "source": row["resolution_source"],
+                                "reason": row["resolution_reason"], "evidence": row["resolution_evidence"],
+                                "at": local_time(row["resolved_at"])}
+    return result
 
 
 def cmd_done(args):
@@ -643,10 +845,24 @@ def cmd_done(args):
         raise SystemExit(f"report not found: {report}")
     db = connect()
     dispatch_id = current_dispatch(db)
+    require_owner(db, owner_scope(db, dispatch_id), owner_token(args), "done")
+    request_key = args.message_id or (("done:" + dispatch_id + ":" + args.attempt) if args.attempt else None)
+    # Resolve an existing stable receipt before reading volatile worktree metadata.
+    # A retry must return its original head/dirty snapshot even if the worktree moved.
+    if request_key:
+        prior = db.execute("SELECT * FROM message WHERE dispatch = ? AND request_key = ?",
+                           (dispatch_id, request_key)).fetchone()
+        if prior:
+            old = json.loads(prior["body"])
+            if old.get("report") != str(report):
+                raise SystemExit(f"message request {request_key} conflicts with an existing receipt")
+            emit(receipt_response(db, prior["id"], duplicate=True))
+            return
     # Read before any lock: git may be slow, and it reads the worktree, not router.db.
     head = worktree_head(db.execute("SELECT cwd FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()["cwd"])
     with input_lock(dispatch_id):  # a nudge being typed lands before this done, as recorded
-        return finish_round(db, dispatch_id, report, head, expected_attempt=args.attempt)
+        return finish_round(db, dispatch_id, report, head, expected_attempt=args.attempt,
+                            request_key=request_key, owner_credential=owner_token(args))
 
 
 GIT_TIMEOUT = 5
@@ -673,9 +889,25 @@ def worktree_head(cwd):
     return {"head": head, "dirty": dirty}
 
 
-def finish_round(db, dispatch_id, report, head, expected_attempt=None):
+def finish_round(db, dispatch_id, report, head, expected_attempt=None, request_key=None, owner_credential=None):
     db.execute("BEGIN IMMEDIATE")
+    scope_check = db.execute("SELECT scope FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()["scope"]
+    require_owner(db, scope_check, owner_credential, "done")
     current_row = db.execute("SELECT report, current_round, current_attempt FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
+    scope, role = db.execute("SELECT scope, role FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
+    if request_key:
+        prior = db.execute("SELECT * FROM message WHERE dispatch = ? AND request_key = ?",
+                           (dispatch_id, request_key)).fetchone()
+        if prior:
+            old = json.loads(prior["body"])
+            candidate = {"report": str(report), "scope": scope, "role": role,
+                         "round": old.get("round"), "attempt": old.get("attempt"), **head}
+            if prior["body_hash"] != hashlib.sha256(json.dumps(candidate, ensure_ascii=False, sort_keys=True).encode()).hexdigest():
+                db.execute("ROLLBACK")
+                raise SystemExit(f"message request {request_key} conflicts with an existing receipt")
+            db.execute("ROLLBACK")
+            emit({**receipt_response(db, prior["id"], duplicate=True)})
+            return
     attempts = db.execute("SELECT COUNT(*) FROM dispatch_round WHERE dispatch = ?", (dispatch_id,)).fetchone()[0]
     same_report = db.execute("SELECT COUNT(*) FROM dispatch_round WHERE dispatch = ? AND report = ?",
                              (dispatch_id, current_row["report"])).fetchone()[0]
@@ -684,19 +916,26 @@ def finish_round(db, dispatch_id, report, head, expected_attempt=None):
         raise SystemExit(f"attempt {expected_attempt or '(missing)'} is no longer accepted for {dispatch_id}; "
                          f"current attempt is {current_row['current_attempt']}")
     current = current_row["report"]
+    current_round = db.execute(
+        "SELECT state FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
+        (dispatch_id, current_row["current_round"], current_row["current_attempt"])).fetchone()
+    if (current_round is None or current_round["state"] != "running") and not (
+            current_round and current_round["state"] == "completed" and current and str(report) == current):
+        db.execute("ROLLBACK")
+        raise SystemExit(f"attempt {expected_attempt or current_row['current_attempt']} is no longer accepted for {dispatch_id}; "
+                         f"its state is {current_round['state'] if current_round else 'unknown'}")
     # A retried `done` from an earlier round must not finish the round that followed it.
     if current and str(report) != current:
         db.execute("ROLLBACK")
         raise SystemExit(f"{report} is the report of an earlier round; the current round reports to {current}")
-    message_id = post(db, dispatch_id, "controller", "done", {"report": str(report),
-        "scope": db.execute("SELECT scope FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()[0],
-        "role": db.execute("SELECT role FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()[0],
-        "round": current_row["current_round"], "attempt": current_row["current_attempt"], **head})
+    body = {"report": str(report), "scope": scope, "role": role,
+        "round": current_row["current_round"], "attempt": current_row["current_attempt"], **head}
+    message_id = post(db, dispatch_id, "controller", "done", body, request_key=request_key)
     db.execute("UPDATE dispatch_round SET state = 'completed', result = ?, completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?",
                (json.dumps({"report": str(report), **head}, ensure_ascii=False), time.time(), dispatch_id,
                 current_row["current_round"], current_row["current_attempt"]))
     db.execute("COMMIT")
-    emit({"message": message_id})
+    emit(receipt_response(db, message_id))
 
 
 def cmd_ask(args):
@@ -704,10 +943,36 @@ def cmd_ask(args):
     options = [o for o in (args.options or "").split(",") if o]
     dispatch_id = current_dispatch(db)
     db.execute("BEGIN IMMEDIATE")
+    require_owner(db, owner_scope(db, dispatch_id), owner_token(args), "ask")
     identity = db.execute("SELECT scope, role, current_round, current_attempt, report FROM dispatch WHERE id = ?",
                           (dispatch_id,)).fetchone()
+    body = {"question": args.question, "options": options, "scope": identity["scope"],
+            "role": identity["role"], "round": identity["current_round"],
+            "attempt": identity["current_attempt"]}
+    request_key = args.message_id
+    if not request_key and args.attempt:
+        request_key = "ask:" + dispatch_id + ":" + args.attempt + ":" + hashlib.sha256(
+            json.dumps({"question": args.question, "options": options}, sort_keys=True).encode()).hexdigest()[:16]
+    if request_key:
+        prior = db.execute("SELECT * FROM message WHERE dispatch = ? AND request_key = ?",
+                           (dispatch_id, request_key)).fetchone()
+        if prior:
+            old = json.loads(prior["body"])
+            compare = {**body, "round": old.get("round"), "attempt": old.get("attempt")}
+            if prior["body_hash"] != hashlib.sha256(json.dumps(compare, ensure_ascii=False, sort_keys=True).encode()).hexdigest():
+                db.execute("ROLLBACK")
+                raise SystemExit(f"message request {request_key} conflicts with an existing receipt")
+            db.execute("ROLLBACK")
+            emit(receipt_response(db, prior["id"], duplicate=True))
+            return
     same_report = db.execute("SELECT COUNT(*) FROM dispatch_round WHERE dispatch = ? AND report = ?",
                              (dispatch_id, identity["report"])).fetchone()[0]
+    current_round = db.execute("SELECT state FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
+                               (dispatch_id, identity["current_round"], identity["current_attempt"])).fetchone()
+    if current_round is None or current_round["state"] != "running":
+        db.execute("ROLLBACK")
+        raise SystemExit(f"attempt {args.attempt or identity['current_attempt']} is no longer accepted for {dispatch_id}; "
+                         f"its state is {current_round['state'] if current_round else 'unknown'}")
     # Missing attempt is accepted only for a truly legacy first attempt. Once the
     # dispatch has moved to another round, an old worker's question is ambiguous.
     legacy_missing = identity["current_round"] == 1 and same_report == 1
@@ -715,15 +980,82 @@ def cmd_ask(args):
         db.execute("ROLLBACK")
         raise SystemExit(f"attempt {args.attempt or '(missing)'} is no longer accepted for {dispatch_id}; "
                          f"current attempt is {identity['current_attempt']}")
-    message_id = post(db, dispatch_id, "controller", "question",
-                      {"question": args.question, "options": options, "scope": identity["scope"],
-                       "role": identity["role"], "round": identity["current_round"],
-                       "attempt": identity["current_attempt"]})
+    message_id = post(db, dispatch_id, "controller", "question", body, request_key=request_key)
     db.execute("COMMIT")
-    emit({"message": message_id, "next": "End your turn now; the answer arrives as your next message."})
+    emit({**receipt_response(db, message_id),
+          "next": "End your turn now; the answer arrives as your next message."})
+
+
+def cmd_ack(args):
+    """Mark a controller message processed. Repeating the same ACK is harmless."""
+    db = connect()
+    db.execute("BEGIN IMMEDIATE")
+    row = db.execute("SELECT * FROM message WHERE id = ? OR message_uid = ?", (args.message, args.message)).fetchone()
+    if row is None or row["recipient"] != "controller":
+        db.execute("ROLLBACK")
+        raise SystemExit(f"no controller message with id {args.message}")
+    scope = db.execute("SELECT scope FROM dispatch WHERE id = ?", (row["dispatch"],)).fetchone()["scope"]
+    require_owner(db, scope, owner_token(args), "ack")
+    if row["state"] == "processed":
+        db.execute("ROLLBACK")
+        emit({**receipt_response(db, row["id"], duplicate=True)})
+        return
+    if row["state"] != "received":
+        db.execute("ROLLBACK")
+        raise SystemExit(f"message {args.message} is {row['state']}; ACK requires received")
+    if args.body is not None:
+        digest = hashlib.sha256(args.body.encode()).hexdigest()
+        if digest != row["body_hash"]:
+            db.execute("ROLLBACK")
+            raise SystemExit(f"message {args.message} ACK conflicts with its body")
+    db.execute("UPDATE message SET state = 'processed', status_version = status_version + 1 WHERE id = ?",
+               (row["id"],))
+    db.execute("COMMIT")
+    emit(receipt_response(db, row["id"]))
+
+
+def cmd_resolve(args):
+    """Record an operator-confirmed external delivery for an unknown receipt.
+
+    This is deliberately explicit: unknown messages are never replayed automatically.
+    """
+    db = connect()
+    if not args.actor or not args.reason or not args.evidence or not args.body_hash:
+        raise SystemExit("resolve requires --actor, --reason, --evidence and --body-hash")
+    db.execute("BEGIN IMMEDIATE")
+    row = db.execute("SELECT * FROM message WHERE id = ? OR message_uid = ?", (args.message, args.message)).fetchone()
+    if row is None or row["recipient"] != "controller":
+        db.execute("ROLLBACK")
+        raise SystemExit(f"no controller message with id {args.message}")
+    if row["state"] == "received" or row["state"] == "processed":
+        same_claim = (row["resolver_actor"] == args.actor and row["resolution_source"] == args.source
+                      and row["resolution_reason"] == args.reason and row["resolution_evidence"] == args.evidence
+                      and args.body_hash == row["body_hash"])
+        if same_claim:
+            db.execute("ROLLBACK")
+            emit({**receipt_response(db, row["id"], duplicate=True)})
+            return
+        db.execute("ROLLBACK")
+        raise SystemExit(f"message {args.message} conflicts with its existing resolution")
+    if row["state"] != "unknown":
+        db.execute("ROLLBACK")
+        raise SystemExit(f"message {args.message} is {row['state']}; resolve requires unknown")
+    if args.body_hash != row["body_hash"]:
+        db.execute("ROLLBACK")
+        raise SystemExit(f"message {args.message} body hash does not match the stored receipt")
+    now = time.time()
+    db.execute("UPDATE message SET delivered = 1, state = 'received', status_version = status_version + 1, "
+               "resolver_actor = ?, resolution_source = ?, resolution_reason = ?, resolution_evidence = ?, resolved_at = ? WHERE id = ?",
+               (args.actor, args.source, args.reason, args.evidence, now, row["id"]))
+    db.execute("INSERT INTO message_resolution (message, actor, source, reason, evidence, body_hash, from_state, to_state, created) "
+               "VALUES (?, ?, ?, ?, ?, ?, 'unknown', 'received', ?)",
+               (row["id"], args.actor, args.source, args.reason, args.evidence, args.body_hash, now))
+    db.execute("COMMIT")
+    emit(receipt_response(db, row["id"]))
 
 
 SENT, NOT_SENT, UNCERTAIN, PARTIAL = "sent", "not-sent", "uncertain", "partial"
+DEFINITELY_NOT_SENT = "definitely-not-sent"
 READ_ONLY = "read-only"
 
 # What a host draws when its conversation can no longer take input. `state` texts describe the
@@ -1028,6 +1360,23 @@ def cmd_reply(args):
     answer = " ".join(args.answer.splitlines())
     # Claim the question before typing, so two concurrent replies cannot both type an answer.
     db.execute("BEGIN IMMEDIATE")
+    require_owner(db, owner_scope(db, question["dispatch"]), owner_token(args), "reply")
+    question_body = json.loads(question["body"])
+    current = db.execute("SELECT current_round, current_attempt FROM dispatch WHERE id = ?",
+                         (question["dispatch"],)).fetchone()
+    legacy_question = question_body.get("round") is None and question_body.get("attempt") is None
+    attempt_row = db.execute("SELECT state FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
+                             (question["dispatch"], question_body.get("round"), question_body.get("attempt"))).fetchone()
+    lifecycle_seen = db.execute("SELECT 1 FROM lifecycle_event WHERE dispatch = ? LIMIT 1",
+                                (question["dispatch"],)).fetchone()
+    valid_attempt = (legacy_question and current is not None and current["current_round"] == 1 and not lifecycle_seen
+                     or not legacy_question and current is not None
+                     and question_body.get("round") == current["current_round"]
+                     and question_body.get("attempt") == current["current_attempt"]
+                     and attempt_row is not None and attempt_row["state"] == "running")
+    if not valid_attempt:
+        db.execute("ROLLBACK")
+        raise SystemExit(f"question {args.message} belongs to an attempt that is no longer accepted")
     if answered(db, question["id"]):
         db.execute("ROLLBACK")
         raise SystemExit(f"question {question['id']} was already answered")
@@ -1074,6 +1423,7 @@ def cmd_continue(args):
     # concurrent `continue`s cannot both type a task. Recording first also keeps the new task's
     # `done` above its `continue`.
     db.execute("BEGIN IMMEDIATE")
+    require_owner(db, row["scope"], owner_token(args), "continue")
     if watched(db, args.dispatch) or not done_current_task(db, args.dispatch):
         db.execute("ROLLBACK")
         raise SystemExit(f"dispatch {args.dispatch} has not done its current task yet")
@@ -1134,6 +1484,7 @@ def cmd_nudge(args):
         raise SystemExit(f"tmux session {session} has ended; use `resume` instead")
     text = " ".join(args.text.splitlines())  # a newline would submit half the line
     db.execute("BEGIN IMMEDIATE")
+    require_owner(db, row["scope"], owner_token(args), "nudge")
     if done_current_task(db, args.dispatch):
         db.execute("ROLLBACK")
         raise SystemExit(f"dispatch {args.dispatch} already finished its task; give the next one with `continue`")
@@ -1155,12 +1506,339 @@ def cmd_nudge(args):
     emit({"nudged": args.dispatch, "message": message_id})
 
 
+def _current_attempt(db, dispatch_id):
+    row = db.execute("SELECT * FROM dispatch WHERE id = ? AND started IS NOT NULL", (dispatch_id,)).fetchone()
+    if row is None:
+        raise SystemExit(f"unknown dispatch {dispatch_id} in {state_dir()}")
+    round_row = db.execute("SELECT * FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
+                           (dispatch_id, row["current_round"], row["current_attempt"])).fetchone()
+    if round_row is None:
+        raise SystemExit(f"dispatch {dispatch_id} has no current attempt")
+    return row, round_row
+
+
+def lifecycle_generation(db, dispatch_id):
+    return db.execute("SELECT COALESCE(MAX(id), 0) FROM lifecycle_event WHERE dispatch = ?",
+                      (dispatch_id,)).fetchone()[0]
+
+
+def require_no_unresolved_lifecycle(db, dispatch_id):
+    event = db.execute("SELECT id, operation, result, diagnostic FROM lifecycle_event WHERE dispatch = ? "
+        "AND operation IN ('interrupt', 'close', 'handoff', 'resume') AND result IN ('pending', 'uncertain') "
+                       "ORDER BY id DESC LIMIT 1", (dispatch_id,)).fetchone()
+    if event:
+        raise SystemExit(json.dumps({"error": "lifecycle_reconcile_required", "dispatch": dispatch_id,
+                                     "audit": event["id"], "operation": event["operation"],
+                                     "result": event["result"], "diagnostic": event["diagnostic"]},
+                                    ensure_ascii=False))
+
+
+def _set_lifecycle_result(db, event_id, dispatch_id, result, diagnostic=None, state=None, owner_credential=None):
+    db.execute("BEGIN IMMEDIATE")
+    event = db.execute("SELECT operation, owner_generation FROM lifecycle_event WHERE id = ? AND dispatch = ?",
+                       (event_id, dispatch_id)).fetchone()
+    if event is None:
+        db.execute("ROLLBACK")
+        raise SystemExit(f"unknown lifecycle event {event_id} for {dispatch_id}")
+    scope = owner_scope(db, dispatch_id)
+    current_owner = require_owner(db, scope, owner_credential, event["operation"])
+    if event["owner_generation"] is not None and (current_owner is None or current_owner["generation"] != event["owner_generation"]):
+        db.execute("ROLLBACK")
+        raise SystemExit(json.dumps({"error": "stale_controller_owner", "operation": event["operation"],
+                                     "scope": scope, "generation": event["owner_generation"]}, ensure_ascii=False))
+    finish_lifecycle_event(db, event_id, result, diagnostic)
+    if state:
+        current = db.execute("SELECT current_round, current_attempt FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
+        db.execute("UPDATE dispatch_round SET state = ?, completed = CASE WHEN ? IN ('cancelled', 'completed') THEN ? ELSE completed END "
+                   "WHERE dispatch = ? AND round = ? AND attempt = ?",
+                   (state, state, time.time(), dispatch_id, current["current_round"], current["current_attempt"]))
+    db.execute("COMMIT")
+
+
+def cmd_interrupt(args):
+    """Fence the current attempt and request a host interrupt.
+
+    The attempt is made non-writable before the external keypress.  Any result that
+    cannot be confirmed remains ``unknown`` and requires an explicit resume/handoff.
+    """
+    db = connect()
+    with input_lock(args.dispatch):
+        row, current = _current_attempt(db, args.dispatch)
+        db.execute("BEGIN IMMEDIATE")
+        require_owner(db, row["scope"], owner_token(args), "interrupt")
+        require_no_unresolved_lifecycle(db, args.dispatch)
+        event = lifecycle_event(db, args.dispatch, "interrupt", round=current["round"],
+                                attempt=current["attempt"], from_attempt=current["attempt"],
+                                from_host=row["host"], to_host=row["host"])
+        post(db, args.dispatch, "worker", "interrupted", {"round": current["round"],
+             "attempt": current["attempt"], "result": "pending"})
+        db.execute("UPDATE dispatch_round SET state = 'unknown', completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?",
+                   (time.time(), args.dispatch, current["round"], current["attempt"]))
+        db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
+        db.execute("COMMIT")
+        session = session_name(args.dispatch)
+        if not session_alive(session):
+            result, diagnostic = UNCERTAIN, f"tmux session {session} is gone; interruption cannot be confirmed"
+        else:
+            owned, why = session_owner(session)
+            if not owned:
+                result, diagnostic = "refused", why
+            else:
+                sent = tmux("send-keys", "-t", session, "C-c")
+                if sent.returncode == 0:
+                    result, diagnostic = "accepted", None
+                elif getattr(sent, "not_run", False):
+                    result, diagnostic = DEFINITELY_NOT_SENT, sent.stderr or sent.stdout or "tmux could not run"
+                else:
+                    result, diagnostic = UNCERTAIN, sent.stderr or sent.stdout or f"tmux exited {sent.returncode}"
+        _set_lifecycle_result(db, event, args.dispatch, result, diagnostic, owner_credential=owner_token(args))
+    emit({"dispatch": args.dispatch, "operation": "interrupt", "result": result,
+          "round": current["round"], "attempt": current["attempt"],
+          **({"diagnostic": diagnostic} if diagnostic else {})})
+
+
+def cmd_close(args):
+    """Close only this router-owned session and record a durable cancellation audit."""
+    db = connect()
+    with input_lock(args.dispatch):
+        row, current = _current_attempt(db, args.dispatch)
+        db.execute("BEGIN IMMEDIATE")
+        require_owner(db, row["scope"], owner_token(args), "close")
+        require_no_unresolved_lifecycle(db, args.dispatch)
+        session = session_name(args.dispatch)
+        if session_alive(session):
+            owned, why = session_owner(session)
+            if not owned:
+                db.execute("ROLLBACK")
+                db.execute("BEGIN IMMEDIATE")
+                lifecycle_event(db, args.dispatch, "close", round=current["round"], attempt=current["attempt"],
+                                from_attempt=current["attempt"], from_host=row["host"], to_host=row["host"],
+                                result="refused", diagnostic=why)
+                db.execute("COMMIT")
+                event = None
+                result, diagnostic = "refused", why
+            else:
+                event = lifecycle_event(db, args.dispatch, "close", round=current["round"],
+                                        attempt=current["attempt"], from_attempt=current["attempt"],
+                                        from_host=row["host"], to_host=row["host"])
+                post(db, args.dispatch, "worker", "closed", {"round": current["round"],
+                     "attempt": current["attempt"], "result": "pending"})
+                db.execute("UPDATE dispatch_round SET state = 'unknown', completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?",
+                           (time.time(), args.dispatch, current["round"], current["attempt"]))
+                db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
+                db.execute("COMMIT")
+                killed = tmux("kill-session", "-t", session)
+                if killed.returncode == 0:
+                    result, diagnostic = "completed", None
+                elif getattr(killed, "not_run", False):
+                    result, diagnostic = DEFINITELY_NOT_SENT, killed.stderr or killed.stdout or "tmux could not run"
+                else:
+                    result, diagnostic = UNCERTAIN, killed.stderr or killed.stdout or f"tmux exited {killed.returncode}"
+        else:
+            event = lifecycle_event(db, args.dispatch, "close", round=current["round"],
+                                    attempt=current["attempt"], from_attempt=current["attempt"],
+                                    from_host=row["host"], to_host=row["host"], result="completed",
+                                    diagnostic="session was already gone")
+            post(db, args.dispatch, "worker", "closed", {"round": current["round"],
+                 "attempt": current["attempt"], "result": "completed"})
+            db.execute("UPDATE dispatch_round SET state = 'cancelled', completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?",
+                       (time.time(), args.dispatch, current["round"], current["attempt"]))
+            db.execute("COMMIT")
+            result, diagnostic = "completed", "session was already gone"
+        if event is not None and result != "completed" and db.execute("SELECT result FROM lifecycle_event WHERE id = ?", (event,)).fetchone()[0] == "pending":
+            _set_lifecycle_result(db, event, args.dispatch, result, diagnostic, owner_credential=owner_token(args))
+        elif event is not None and result == "completed" and db.execute("SELECT result FROM lifecycle_event WHERE id = ?", (event,)).fetchone()[0] == "pending":
+            _set_lifecycle_result(db, event, args.dispatch, result, diagnostic, state="cancelled",
+                                  owner_credential=owner_token(args))
+    if result == "refused":
+        raise SystemExit(diagnostic)
+    emit({"dispatch": args.dispatch, "operation": "close", "result": result,
+          "round": current["round"], "attempt": current["attempt"],
+          **({"diagnostic": diagnostic} if diagnostic else {})})
+
+
+def cmd_reconcile(args):
+    """Resolve a persisted handoff result after an external operator check."""
+    db = connect()
+    with input_lock(args.dispatch):
+        row, current = _current_attempt(db, args.dispatch)
+        db.execute("BEGIN IMMEDIATE")
+        current_owner = require_owner(db, row["scope"], owner_token(args), "reconcile")
+        event = db.execute("SELECT * FROM lifecycle_event WHERE id = ? AND dispatch = ? "
+                           "AND operation IN ('interrupt', 'close', 'handoff', 'resume')",
+                           (args.audit, args.dispatch)).fetchone()
+        if event is None:
+            db.execute("ROLLBACK")
+            raise SystemExit(f"no lifecycle audit {args.audit} for dispatch {args.dispatch}")
+        if event["result"] not in ("pending", "uncertain"):
+            same = (event["result"] == args.result and event["resolver_actor"] == args.actor
+                    and event["resolution_evidence"] == args.evidence)
+            db.execute("ROLLBACK")
+            if same:
+                emit({"dispatch": args.dispatch, "operation": "reconcile", "result": args.result,
+                      "audit": event["id"], "duplicate": True})
+                return
+            raise SystemExit(f"handoff audit {args.audit} is already {event['result']}")
+        expected_attempt = event["to_attempt"] or event["attempt"]
+        if current["attempt"] != expected_attempt:
+            db.execute("ROLLBACK")
+            raise SystemExit(f"handoff audit {args.audit} is no longer the current attempt")
+        if args.result == "accepted" and event["operation"] in ("handoff", "resume"):
+            state = "running"
+        elif args.result == "accepted" and event["operation"] == "close":
+            state = "cancelled"
+        else:
+            state = "unknown"
+        finish_lifecycle_event(db, event["id"], args.result,
+                               f"reconciled by {args.actor}: {args.evidence}", args.actor, args.evidence)
+        db.execute("UPDATE dispatch_round SET state = ?, completed = CASE WHEN ? = 'unknown' THEN ? ELSE completed END "
+                   "WHERE dispatch = ? AND round = ? AND attempt = ?",
+                   (state, state, time.time(), args.dispatch, event["round"], expected_attempt))
+        db.execute("COMMIT")
+    emit({"dispatch": args.dispatch, "operation": "reconcile", "result": args.result,
+          "audit": event["id"], "attempt": expected_attempt, "duplicate": False})
+
+
+def cmd_handoff(args):
+    """Fence an attempt, close its session, and start the task on a new host."""
+    db = connect()
+    with input_lock(args.dispatch):
+        row, current = _current_attempt(db, args.dispatch)
+        require_owner(db, row["scope"], owner_token(args), "handoff")
+        require_no_unresolved_lifecycle(db, args.dispatch)
+        if not args.task and not args.report:
+            prior = db.execute("SELECT * FROM lifecycle_event WHERE dispatch = ? AND operation = 'handoff' "
+                               "AND result = 'accepted' AND to_attempt = ? AND to_host = ? "
+                               "ORDER BY id DESC LIMIT 1",
+                               (args.dispatch, current["attempt"], args.host)).fetchone()
+            if prior:
+                emit({"dispatch": args.dispatch, "operation": "handoff", "result": "accepted",
+                      "duplicate": True, "audit": prior["id"], "attempt": current["attempt"],
+                      "host": args.host, "round": current["round"]})
+                return
+        if bool(args.task) != bool(args.report):
+            raise SystemExit("give both --task and --report, or neither")
+        if args.task and not done_current_task(db, args.dispatch):
+            raise SystemExit(f"dispatch {args.dispatch} has not done its current task; handoff without --task to continue it")
+        if not args.task and done_current_task(db, args.dispatch):
+            raise SystemExit(f"dispatch {args.dispatch} already finished its task; give the next one with --task and --report")
+        task = Path(args.task).resolve() if args.task else Path(row["task"])
+        report = Path(args.report).resolve() if args.report else Path(row["report"])
+        if row["report_dir"] and str(report.parent) != row["report_dir"]:
+            raise SystemExit(f"the report must be in {row['report_dir']}, the directory this worker was given write access to")
+        if args.task:
+            db.execute("BEGIN IMMEDIATE")
+            refuse_used_report(db, args.dispatch, report)
+            db.execute("ROLLBACK")
+        session = session_name(args.dispatch)
+        old_alive = session_alive(session)
+        if old_alive:
+            owned, why = session_owner(session)
+            if not owned:
+                db.execute("BEGIN IMMEDIATE")
+                lifecycle_event(db, args.dispatch, "handoff", round=current["round"], attempt=current["attempt"],
+                                from_attempt=current["attempt"], from_host=row["host"], to_host=args.host,
+                                result="refused", diagnostic=why)
+                db.execute("COMMIT")
+                raise SystemExit(why)
+        next_round = current["round"] + (1 if args.task else 0)
+        attempt = "a-" + uuid.uuid4().hex[:12]
+        host_session = str(uuid.uuid4()) if args.host == "claude" else None
+        controller = db.execute("SELECT token FROM controller_owner WHERE scope = ?", (row["scope"],)).fetchone()
+        command, extra_env = LAUNCHERS[args.host](
+            worker_brief(args.dispatch, task, report, opening="[router] This task has been handed off to a new host",
+                         attempt=attempt, owner=bool(controller)),
+            [state_dir(), Path(row["report_dir"])], Path(row["cwd"]), args.model or row["model"], host_session,
+            effort=row["effort"], network=bool(row["network"]), label=row["label"], git=bool(row["git"]))
+        if controller:
+            extra_env = {**extra_env, "WFC_OWNER_TOKEN": controller["token"]}
+        db.execute("BEGIN IMMEDIATE")
+        require_owner(db, row["scope"], owner_token(args), "handoff")
+        latest, _ = _current_attempt(db, args.dispatch)
+        if latest["current_attempt"] != current["attempt"] or latest["host"] != row["host"]:
+            db.execute("ROLLBACK")
+            raise SystemExit(f"dispatch {args.dispatch} changed while handing off; inspect status and retry")
+        event = lifecycle_event(db, args.dispatch, "handoff", round=next_round, attempt=attempt,
+                                from_attempt=current["attempt"], to_attempt=attempt,
+                                from_host=row["host"], to_host=args.host)
+        post(db, args.dispatch, "worker", "handoff", {"round": next_round, "attempt": attempt,
+             "fromAttempt": current["attempt"], "fromHost": row["host"], "toHost": args.host, "result": "pending"})
+        if not args.task:
+            db.execute("UPDATE dispatch_round SET state = 'unknown', completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?",
+                       (time.time(), args.dispatch, current["round"], current["attempt"]))
+        db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, state, created) VALUES (?, ?, ?, ?, ?, 'unknown', ?)",
+                   (args.dispatch, next_round, attempt, str(task), str(report), time.time()))
+        db.execute("UPDATE dispatch SET host = ?, host_session = ?, model = ?, task = ?, report = ?, current_round = ?, current_attempt = ? WHERE id = ?",
+                   (args.host, host_session, args.model or row["model"], str(task), str(report), next_round, attempt, args.dispatch))
+        db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
+        db.execute("COMMIT")
+
+        if old_alive:
+            killed = tmux("kill-session", "-t", session)
+            if killed.returncode == 0:
+                close_result, close_diag = "completed", None
+            elif getattr(killed, "not_run", False):
+                close_result, close_diag = DEFINITELY_NOT_SENT, killed.stderr or killed.stdout or "tmux could not run"
+            else:
+                close_result, close_diag = UNCERTAIN, killed.stderr or killed.stdout or f"tmux exited {killed.returncode}"
+        else:
+            close_result, close_diag = "completed", "old session was already gone"
+        if close_result != "completed":
+            finish_result = close_result
+            diagnostic = f"could not confirm closing old session: {close_diag}"
+            _set_lifecycle_result(db, event, args.dispatch, finish_result, diagnostic, state="unknown",
+                                  owner_credential=owner_token(args))
+            emit({"dispatch": args.dispatch, "operation": "handoff", "result": finish_result,
+                  "fromAttempt": current["attempt"], "attempt": attempt, "host": args.host,
+                  "diagnostic": diagnostic})
+            return
+        launched = launch(args.dispatch, row["cwd"], command, extra_env, row["label"])
+        if launched == NOT_SENT:
+            diagnostic = "new host session was definitely not started"
+            _set_lifecycle_result(db, event, args.dispatch, DEFINITELY_NOT_SENT, diagnostic, state="unknown",
+                                  owner_credential=owner_token(args))
+            emit({"dispatch": args.dispatch, "operation": "handoff", "result": DEFINITELY_NOT_SENT,
+                  "fromAttempt": current["attempt"], "attempt": attempt, "host": args.host,
+                  "diagnostic": diagnostic})
+            return
+        if launched == UNCERTAIN:
+            diagnostic = "new host session start was not confirmed"
+            _set_lifecycle_result(db, event, args.dispatch, UNCERTAIN, diagnostic, state="unknown",
+                                  owner_credential=owner_token(args))
+            emit({"dispatch": args.dispatch, "operation": "handoff", "result": UNCERTAIN,
+                  "fromAttempt": current["attempt"], "attempt": attempt, "host": args.host,
+                  "diagnostic": diagnostic})
+            return
+        if args.host == "opencode":
+            typed, notice, diagnostic = (type_into(session, worker_brief(args.dispatch, task, report,
+                                      opening="[router] This task has been handed off to a new host", attempt=attempt), args.host)
+                                         if wait_for_quiet_screen(session) else (NOT_SENT, None, "worker screen did not become ready"))
+            if typed != SENT:
+                _set_lifecycle_result(db, event, args.dispatch, UNCERTAIN if typed in (PARTIAL, UNCERTAIN) else DEFINITELY_NOT_SENT,
+                                      diagnostic or notice, state="unknown", owner_credential=owner_token(args))
+                emit({"dispatch": args.dispatch, "operation": "handoff", "result": UNCERTAIN if typed in (PARTIAL, UNCERTAIN) else DEFINITELY_NOT_SENT,
+                      "fromAttempt": current["attempt"], "attempt": attempt, "host": args.host,
+                      "diagnostic": diagnostic or notice})
+                return
+        _set_lifecycle_result(db, event, args.dispatch, "accepted", state="running",
+                              owner_credential=owner_token(args))
+    emit({"dispatch": args.dispatch, "operation": "handoff", "result": "accepted",
+          "fromAttempt": current["attempt"], "attempt": attempt, "host": args.host,
+          "round": next_round})
+
+
 def local_time(epoch):
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch)) if epoch else None
 
 
 def message_view(r):
-    return {"id": r["id"], "dispatch": r["dispatch"], "type": r["type"], "to": r["recipient"], "at": local_time(r["created"]),
+    return {"id": r["id"], "messageId": r["message_uid"] or str(r["id"]),
+            "dispatch": r["dispatch"], "type": r["type"], "to": r["recipient"], "at": local_time(r["created"]),
+            "state": r["state"] or ("received" if r["delivered"] else "unsent"),
+            "statusVersion": r["status_version"] or 1,
+            **({"resolution": {"actor": r["resolver_actor"], "source": r["resolution_source"],
+                                "reason": r["resolution_reason"], "evidence": r["resolution_evidence"],
+                                "at": local_time(r["resolved_at"])} } if r["resolver_actor"] else {}),
             **({"delivered": bool(r["delivered"])} if r["recipient"] == "controller" else {}), **json.loads(r["body"])}
 
 
@@ -1191,15 +1869,22 @@ def canonical_status(db, row, legacy_state, last, alive, watch):
     """Return the multi-signal status contract while retaining legacy ``state``."""
     latest_type = last["type"] if last else None
     body = json.loads(last["body"]) if last else {}
+    current = db.execute("SELECT current_round, current_attempt FROM dispatch WHERE id = ?", (row["id"],)).fetchone()
+    current_round = db.execute("SELECT state FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
+                               (row["id"], current["current_round"], current["current_attempt"])).fetchone() if current else None
+    current_round_state = current_round["state"] if current_round else None
+    current_message = bool(last and (body.get("attempt") is None or body.get("attempt") == current["current_attempt"]))
     persisted_fault = db.execute("SELECT operation, outcome, category, diagnostic, created FROM fault_event WHERE dispatch = ?",
                                  (row["id"],)).fetchone()
     if legacy_state == "reclaimed" or latest_type == "reclaimed":
         status = "reclaimed"
-    elif latest_type == "cancelled" or legacy_state == "cancelled":
+    elif current_round_state in ("unknown", "interrupted") or legacy_state == "unknown":
+        status = "unknown"
+    elif latest_type in ("closed", "cancelled") or legacy_state == "cancelled" or current_round_state == "cancelled":
         status = "cancelled"
-    elif latest_type == "done" or legacy_state == "done":
+    elif (current_message and latest_type == "done") or legacy_state == "done":
         status = "completed"
-    elif latest_type == "question" or legacy_state == "asking":
+    elif (current_message and latest_type == "question") or legacy_state == "asking":
         status = "waiting-human"
     elif latest_type == "blocked":
         status = "blocked"
@@ -1235,8 +1920,15 @@ def canonical_status(db, row, legacy_state, last, alive, watch):
 
 
 def dispatch_state(db, dispatch_id):
-    if done_current_task(db, dispatch_id):
+    current = db.execute("SELECT current_round, current_attempt FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
+    active_round = db.execute("SELECT state FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
+                              (dispatch_id, current["current_round"], current["current_attempt"])).fetchone() if current else None
+    if active_round and active_round["state"] == "completed":
         return "done"
+    if active_round and active_round["state"] == "cancelled":
+        return "cancelled"
+    if active_round and active_round["state"] in ("unknown", "interrupted"):
+        return "unknown"
     if reclaimed(db, dispatch_id):
         return "reclaimed"
     if not watched(db, dispatch_id):
@@ -1274,19 +1966,27 @@ def cmd_status(args):
         lifecycle = "running" if canonical == "online" else canonical
         rounds = [dict(r) for r in db.execute("SELECT round, attempt, task, report, state, result, created, completed "
                                                "FROM dispatch_round WHERE dispatch = ? ORDER BY round, created", (row["id"],))]
+        audit = [lifecycle_view(event) for event in db.execute(
+            "SELECT * FROM lifecycle_event WHERE dispatch = ? ORDER BY id", (row["id"],))]
         view = {"dispatch": row["id"], "scope": row["scope"], "role": row["role"],
                 "round": row["current_round"], "attempt": row["current_attempt"], "rounds": rounds,
+                "audit": audit,
                 "label": row["label"], "host": row["host"], "model": row["model"],
                 "git": bool(row["git"]), "state": state, "status": canonical, "lifecycle": lifecycle,
-                # queued/cancelled require backend lifecycle operations not exposed by this ticket;
-                # do not advertise states the current CLI cannot observe.
+                # queued remains a backend concern; cancelled is produced by `close` and is part of
+                # the stable state contract exposed here.
                 "canonicalStates": ["running", "online", "waiting-human", "blocked", "unknown",
-                                    "completed", "failed", "reclaimed"], "signals": signals,
+                                    "completed", "failed", "cancelled", "reclaimed"], "signals": signals,
                 "tmux": session_name(row["id"]), "tmuxAlive": alive,
                 "cwd": row["cwd"], "task": row["task"], "report": row["report"], "started": local_time(row["started"]),
                 "last": message_view(last) if last else None,
                 **({"screenIdleSeconds": int(now - watch["since"])} if watch else {}),
                 **({"reclaimed": local_time(closed)} if closed else {})}
+        owner = db.execute("SELECT owner, generation, lease_until FROM controller_owner WHERE scope = ?", (row["scope"],)).fetchone()
+        if owner:
+            view["controllerOwner"] = {"owner": owner["owner"], "generation": owner["generation"],
+                                       "leaseUntil": local_time(owner["lease_until"]),
+                                       "active": owner["lease_until"] > now}
         if args.dispatch:
             view["messages"] = [message_view(m) for m in
                                 db.execute("SELECT * FROM message WHERE dispatch = ? ORDER BY id", (row["id"],))]
@@ -1395,7 +2095,13 @@ def cmd_resume(args):
     row = db.execute("SELECT * FROM dispatch WHERE id = ? AND started IS NOT NULL", (args.dispatch,)).fetchone()
     if row is None:
         raise SystemExit(f"unknown dispatch {args.dispatch} in {state_dir()}")
+    require_owner(db, row["scope"], owner_token(args), "resume")
+    require_no_unresolved_lifecycle(db, args.dispatch)
     mark = round_mark(db, args.dispatch)
+    generation = lifecycle_generation(db, args.dispatch)
+    initial_round = db.execute("SELECT state FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
+                               (args.dispatch, row["current_round"], row["current_attempt"])).fetchone()
+    initial_state = initial_round["state"] if initial_round else None
     session = session_name(args.dispatch)
     if session_alive(session):
         raise SystemExit(f"tmux session {session} is still running; use `continue` or attach to it")
@@ -1423,26 +2129,37 @@ def cmd_resume(args):
         raise SystemExit(f"cannot find the {row['host']} conversation of dispatch {args.dispatch}; dispatch a new worker")
     opening = ("[router] Your session was interrupted and has been resumed. Check the worktree and what you "
                "already did, then continue" if not args.task else "[router] Resumed with a new task for you")
+    controller = db.execute("SELECT token FROM controller_owner WHERE scope = ?", (row["scope"],)).fetchone()
     command, extra_env = LAUNCHERS[row["host"]](worker_brief(args.dispatch, task, report, opening=opening,
-                                                              attempt=resume_attempt),
+                                                              attempt=resume_attempt, owner=bool(controller)),
                                                 [state_dir(), Path(row["report_dir"])], Path(row["cwd"]),
                                                 row["model"], host_session, resume=True,
                                                 effort=row["effort"], network=bool(row["network"]), label=row["label"],
                                                 git=bool(row["git"]))
+    if controller:
+        extra_env = {**extra_env, "WFC_OWNER_TOKEN": controller["token"]}
     # From the locked re-check to the last keystroke under the input lock (taken before the SQLite
     # lock, as everywhere), so no nudge, done or continue can come between the launch and the brief.
     with input_lock(args.dispatch):
         input_started = time.time()
-        # Posted before launch so the new session's `done` sorts after it, and under the write lock the
-        # watchdog also takes, so it cannot report the not-yet-started session as exited in between.
+        # Persist the fence and pending attempt before crossing the tmux boundary. A router crash
+        # after tmux creates a session therefore leaves a visible pending attempt instead of rolling
+        # the identity back and orphaning an unaccounted writer.
         db.execute("BEGIN IMMEDIATE")
+        require_owner(db, row["scope"], owner_token(args), "resume")
         # Everything above was decided without the lock: give up if the round moved on meanwhile
         # (another resume, a continue, a done) or a session came back.
         # The row read before the lock must still be the current one, as must the round mark: an old
         # row paired with a newer mark would relaunch the wrong round.
-        now = db.execute("SELECT task, report, host_session FROM dispatch WHERE id = ?", (args.dispatch,)).fetchone()
-        if (round_mark(db, args.dispatch) != mark or session_alive(session)
-                or (now["task"], now["report"], now["host_session"]) != (row["task"], row["report"], row["host_session"])):
+        now = db.execute("SELECT task, report, host, host_session, current_round, current_attempt FROM dispatch WHERE id = ?",
+                         (args.dispatch,)).fetchone()
+        now_round = db.execute("SELECT state FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
+                               (args.dispatch, now["current_round"], now["current_attempt"])).fetchone()
+        if (round_mark(db, args.dispatch) != mark or lifecycle_generation(db, args.dispatch) != generation
+                or session_alive(session)
+                or (now["task"], now["report"], now["host"], now["host_session"], now["current_round"], now["current_attempt"])
+                != (row["task"], row["report"], row["host"], row["host_session"], row["current_round"], row["current_attempt"])
+                or not now_round or now_round["state"] != initial_state):
             db.execute("ROLLBACK")
             raise SystemExit(f"dispatch {args.dispatch} changed while resuming (another resume, continue or done); "
                              f"look at its state and run resume again if it is still needed")
@@ -1454,6 +2171,9 @@ def cmd_resume(args):
         # for an interrupted worker still preserves the prior attempt for diagnosis.
         next_round = identity["current_round"] + (1 if args.task else 0)
         attempt = resume_attempt
+        resume_event = lifecycle_event(db, args.dispatch, "resume", round=next_round, attempt=attempt,
+                                       from_attempt=identity["current_attempt"], to_attempt=attempt,
+                                       from_host=row["host"], to_host=row["host"])
         if not args.task:
             db.execute("UPDATE dispatch_round SET state = 'unknown', completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?",
                        (time.time(), args.dispatch, identity["current_round"], identity["current_attempt"]))
@@ -1462,18 +2182,22 @@ def cmd_resume(args):
         if args.task:
             post(db, args.dispatch, "worker", "continue", {"task": str(task), "report": str(report),
                  "scope": identity["scope"], "role": identity["role"], "round": next_round, "attempt": attempt})
-        db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, created) VALUES (?, ?, ?, ?, ?, ?)",
+        db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, state, created) VALUES (?, ?, ?, ?, ?, 'unknown', ?)",
                    (args.dispatch, next_round, attempt, str(task), str(report), time.time()))
         db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
-        launched = launch(args.dispatch, row["cwd"], command, extra_env, row["label"])
-        if launched == NOT_SENT:
-            db.execute("ROLLBACK")
-            raise SystemExit(f"could not start tmux session {session}")
-        # The session (possibly) runs this task: record it with the launch, before typing can fail.
         db.execute("UPDATE dispatch SET task = ?, report = ?, host_session = ?, current_round = ?, current_attempt = ? WHERE id = ?",
                    (str(task), str(report), host_session, next_round, attempt, args.dispatch))
         db.execute("COMMIT")
+        launched = launch(args.dispatch, row["cwd"], command, extra_env, row["label"])
+        if launched == NOT_SENT:
+            diagnostic = f"could not start tmux session {session}"
+            _set_lifecycle_result(db, resume_event, args.dispatch, DEFINITELY_NOT_SENT, diagnostic, state="unknown",
+                                  owner_credential=owner_token(args))
+            raise SystemExit(diagnostic)
         if launched == UNCERTAIN:
+            _set_lifecycle_result(db, resume_event, args.dispatch, UNCERTAIN,
+                                  f"tmux did not confirm {session}", state="unknown",
+                                  owner_credential=owner_token(args))
             raise SystemExit(f"tmux did not confirm {session}; the resumed round is recorded. Check `tmux ls`; "
                              f"`wait` reports it exited if it never started.")
         if row["host"] == "opencode":
@@ -1481,27 +2205,37 @@ def cmd_resume(args):
             typed, notice, diagnostic = (type_into(session, brief, row["host"]) if wait_for_quiet_screen(session)
                                          else (NOT_SENT, None, "worker screen did not become ready"))
             if typed in (PARTIAL, UNCERTAIN):
+                _set_lifecycle_result(db, resume_event, args.dispatch, UNCERTAIN, diagnostic, state="unknown",
+                                      owner_credential=owner_token(args))
                 persist_input_fault(db, args.dispatch, "resume", typed, diagnostic)
                 raise typing_error(session, "The brief", typed)
             if typed == READ_ONLY:
+                _set_lifecycle_result(db, resume_event, args.dispatch, "refused", notice, state="unknown",
+                                      owner_credential=owner_token(args))
                 persist_input_fault(db, args.dispatch, "resume", typed, diagnostic)
                 mark_screen_reported(db, args.dispatch, session)
                 raise SystemExit(f"resumed {session}, but " + refusal(session, "the brief", notice))
             if typed == NOT_SENT:
+                _set_lifecycle_result(db, resume_event, args.dispatch, DEFINITELY_NOT_SENT, diagnostic, state="unknown",
+                                      owner_credential=owner_token(args))
                 persist_input_fault(db, args.dispatch, "resume", typed, diagnostic)
                 raise SystemExit(f"resumed {session} but could not type the brief into it; attach and paste it: {brief}")
         elif any(host == row["host"] for host, *_ in READ_ONLY_NOTICES):
             # The brief went in on the command line; a conversation that opens read-only drops it.
             notice = new_notice(session, [], seconds_setting("WFC_RESUME_CHECK_SECONDS", 5))
             if notice:
+                _set_lifecycle_result(db, resume_event, args.dispatch, "refused", notice, state="unknown",
+                                      owner_credential=owner_token(args))
                 persist_input_fault(db, args.dispatch, "resume", READ_ONLY, notice)
                 mark_screen_reported(db, args.dispatch, session)
                 raise SystemExit(f"resumed {session}, but its screen says \"{notice}\" The brief was not sent, and "
                                  f"this conversation cannot go on; dispatch a new worker (the resumed round stays "
                                  f"recorded; close the session with tmux kill-session -t {session})")
         clear_input_fault(db, args.dispatch, input_started)
-    emit({"resumed": args.dispatch, "session": host_session, "tmux": session,
-          "round": next_round, "attempt": attempt})
+        _set_lifecycle_result(db, resume_event, args.dispatch, "accepted", state="running",
+                              owner_credential=owner_token(args))
+    emit({"resumed": args.dispatch, "operation": "resume", "result": "accepted",
+          "session": host_session, "tmux": session, "round": next_round, "attempt": attempt})
 
 
 def session_owner(session):
@@ -1548,6 +2282,7 @@ def cmd_reclaim(args):
             return 0
     sessions, errors = [], []
     for row in reclaim_targets(db, named):
+        require_owner(db, row["scope"], owner_token(args), "reclaim")
         dispatch_id, session = row["id"], session_name(row["id"])
         state = dispatch_state(db, dispatch_id)
         item = {"dispatch": dispatch_id, "label": row["label"], "tmux": session, "state": state,
@@ -1568,7 +2303,7 @@ def cmd_reclaim(args):
         if not args.yes:
             item["result"] = "listed"
             continue
-        item.update(reclaim_session(db, row, named=bool(named)))
+        item.update(reclaim_session(db, row, named=bool(named), token=owner_token(args)))
         if item["result"] == "failed":
             errors.append(item["error"])
     emit({"state": str(state_dir()), "yes": bool(args.yes), "sessions": sessions})
@@ -1577,7 +2312,7 @@ def cmd_reclaim(args):
     return 1 if errors else 0
 
 
-def reclaim_session(db, row, named):
+def reclaim_session(db, row, named, token=None):
     """Close one session and record `reclaimed`, under the input lock and the write lock the
     watchdog takes, so it never sees the session gone without the record. A dispatch reclaim chose
     by itself (not `named` with --dispatch) must still be done and not reclaimed under the lock: one
@@ -1587,6 +2322,7 @@ def reclaim_session(db, row, named):
     with input_lock(dispatch_id):
         db.execute("BEGIN IMMEDIATE")
         try:
+            require_owner(db, row["scope"], token, "reclaim")
             if not named and (not done_current_task(db, dispatch_id) or reclaimed(db, dispatch_id)):
                 db.execute("ROLLBACK")
                 return {"result": "changed", "note": f"dispatch {dispatch_id} is no longer done and unreclaimed "
@@ -1612,12 +2348,29 @@ def reclaim_session(db, row, named):
     return {"result": "reclaimed", "message": message_id}
 
 
-def take_controller_messages(db):
+def take_controller_messages(db, relay=False, scope=None, token=None):
     db.execute("BEGIN IMMEDIATE")
-    rows = db.execute("SELECT * FROM message WHERE recipient = 'controller' AND delivered = 0 ORDER BY id").fetchall()
-    db.executemany("UPDATE message SET delivered = 1 WHERE id = ?", [(r["id"],) for r in rows])
+    if scope:
+        require_owner(db, scope, token, "relay" if relay else "wait")
+    owned = db.execute("SELECT scope FROM controller_owner").fetchall()
+    if not scope and owned:
+        db.execute("ROLLBACK")
+        raise SystemExit(json.dumps({"error": "controller_owner_required", "operation": "relay" if relay else "wait"}))
+    where = " AND d.scope = ?" if scope else ""
+    params = (scope,) if scope else ()
+    rows = db.execute("SELECT m.* FROM message m JOIN dispatch d ON d.id = m.dispatch WHERE m.recipient = 'controller' AND m.delivered = 0 AND m.state = 'unsent'" + where + " ORDER BY m.id", params).fetchall()
+    if relay:
+        # Claim as unknown before crossing the external boundary. A process exit now
+        # leaves an auditable result that is never silently replayed.
+        db.executemany("UPDATE message SET state = 'unknown', status_version = status_version + 1 WHERE id = ?",
+                       [(r["id"],) for r in rows])
+    else:
+        db.executemany("UPDATE message SET delivered = 1, state = 'received', status_version = status_version + 1 WHERE id = ?",
+                       [(r["id"],) for r in rows])
     db.execute("COMMIT")
-    return [{"id": r["id"], "dispatch": r["dispatch"], "type": r["type"], **json.loads(r["body"])} for r in rows]
+    return [{"id": r["id"], "messageId": r["message_uid"] or str(r["id"]), "dispatch": r["dispatch"],
+             "type": r["type"], "state": ("unknown" if relay else "received"), "statusVersion": (r["status_version"] or 1) + 1,
+             **json.loads(r["body"])} for r in rows]
 
 
 def answered(db, question_id):
@@ -1649,11 +2402,11 @@ def round_mark(db, dispatch_id):
 
 
 def done_current_task(db, dispatch_id):
-    """True once the dispatch reported done after its latest `continue` (or its first task)."""
-    return db.execute(
-        "SELECT 1 FROM message m WHERE m.dispatch = ? AND m.type = 'done' AND m.id > "
-        "COALESCE((SELECT MAX(c.id) FROM message c WHERE c.dispatch = m.dispatch AND c.type = 'continue'), 0)",
-        (dispatch_id,)).fetchone() is not None
+    """True once the current round has a durable completed result."""
+    current = db.execute("SELECT current_round, current_attempt FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
+    return bool(current and db.execute(
+        "SELECT 1 FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ? AND state = 'completed'",
+        (dispatch_id, current["current_round"], current["current_attempt"])).fetchone())
 
 
 def watched(db, dispatch_id):
@@ -1664,7 +2417,10 @@ def watched(db, dispatch_id):
         "SELECT 1 FROM message m WHERE m.dispatch = ? AND m.type = 'exited' AND m.id > "
         "COALESCE((SELECT MAX(r.id) FROM message r WHERE r.dispatch = m.dispatch AND r.type = 'resumed'), 0)",
         (dispatch_id,)).fetchone()
-    return started is not None and exited is None and not done_current_task(db, dispatch_id)
+    current = db.execute("SELECT current_round, current_attempt FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
+    active_round = db.execute("SELECT state FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
+                              (dispatch_id, current["current_round"], current["current_attempt"])).fetchone() if current else None
+    return started is not None and exited is None and active_round is not None and active_round["state"] == "running"
 
 
 def reclaimed(db, dispatch_id):
@@ -1679,15 +2435,21 @@ def reclaimed(db, dispatch_id):
 
 
 def awaiting_answer(db, dispatch_id):
+    current = db.execute("SELECT current_round, current_attempt FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
+    if current is None:
+        return False
     return any(not answered(db, q["id"]) for q in db.execute(
-        "SELECT id FROM message WHERE dispatch = ? AND type = 'question'", (dispatch_id,)))
+        "SELECT id FROM message WHERE dispatch = ? AND type = 'question' "
+        "AND json_extract(body, '$.round') = ? AND json_extract(body, '$.attempt') = ?",
+        (dispatch_id, current["current_round"], current["current_attempt"])))
 
 
-def check_workers(db, stall_after):
+def check_workers(db, stall_after, scope=None, token=None):
     """Report workers whose tmux session ended, or whose screen stopped changing,
     without `done` or a pending question. A busy TUI redraws a timer or spinner;
     an idle prompt, a crash message or an approval dialog stays still."""
-    candidates = db.execute("SELECT * FROM dispatch WHERE started IS NOT NULL").fetchall()
+    candidates = (db.execute("SELECT * FROM dispatch WHERE started IS NOT NULL AND scope = ?", (scope,)).fetchall()
+                  if scope else db.execute("SELECT * FROM dispatch WHERE started IS NOT NULL").fetchall())
     max_turn = seconds_setting("WFC_MAX_TURN_SECONDS", 3600)
     for row in candidates:
         dispatch_id = row["id"]
@@ -1708,6 +2470,8 @@ def check_workers(db, stall_after):
         # Decide and post under one write lock, re-checking state a worker's `done` may have changed.
         db.execute("BEGIN IMMEDIATE")
         try:
+            if scope:
+                require_owner(db, scope, token, "watchdog")
             if not watched(db, dispatch_id) or reclaimed(db, dispatch_id):
                 pass
             elif not alive and session_alive(session):
@@ -1794,12 +2558,14 @@ def watch_screen(db, dispatch_id, screen, now, stall_after):
 
 def cmd_wait(args):
     db = connect()
+    preflight_controller(db, args.scope, owner_token(args), "wait")
     deadline = time.monotonic() + args.timeout
     with registered_waiter(db, "wait"):
         while True:
-            check_workers(db, args.stall_after)
+            preflight_controller(db, args.scope, owner_token(args), "wait")
+            check_workers(db, args.stall_after, scope=args.scope, token=owner_token(args))
             # At-most-once: messages are marked delivered before they are printed; `status` shows them again.
-            messages = take_controller_messages(db)
+            messages = take_controller_messages(db, scope=args.scope, token=owner_token(args))
             if messages:
                 emit({"messages": messages})
                 return 0
@@ -1931,12 +2697,15 @@ def relay_target(args):
 def cmd_relay(args):
     """Like `wait`, but runs on and pushes each batch to a Codex or OpenCode controller, which then
     sleeps between turns instead of blocking on `wait`."""
+    db = connect()
+    preflight_controller(db, args.scope, owner_token(args), "relay")
     target_args, deliver = relay_target(args)
     if args.detach:
         # A Codex controller's shell may end its background jobs; run in a new session instead.
         log = state_dir() / "relay.log"
         state_dir().mkdir(parents=True, exist_ok=True)
         argv = ["relay", *target_args, "--stall-after", str(args.stall_after),
+                *( ["--scope", args.scope, "--owner-token", owner_token(args)] if args.scope else []),
                 *(["--for", str(args.for_seconds)] if args.for_seconds else [])]
         with open(log, "a") as out:
             child = subprocess.Popen([sys.executable, str(PROGRAM), *argv], stdin=subprocess.DEVNULL,
@@ -1947,14 +2716,34 @@ def cmd_relay(args):
     deadline = time.monotonic() + args.for_seconds if args.for_seconds else None
     with registered_waiter(db, "relay"):
         while deadline is None or time.monotonic() < deadline:
-            check_workers(db, args.stall_after)
-            messages = take_controller_messages(db)
-            outcome = deliver(messages) if messages else None
-            if outcome in ("failed", "missing"):
-                # Put the batch back so the next pass, or a `wait`, delivers it.
-                db.executemany("UPDATE message SET delivered = 0 WHERE id = ?", [(m["id"],) for m in messages])
+            preflight_controller(db, args.scope, owner_token(args), "relay")
+            check_workers(db, args.stall_after, scope=args.scope, token=owner_token(args))
+            messages = take_controller_messages(db, relay=True, scope=args.scope, token=owner_token(args))
+            # The internal claim and the external envelope both remain explicitly
+            # uncertain until the backend call returns. A later durable transition
+            # records received; this envelope cannot pre-claim that outcome.
+            envelope = [{**message, "state": "unknown", "delivery": "pending",
+                          "deliveryAttempt": "relay:" + message["messageId"] + ":" + str(message["statusVersion"])}
+                         for message in messages]
+            outcome = deliver(envelope) if envelope else None
+            if messages and outcome == "delivered":
+                db.execute("BEGIN IMMEDIATE")
+                db.executemany("UPDATE message SET delivered = 1, state = 'received', status_version = status_version + 1 "
+                               "WHERE id = ? AND state = 'unknown'", [(m["id"],) for m in messages])
+                db.execute("COMMIT")
+            elif messages and outcome in ("failed", "missing"):
+                # Definitely not sent: make it available to a later explicit attempt.
+                db.execute("BEGIN IMMEDIATE")
+                db.executemany("UPDATE message SET delivered = 0, state = 'unsent', status_version = status_version + 1 "
+                               "WHERE id = ? AND state = 'unknown'",
+                               [(m["id"],) for m in messages])
+                db.execute("COMMIT")
                 if outcome == "missing":
                     return 1  # the thread is gone or wrong: every later batch would be lost too
+            elif messages and outcome == "uncertain":
+                # Keep unknown and undelivered. It is queryable, but wait/relay will not
+                # silently replay it after an external timeout.
+                pass
                 time.sleep(5)
             time.sleep(0.5)
     return 0
@@ -1971,6 +2760,7 @@ def main(argv):
     p.add_argument("--cwd", required=True)
     p.add_argument("--report", required=True, help="report path; its directory is made writable for the worker")
     p.add_argument("--scope", help="stable controller scope identity (generated when omitted)")
+    p.add_argument("--owner-token", help="controller ownership token")
     p.add_argument("--role", help="stable worker role identity (derived from the report directory when omitted)")
     p.add_argument("--model", help="model for the worker; passed to the host's own model flag")
     p.add_argument("--effort", help="reasoning effort, passed to the host's own option "
@@ -1986,30 +2776,75 @@ def main(argv):
     p = sub.add_parser("done")
     p.add_argument("--report", required=True)
     p.add_argument("--attempt", help="execution attempt identity from the worker brief")
+    p.add_argument("--message-id", help="stable worker receipt key; retries are idempotent")
+    p.add_argument("--owner-token")
     p.set_defaults(func=cmd_done)
     p = sub.add_parser("ask")
     p.add_argument("question")
     p.add_argument("--options")
     p.add_argument("--attempt", help="execution attempt identity from the worker brief")
+    p.add_argument("--message-id", help="stable worker receipt key; retries are idempotent")
+    p.add_argument("--owner-token")
     p.set_defaults(func=cmd_ask)
+    p = sub.add_parser("ack", help="mark a controller message processed")
+    p.add_argument("message", help="numeric message id or stable message id")
+    p.add_argument("--body", help="canonical receipt body, when available")
+    p.add_argument("--owner-token")
+    p.set_defaults(func=cmd_ack)
+    p = sub.add_parser("resolve", help="record an externally confirmed delivery for an unknown message")
+    p.add_argument("message", help="numeric message id or stable message id")
+    p.add_argument("--actor", required=True, help="controller/operator identity authorizing reconciliation")
+    p.add_argument("--source", default="operator", help="authorization source")
+    p.add_argument("--reason", required=True, help="why external delivery was confirmed")
+    p.add_argument("--evidence", required=True, help="external receipt/token or verification reference")
+    p.add_argument("--body-hash", required=True, help="SHA-256 of the canonical stored message body")
+    p.set_defaults(func=cmd_resolve)
     p = sub.add_parser("reply")
     p.add_argument("message", type=int)
     p.add_argument("answer")
+    p.add_argument("--owner-token")
     p.set_defaults(func=cmd_reply)
     p = sub.add_parser("continue", help="give a worker its next task in the same session")
     p.add_argument("dispatch")
+    p.add_argument("--owner-token")
     p.add_argument("--task", required=True)
     p.add_argument("--report", required=True, help="must be in the dispatch's report directory")
     p.set_defaults(func=cmd_continue)
     p = sub.add_parser("resume", help="relaunch a worker whose session ended into its own conversation")
     p.add_argument("dispatch")
+    p.add_argument("--owner-token")
     p.add_argument("--task", help="the next task, for a worker that already finished its current one")
     p.add_argument("--report", help="the next report; must be in the dispatch's report directory")
     p.set_defaults(func=cmd_resume)
     p = sub.add_parser("nudge", help="type a line into a worker that has not finished its task")
     p.add_argument("dispatch")
     p.add_argument("--text", required=True)
+    p.add_argument("--owner-token")
     p.set_defaults(func=cmd_nudge)
+    p = sub.add_parser("interrupt", help="fence the current attempt and request a host interrupt")
+    p.add_argument("dispatch")
+    p.add_argument("--owner-token")
+    p.set_defaults(func=cmd_interrupt)
+    p = sub.add_parser("close", help="close a router-owned worker session and record cancellation")
+    p.add_argument("dispatch")
+    p.add_argument("--owner-token")
+    p.set_defaults(func=cmd_close)
+    p = sub.add_parser("reconcile", help="resolve a pending or uncertain handoff with operator evidence")
+    p.add_argument("dispatch")
+    p.add_argument("audit", type=int, help="lifecycle audit id from status")
+    p.add_argument("--result", required=True, choices=("accepted", "definitely-not-sent", "unknown", "refused"))
+    p.add_argument("--actor", required=True)
+    p.add_argument("--evidence", required=True)
+    p.add_argument("--owner-token")
+    p.set_defaults(func=cmd_reconcile)
+    p = sub.add_parser("handoff", help="move a task to a new host and attempt")
+    p.add_argument("dispatch")
+    p.add_argument("--host", required=True, choices=sorted(LAUNCHERS))
+    p.add_argument("--task", help="next task; required with --report when the current task is done")
+    p.add_argument("--report", help="next report in the dispatch report directory")
+    p.add_argument("--model", help="model for the new host")
+    p.add_argument("--owner-token")
+    p.set_defaults(func=cmd_handoff)
     p = sub.add_parser("status", help="show every dispatch, undelivered messages and running waiters")
     one = p.add_mutually_exclusive_group()
     one.add_argument("--dispatch", help="one dispatch, with its whole message history")
@@ -2021,13 +2856,18 @@ def main(argv):
     p.add_argument("--dispatch", action="append",
                    help="only this dispatch (repeatable); an unfinished one is closed only when named")
     p.add_argument("--yes", action="store_true", help="close the listed sessions (default: only list them)")
+    p.add_argument("--owner-token")
     p.set_defaults(func=cmd_reclaim)
     p = sub.add_parser("wait")
     p.add_argument("--timeout", type=float, default=3600)
+    p.add_argument("--scope")
+    p.add_argument("--owner-token")
     p.add_argument("--stall-after", type=float, default=300,
                    help="seconds a worker's screen may stay unchanged before it is reported as stalled")
     p.set_defaults(func=cmd_wait)
     p = sub.add_parser("relay", help="push controller messages into a Codex or OpenCode controller session")
+    p.add_argument("--scope")
+    p.add_argument("--owner-token")
     p.add_argument("--codex", action="store_true",
                    help="relay into the Codex session this runs in ($CODEX_THREAD_ID)")
     p.add_argument("--codex-thread", help="the Codex controller's session UUID, checked against its rollout")
@@ -2038,6 +2878,22 @@ def main(argv):
     p.add_argument("--detach", action="store_true",
                    help="run in a new session with output to $WFC_STATE/relay.log; prints the pid")
     p.set_defaults(func=cmd_relay)
+    p = sub.add_parser("owner", help="acquire, renew, or take over a controller scope")
+    p.add_argument("owner_action", choices=("acquire", "renew", "takeover", "claim"), type=lambda x: "acquire" if x == "claim" else x)
+    p.add_argument("--scope", required=True)
+    p.add_argument("--owner", default=os.environ.get("WFC_CONTROLLER_ID", "controller"))
+    p.add_argument("--token")
+    p.add_argument("--owner-token")
+    p.add_argument("--lease", type=float, default=OWNER_LEASE)
+    p.set_defaults(func=cmd_owner)
+    for action in ("acquire", "renew", "takeover", "claim"):
+        p = sub.add_parser(action, help=f"{action} a controller scope")
+        p.add_argument("--scope", required=True)
+        p.add_argument("--owner", default=os.environ.get("WFC_CONTROLLER_ID", "controller"))
+        p.add_argument("--token")
+        p.add_argument("--owner-token")
+        p.add_argument("--lease", type=float, default=OWNER_LEASE)
+        p.set_defaults(func=cmd_owner, owner_action=("acquire" if action == "claim" else action))
     args = parser.parse_args(argv)
     return args.func(args) or 0
 
