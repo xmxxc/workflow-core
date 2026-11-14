@@ -1,6 +1,7 @@
 """Backend contract tests using a non-terminal controlled execution backend."""
 
 import argparse
+import json
 import os
 import sqlite3
 import tempfile
@@ -15,6 +16,7 @@ class FakeBackend(router.ExecutionBackend):
         self.create_result = create_result
         self.submit_result = submit_result
         self.inspect_result = inspect_result
+        self.submit_category = None
         self.read_calls = 0
 
     def create(self, dispatch_id, cwd, command, extra_env, label=None):
@@ -30,7 +32,8 @@ class FakeBackend(router.ExecutionBackend):
         return router.backend_result("accepted", activity="active")
 
     def submit(self, dispatch_id, text, host=None):
-        return router.backend_result(self.submit_result, "fake submit diagnostic")
+        return router.backend_result(self.submit_result, "fake submit diagnostic",
+                                    **({"category": self.submit_category} if self.submit_category else {}))
 
     def interrupt(self, dispatch_id):
         return router.backend_result("accepted")
@@ -75,6 +78,20 @@ class BackendContract(unittest.TestCase):
                 self.assertEqual(outcome["result"], result)
                 self.assertEqual(outcome["diagnostic"], "fake submit diagnostic")
 
+    def test_refused_fault_category_is_preserved(self):
+        row = {"id": "d-fake", "backend": "fake", "host": "structured"}
+        db = router.connect()
+        for category in ("authentication", "policy_rejected"):
+            with self.subTest(category=category):
+                self.fake.submit_result = "refused"
+                self.fake.submit_category = category
+                outcome = router.backend_submit(row, "hello")
+                router.persist_input_fault(db, row["id"], "submit", router.backend_fault_state(outcome),
+                                           outcome["diagnostic"], outcome.get("category"))
+                stored = db.execute("SELECT category FROM fault_event WHERE dispatch = ?", (row["id"],)).fetchone()[0]
+                self.assertEqual(stored, category)
+        db.close()
+
     def test_create_refused_is_recorded_without_started_dispatch(self):
         self.fake.create_result = "refused"
         task = Path(self.tmp.name) / "task.md"
@@ -116,6 +133,29 @@ class BackendContract(unittest.TestCase):
         self.assertEqual(message[0], "unknown")
         self.assertIn("fake inspect timed out", message[1])
         self.assertEqual(self.fake.read_calls, 0)
+        db.close()
+
+    def test_uncertain_resume_requires_reconcile_before_retry(self):
+        self.fake.inspect_result = "uncertain"
+        db = router.connect()
+        db.execute("INSERT INTO dispatch (id, host, backend, cwd, task, created, started, report_dir, report, "
+                   "scope, role, current_round, current_attempt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                   ("d-resume", "structured", "fake", str(self.cwd), "task", 1, 1, str(self.cwd), "report",
+                    "s-fake", "worker", 1, "a-fake"))
+        db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, state, created) "
+                   "VALUES (?, ?, ?, ?, ?, 'running', ?)",
+                   ("d-resume", 1, "a-fake", "task", "report", 1))
+        db.commit()
+        row = db.execute("SELECT * FROM dispatch WHERE id = 'd-resume'").fetchone()
+
+        with self.assertRaises(SystemExit) as raised:
+            router.resume_reconcile_required(db, row, self.fake.inspect("d-resume"), None)
+        audit = json.loads(str(raised.exception))["audit"]
+        router.cmd_reconcile(argparse.Namespace(dispatch="d-resume", audit=audit, result="accepted",
+                                                actor="operator", evidence="confirmed-absent", owner_token=None))
+
+        state = db.execute("SELECT state FROM dispatch_round WHERE dispatch = 'd-resume'").fetchone()[0]
+        self.assertEqual(state, "running")
         db.close()
 
 

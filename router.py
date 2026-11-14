@@ -1368,7 +1368,8 @@ class TmuxBackend(ExecutionBackend):
             owned, diagnostic = session_owner(session)
             return backend_result("accepted", diagnostic=diagnostic, alive=True, owned=owned)
         if getattr(shown, "not_run", False):
-            return backend_result(DEFINITELY_NOT_SENT, "tmux could not run", alive=False, owned=False)
+            return backend_result(DEFINITELY_NOT_SENT, "tmux could not run", alive=False, owned=False,
+                                  confirmedAbsent=True)
         return backend_result("accepted", alive=False, owned=False)
 
     def read(self, dispatch_id):
@@ -1384,10 +1385,10 @@ class TmuxBackend(ExecutionBackend):
         if state == SENT:
             return backend_result("accepted")
         if state == NOT_SENT:
-            return backend_result(DEFINITELY_NOT_SENT, diagnostic, legacy=state,
+            return backend_result(DEFINITELY_NOT_SENT, diagnostic, category="input_not_delivered", legacy=state,
                                   recovery=f"backend could not send input to {session_name(dispatch_id)}; retry is safe")
         if state == READ_ONLY:
-            return backend_result("refused", diagnostic, notice=notice, legacy=state,
+            return backend_result("refused", diagnostic, category="permission_required", notice=notice, legacy=state,
                                   recovery=f"tmux session {session_name(dispatch_id)} refused input: {notice}; "
                                            "dispatch a new worker")
         # ``partial`` is deliberately exposed as uncertain: a backend cannot
@@ -1397,7 +1398,7 @@ class TmuxBackend(ExecutionBackend):
                     if state == PARTIAL else
                     f"input may or may not have reached tmux session {session_name(dispatch_id)}; "
                     f"attach (tmux attach -t {session_name(dispatch_id)}), inspect it, and do not send it again")
-        return backend_result(UNCERTAIN, diagnostic, legacy=state, recovery=recovery)
+        return backend_result(UNCERTAIN, diagnostic, category="input_uncertain", legacy=state, recovery=recovery)
 
     def interrupt(self, dispatch_id):
         inspected = self.inspect(dispatch_id)
@@ -1425,7 +1426,7 @@ class TmuxBackend(ExecutionBackend):
         if host == "codex" and probe_read_only:
             notice = new_notice(session, [], seconds_setting("WFC_RESUME_CHECK_SECONDS", 5))
             if notice:
-                return backend_result("refused", notice, notice=notice, legacy=READ_ONLY,
+                return backend_result("refused", notice, category="permission_required", notice=notice, legacy=READ_ONLY,
                                       recovery=f"tmux session {session} refused the brief: {notice}; dispatch a new worker")
         return created
 
@@ -1473,8 +1474,8 @@ def backend_fault_state(outcome):
     """Map a backend envelope to the legacy fault ledger vocabulary."""
     if outcome.get("legacy"):
         return outcome["legacy"]
-    return {DEFINITELY_NOT_SENT: NOT_SENT, "uncertain": UNCERTAIN,
-            "refused": READ_ONLY}.get(outcome["result"], outcome["result"])
+    return {DEFINITELY_NOT_SENT: NOT_SENT, "uncertain": UNCERTAIN}.get(
+        outcome["result"], outcome["result"])
 
 
 def mark_backend_reported(db, row):
@@ -1486,10 +1487,10 @@ def mark_backend_reported(db, row):
                    (row["id"], screen, time.time(), screen))
 
 
-def persist_input_fault(db, dispatch_id, operation, outcome, diagnostic=None):
+def persist_input_fault(db, dispatch_id, operation, outcome, diagnostic=None, category=None):
     """Persist an uncertain input result so it remains queryable after restart."""
-    category = {NOT_SENT: "input_not_delivered", PARTIAL: "input_not_delivered",
-                UNCERTAIN: "input_uncertain", READ_ONLY: "permission_required"}.get(outcome, "host_error")
+    category = category or {NOT_SENT: "input_not_delivered", PARTIAL: "input_not_delivered",
+                            UNCERTAIN: "input_uncertain", READ_ONLY: "permission_required"}.get(outcome, "host_error")
     diagnostic = diagnostic or f"{operation} returned {outcome}"
     db.execute("BEGIN IMMEDIATE")
     try:
@@ -1574,12 +1575,12 @@ def cmd_reply(args):
         if outcome["result"] in (DEFINITELY_NOT_SENT, "refused"):
             db.execute("DELETE FROM message WHERE id = ?", (reply_id,))
             state = backend_fault_state(outcome)
-            persist_input_fault(db, question["dispatch"], "reply", state, outcome.get("diagnostic"))
+            persist_input_fault(db, question["dispatch"], "reply", state, outcome.get("diagnostic"), outcome.get("category"))
             if outcome["result"] == "refused":
                 mark_backend_reported(db, dispatch_row)
             raise backend_failure(outcome, f"answer to question {question['id']}")
         if outcome["result"] == UNCERTAIN:
-            persist_input_fault(db, question["dispatch"], "reply", backend_fault_state(outcome), outcome.get("diagnostic"))
+            persist_input_fault(db, question["dispatch"], "reply", backend_fault_state(outcome), outcome.get("diagnostic"), outcome.get("category"))
             raise backend_failure(outcome, f"answer to question {question['id']}")  # the claim stays
         clear_input_fault(db, question["dispatch"], input_started)
     emit({"replied": question["id"], "dispatch": question["dispatch"]})
@@ -1643,14 +1644,14 @@ def cmd_continue(args):
             db.execute("UPDATE dispatch SET task = ?, report = ?, current_round = ?, current_attempt = ? WHERE id = ?",
                        (previous["task"], previous["report"], previous["current_round"], previous["current_attempt"], args.dispatch))
             db.execute("COMMIT")
-            persist_input_fault(db, args.dispatch, "continue", typed, diagnostic)
+            persist_input_fault(db, args.dispatch, "continue", typed, diagnostic, outcome.get("category"))
             raise SystemExit(why)
         db.execute("COMMIT")
-        persist_input_fault(db, args.dispatch, "continue", typed, diagnostic)
+        persist_input_fault(db, args.dispatch, "continue", typed, diagnostic, outcome.get("category"))
         raise SystemExit(f"{why}. But dispatch {args.dispatch} moved on meanwhile (a resume took the round over); "
                          f"its current state is kept")
     if outcome["result"] == UNCERTAIN:
-        persist_input_fault(db, args.dispatch, "continue", typed, diagnostic)
+        persist_input_fault(db, args.dispatch, "continue", typed, diagnostic, outcome.get("category"))
         raise backend_failure(outcome, "the next task")
     clear_input_fault(db, args.dispatch)
     emit({"continued": args.dispatch, "message": message_id})
@@ -1682,12 +1683,12 @@ def cmd_nudge(args):
     typed, diagnostic = backend_fault_state(outcome), outcome.get("diagnostic")
     if outcome["result"] in (DEFINITELY_NOT_SENT, "refused"):
         db.execute("DELETE FROM message WHERE id = ?", (message_id,))
-        persist_input_fault(db, args.dispatch, "nudge", typed, diagnostic)
+        persist_input_fault(db, args.dispatch, "nudge", typed, diagnostic, outcome.get("category"))
         if outcome["result"] == "refused":
             mark_backend_reported(db, row)
         raise backend_failure(outcome, "the message")
     if outcome["result"] == UNCERTAIN:
-        persist_input_fault(db, args.dispatch, "nudge", typed, diagnostic)
+        persist_input_fault(db, args.dispatch, "nudge", typed, diagnostic, outcome.get("category"))
         raise backend_failure(outcome, "the message")
     clear_input_fault(db, args.dispatch)
     emit({"nudged": args.dispatch, "message": message_id})
@@ -2259,6 +2260,25 @@ class registered_waiter:
         self.db.execute("DELETE FROM waiter WHERE pid = ?", (os.getpid(),))
 
 
+def resume_reconcile_required(db, row, inspection, token):
+    """Fence a resume when the backend cannot confirm the old attempt is absent."""
+    db.execute("BEGIN IMMEDIATE")
+    require_owner(db, row["scope"], token, "resume")
+    current = db.execute("SELECT current_round, current_attempt FROM dispatch WHERE id = ?",
+                         (row["id"],)).fetchone()
+    diagnostic = inspection.get("diagnostic") or f"backend inspect returned {inspection['result']}"
+    event = lifecycle_event(db, row["id"], "resume", round=current["current_round"],
+                            attempt=current["current_attempt"], from_attempt=current["current_attempt"],
+                            to_attempt=current["current_attempt"], from_host=row["host"], to_host=row["host"],
+                            result=inspection["result"], diagnostic=diagnostic)
+    db.execute("UPDATE dispatch_round SET state = 'unknown', completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?",
+               (time.time(), row["id"], current["current_round"], current["current_attempt"]))
+    db.execute("COMMIT")
+    raise SystemExit(json.dumps({"error": "lifecycle_reconcile_required", "dispatch": row["id"],
+                                 "audit": event, "operation": "resume", "result": inspection["result"],
+                                 "diagnostic": diagnostic}, ensure_ascii=False))
+
+
 def cmd_resume(args):
     """Relaunch a worker whose tmux session ended into its own host conversation, either to finish
     its current task or, once that is done, to start the next one (like `continue`)."""
@@ -2276,6 +2296,8 @@ def cmd_resume(args):
     initial_state = initial_round["state"] if initial_round else None
     session = session_name(args.dispatch)
     inspection = backend.inspect(args.dispatch)
+    if inspection["result"] != "accepted" and not inspection.get("confirmedAbsent", False):
+        resume_reconcile_required(db, row, inspection, owner_token(args))
     if inspection.get("alive", False):
         raise SystemExit(f"tmux session {session} is still running; use `continue` or attach to it")
     if bool(args.task) != bool(args.report):
@@ -2328,8 +2350,12 @@ def cmd_resume(args):
                          (args.dispatch,)).fetchone()
         now_round = db.execute("SELECT state FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
                                (args.dispatch, now["current_round"], now["current_attempt"])).fetchone()
+        locked_inspection = backend.inspect(args.dispatch)
+        if locked_inspection["result"] != "accepted" and not locked_inspection.get("confirmedAbsent", False):
+            db.execute("ROLLBACK")
+            resume_reconcile_required(db, row, locked_inspection, owner_token(args))
         if (round_mark(db, args.dispatch) != mark or lifecycle_generation(db, args.dispatch) != generation
-                or backend.inspect(args.dispatch).get("alive", False)
+                or locked_inspection.get("alive", False)
                 or (now["task"], now["report"], now["host"], now["host_session"], now["current_round"], now["current_attempt"])
                 != (row["task"], row["report"], row["host"], row["host_session"], row["current_round"], row["current_attempt"])
                 or not now_round or now_round["state"] != initial_state):
@@ -2370,7 +2396,7 @@ def cmd_resume(args):
                                   owner_credential=owner_token(args))
             legacy = resumed.get("legacy")
             if legacy:
-                persist_input_fault(db, args.dispatch, "resume", legacy, diagnostic)
+                persist_input_fault(db, args.dispatch, "resume", legacy, diagnostic, resumed.get("category"))
             if result == "refused":
                 raise backend_failure(resumed, "the resumed brief")
             if legacy in (PARTIAL, UNCERTAIN):
@@ -2617,8 +2643,9 @@ def check_workers(db, stall_after, scope=None, token=None):
         backend_fault = inspected if inspected["result"] == UNCERTAIN else None
         if alive and read_view and read_view.get("result") != "accepted":
             backend_fault = read_view
-        captured = (subprocess.CompletedProcess(["backend", "read"], 0, read_view["screen"], "")
-                    if read_view and read_view.get("result") == "accepted" else None)
+        screen = read_view.get("screen") if read_view and read_view.get("result") == "accepted" else None
+        captured = (subprocess.CompletedProcess(["backend", "read"], 0, screen, "")
+                    if screen is not None else None)
         now = time.time()
         # A resume starts a fresh watch: the host may record the reopened conversation elsewhere.
         watch_key = (dispatch_id, db.execute("SELECT MAX(id) FROM message WHERE dispatch = ? AND type = 'resumed'",
