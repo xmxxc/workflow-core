@@ -3094,6 +3094,66 @@ class Reclaim(unittest.TestCase):
         self.env.run("done", "--report", str(nxt), dispatch=dispatch)
         self.assertEqual([m["type"] for m in self.env.json("wait", "--timeout", "2")["messages"]], ["done", "done"])
 
+class MultiSignalContract(unittest.TestCase):
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+
+    def test_status_exposes_canonical_lifecycle_and_activity(self):
+        dispatch = self.env.dispatch()
+        view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((view["status"], view["lifecycle"], view["signals"]["activity"]),
+                         ("online", "running", "active"))
+        self.assertEqual(view["canonicalStates"],
+                         ["running", "online", "waiting-human", "blocked", "unknown",
+                          "completed", "failed", "reclaimed"])
+
+    def test_repeated_redraw_reaches_a_bounded_turn_timeout(self):
+        alt = self.env.screen.with_name("screen-alt.txt")
+        self.env.screen.write_text("tick-a\n")
+        alt.write_text("tick-b\n")
+        dispatch = self.env.dispatch(env={"FAKE_SCREEN": str(self.env.screen), "FAKE_SCREEN_ALT": str(alt),
+                                          "WFC_MAX_TURN_SECONDS": "0.1"})
+        [message] = self.env.json("wait", "--timeout", "2", "--stall-after", "60",
+                                   env={"FAKE_SCREEN": str(self.env.screen), "FAKE_SCREEN_ALT": str(alt),
+                                        "WFC_MAX_TURN_SECONDS": "0.1"})["messages"]
+        self.assertEqual((message["type"], message["fault"]["category"]), ("unknown", "timeout"))
+
+    def test_uncertain_reply_is_persisted_as_an_input_fault(self):
+        dispatch = self.env.dispatch()
+        self.env.run("ask", "Continue?", dispatch=dispatch)
+        [question] = self.env.json("wait", "--timeout", "1")["messages"]
+        result = self.env.run("reply", str(question["id"]), "yes", env={"FAKE_FAIL": "send-keys"})
+        self.assertNotEqual(result.returncode, 0)
+        view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((view["status"], view["signals"]["fault"]["category"]), ("unknown", "input_uncertain"))
+
+    def test_successful_reply_resets_the_turn_deadline(self):
+        dispatch = self.env.dispatch(env={"WFC_MAX_TURN_SECONDS": "3"})
+        self.env.run("ask", "Continue?", dispatch=dispatch)
+        [question] = self.env.json("wait", "--timeout", "1", env={"WFC_MAX_TURN_SECONDS": "3"})["messages"]
+        self.env.json("reply", str(question["id"]), "yes", env={"WFC_MAX_TURN_SECONDS": "3"})
+        result = self.env.json("wait", "--timeout", "0.2", "--stall-after", "60",
+                               env={"WFC_MAX_TURN_SECONDS": "3"})
+        self.assertNotIn("unknown", [message["type"] for message in result.get("messages", [])])
+
+    def test_timeout_event_keeps_its_fault_after_controller_consumes_it(self):
+        dispatch = self.env.dispatch(env={"WFC_MAX_TURN_SECONDS": "0.1"})
+        self.env.json("wait", "--timeout", "2", "--stall-after", "60",
+                      env={"WFC_MAX_TURN_SECONDS": "0.1"})
+        view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((view["status"], view["signals"]["fault"]["category"]), ("unknown", "timeout"))
+
+    def test_read_only_reply_is_blocked_and_not_host_active(self):
+        dispatch = self.env.dispatch(env={"FAKE_SCREEN": str(self.env.screen)})
+        self.env.run("ask", "Continue?", dispatch=dispatch)
+        [question] = self.env.json("wait", "--timeout", "1")["messages"]
+        self.env.screen.write_text("This conversation is unavailable. Its cached transcript and draft remain here; input is paused.\n")
+        self.env.run("reply", str(question["id"]), "yes", env={"FAKE_SCREEN": str(self.env.screen)})
+        view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual(view["signals"]["fault"]["category"], "permission_required")
+        self.assertFalse(view["signals"]["hostActive"])
+
 
 if __name__ == "__main__":
     unittest.main()

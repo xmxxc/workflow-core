@@ -67,6 +67,7 @@ TABLES = {
                           "reason TEXT, evidence TEXT, body_hash TEXT, from_state TEXT, to_state TEXT, created REAL",
     "screen_watch": "dispatch TEXT PRIMARY KEY, screen TEXT, since REAL, reported_screen TEXT",
     "host_error": "dispatch TEXT PRIMARY KEY, turn TEXT",
+    "fault_event": "dispatch TEXT PRIMARY KEY, operation TEXT, outcome TEXT, category TEXT, diagnostic TEXT, created REAL",
     "waiter": "pid INTEGER PRIMARY KEY, kind TEXT, since REAL",
 }
 # Column upgrades: `started` is set once the worker's tmux session exists (the watchdog ignores
@@ -1168,7 +1169,7 @@ def text_left_in_box(session, host, text):
 
 
 def type_into(session, text, host=None):
-    """Type one line into a TUI and submit it. Returns (state, notice), the state being
+    """Type one line into a TUI and submit it. Returns (state, notice, diagnostic), the state being
     SENT;
     NOT_SENT when the text certainly did not arrive (tmux could not be run at all): safe to type again;
     READ_ONLY when the host's screen says its conversation takes no input (`notice` is that line):
@@ -1187,29 +1188,35 @@ def type_into(session, text, host=None):
     screen = capture(session)
     before = screen_notices(screen) if screen is not None else None
     if before and any(kind == "state" for kind, _ in before):
-        return READ_ONLY, next(t for kind, t in before if kind == "state")
+        notice = next(t for kind, t in before if kind == "state")
+        return READ_ONLY, notice, notice
     sent = tmux("send-keys", "-t", session, "-l", text)
     if sent.returncode != 0:
-        return (NOT_SENT if getattr(sent, "not_run", False) else UNCERTAIN), None
+        state = NOT_SENT if getattr(sent, "not_run", False) else UNCERTAIN
+        return state, None, sent.stderr or sent.stdout or f"tmux send-keys exited {sent.returncode}"
     time.sleep(0.5)  # TUIs drop an Enter that arrives in the same burst as the text
-    if tmux("send-keys", "-t", session, "Enter").returncode != 0:
-        return PARTIAL, None
+    entered = tmux("send-keys", "-t", session, "Enter")
+    if entered.returncode != 0:
+        return PARTIAL, None, entered.stderr or entered.stdout or f"tmux Enter exited {entered.returncode}"
     if before is None:  # no screen to compare with: tmux could not capture it
-        return SENT, None
+        return SENT, None, None
     window = seconds_setting("WFC_TYPED_CHECK_SECONDS", 1.5)
     notice = new_notice(session, before, window)
     if notice:
-        return READ_ONLY, notice
+        return READ_ONLY, notice, notice
     for _ in range(ENTER_RETRIES):
         left = text_left_in_box(session, host, text)
         if left is None:
-            return SENT, None
-        if tmux("send-keys", "-t", session, "Enter").returncode != 0:
-            return PARTIAL, None
+            return SENT, None, None
+        entered = tmux("send-keys", "-t", session, "Enter")
+        if entered.returncode != 0:
+            return PARTIAL, None, entered.stderr or entered.stdout or f"tmux Enter exited {entered.returncode}"
         notice = new_notice(session, screen_notices(left), window)
         if notice:
-            return READ_ONLY, notice
-    return (PARTIAL, None) if text_left_in_box(session, host, text) is not None else (SENT, None)
+            return READ_ONLY, notice, notice
+    if text_left_in_box(session, host, text) is not None:
+        return PARTIAL, None, "typed text remained in the host input box"
+    return SENT, None, None
 
 
 def refusal(session, what, notice):
@@ -1230,6 +1237,30 @@ def typing_error(session, what, typed):
              else "was typed into, but its Enter was not confirmed in,")
     return SystemExit(f"{what} {state} tmux session {session}. Attach (tmux attach -t {session}), check the input "
                       f"line, and press Enter or clear it yourself; do not send it again.")
+
+
+def persist_input_fault(db, dispatch_id, operation, outcome, diagnostic=None):
+    """Persist an uncertain input result so it remains queryable after restart."""
+    category = {NOT_SENT: "input_not_delivered", PARTIAL: "input_not_delivered",
+                UNCERTAIN: "input_uncertain", READ_ONLY: "permission_required"}.get(outcome, "host_error")
+    diagnostic = diagnostic or f"{operation} returned {outcome}"
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        db.execute("INSERT OR REPLACE INTO fault_event (dispatch, operation, outcome, category, diagnostic, created) "
+                   "VALUES (?, ?, ?, ?, ?, ?)",
+                   (dispatch_id, operation, outcome, category, diagnostic, time.time()))
+        db.execute("COMMIT")
+    except BaseException:
+        db.execute("ROLLBACK")
+        raise
+    return None
+
+
+def clear_input_fault(db, dispatch_id, before=None):
+    if before is None:
+        db.execute("DELETE FROM fault_event WHERE dispatch = ?", (dispatch_id,))
+    else:
+        db.execute("DELETE FROM fault_event WHERE dispatch = ? AND created <= ?", (dispatch_id, before))
 
 
 class input_lock:
@@ -1276,16 +1307,20 @@ def cmd_reply(args):
     session = session_name(question["dispatch"])
     host = db.execute("SELECT host FROM dispatch WHERE id = ?", (question["dispatch"],)).fetchone()
     with input_lock(question["dispatch"]):
-        typed, notice = type_into(session, f"[router] Answer to question {question['id']}: {answer}",
-                                  host["host"] if host else None)
-    if typed in (NOT_SENT, READ_ONLY):
-        db.execute("DELETE FROM message WHERE id = ?", (reply_id,))
-        if typed == READ_ONLY:
-            mark_screen_reported(db, question["dispatch"], session)
-            raise SystemExit(refusal(session, "the answer", notice))
-        raise SystemExit(f"could not type the answer into tmux session {session}; is the worker still running?")
-    if typed in (PARTIAL, UNCERTAIN):
-        raise typing_error(session, f"The answer to question {question['id']}", typed)  # the claim stays
+        input_started = time.time()
+        typed, notice, diagnostic = type_into(session, f"[router] Answer to question {question['id']}: {answer}",
+                                              host["host"] if host else None)
+        if typed in (NOT_SENT, READ_ONLY):
+            db.execute("DELETE FROM message WHERE id = ?", (reply_id,))
+            persist_input_fault(db, question["dispatch"], "reply", typed, diagnostic)
+            if typed == READ_ONLY:
+                mark_screen_reported(db, question["dispatch"], session)
+                raise SystemExit(refusal(session, "the answer", notice))
+            raise SystemExit(f"could not type the answer into tmux session {session}; is the worker still running?")
+        if typed in (PARTIAL, UNCERTAIN):
+            persist_input_fault(db, question["dispatch"], "reply", typed, diagnostic)
+            raise typing_error(session, f"The answer to question {question['id']}", typed)  # the claim stays
+        clear_input_fault(db, question["dispatch"], input_started)
     emit({"replied": question["id"], "dispatch": question["dispatch"]})
 
 
@@ -1328,7 +1363,7 @@ def cmd_continue(args):
     db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
     db.execute("COMMIT")
     brief = worker_brief(args.dispatch, task, report, opening="[router] New task for you", attempt=attempt)
-    typed, notice = type_into(session, brief, row["host"])
+    typed, notice, diagnostic = type_into(session, brief, row["host"])
     if typed in (NOT_SENT, READ_ONLY):
         why = (refusal(session, "the next task", notice) if typed == READ_ONLY
                else f"could not type the next task into tmux session {session}")
@@ -1345,12 +1380,16 @@ def cmd_continue(args):
             db.execute("UPDATE dispatch SET task = ?, report = ?, current_round = ?, current_attempt = ? WHERE id = ?",
                        (previous["task"], previous["report"], previous["current_round"], previous["current_attempt"], args.dispatch))
             db.execute("COMMIT")
+            persist_input_fault(db, args.dispatch, "continue", typed, diagnostic)
             raise SystemExit(why)
         db.execute("COMMIT")
+        persist_input_fault(db, args.dispatch, "continue", typed, diagnostic)
         raise SystemExit(f"{why}. But dispatch {args.dispatch} moved on meanwhile (a resume took the round over); "
                          f"its current state is kept")
     if typed in (PARTIAL, UNCERTAIN):
+        persist_input_fault(db, args.dispatch, "continue", typed, diagnostic)
         raise typing_error(session, "The next task", typed)
+    clear_input_fault(db, args.dispatch)
     emit({"continued": args.dispatch, "message": message_id})
 
 
@@ -1374,15 +1413,18 @@ def cmd_nudge(args):
     message_id = post(db, args.dispatch, "worker", "nudge", {"text": text})
     db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
     db.execute("COMMIT")
-    typed, notice = type_into(session, f"[router] Message from the controller: {text}", row["host"])
+    typed, notice, diagnostic = type_into(session, f"[router] Message from the controller: {text}", row["host"])
     if typed in (NOT_SENT, READ_ONLY):
         db.execute("DELETE FROM message WHERE id = ?", (message_id,))
+        persist_input_fault(db, args.dispatch, "nudge", typed, diagnostic)
         if typed == READ_ONLY:
             mark_screen_reported(db, args.dispatch, session)
             raise SystemExit(refusal(session, "the message", notice))
         raise SystemExit(f"could not type the message into tmux session {session}")
     if typed in (PARTIAL, UNCERTAIN):
+        persist_input_fault(db, args.dispatch, "nudge", typed, diagnostic)
         raise typing_error(session, "The message", typed)
+    clear_input_fault(db, args.dispatch)
     emit({"nudged": args.dispatch, "message": message_id})
 
 
@@ -1399,6 +1441,76 @@ def message_view(r):
                                 "reason": r["resolution_reason"], "evidence": r["resolution_evidence"],
                                 "at": local_time(r["resolved_at"])} } if r["resolver_actor"] else {}),
             **({"delivered": bool(r["delivered"])} if r["recipient"] == "controller" else {}), **json.loads(r["body"])}
+
+
+# Public, stable fault categories.  Host-specific ``kind`` values remain in the message as raw
+# diagnostics; callers must decide whether a category is retryable, needs a human, or is terminal.
+def fault_category(kind, message=""):
+    text = f"{kind or ''} {message or ''}".lower()
+    if any(word in text for word in ("quota", "usage_limit", "rate_limit", "rate limit", "balance", "credit")):
+        return "quota"
+    if any(word in text for word in ("auth", "unauthor", "credential", "login", "token", "401")):
+        return "authentication"
+    if any(word in text for word in ("policy", "safety", "forbidden", "not allowed")):
+        return "policy_rejected"
+    if any(word in text for word in ("permission", "approval", "approve", "trust", "allow")):
+        return "permission_required"
+    if any(word in text for word in ("protocol", "disconnect", "connection reset", "broken pipe")):
+        return "protocol_disconnected"
+    if any(word in text for word in ("input", "send-keys", "not delivered", "partial", "uncertain")):
+        return "input_not_delivered"
+    if any(word in text for word in ("timeout", "timed out", "stall", "stalled")):
+        return "timeout"
+    if any(word in text for word in ("exit", "session ended", "process")):
+        return "process_exited"
+    return "host_error"
+
+
+def canonical_status(db, row, legacy_state, last, alive, watch):
+    """Return the multi-signal status contract while retaining legacy ``state``."""
+    latest_type = last["type"] if last else None
+    body = json.loads(last["body"]) if last else {}
+    persisted_fault = db.execute("SELECT operation, outcome, category, diagnostic, created FROM fault_event WHERE dispatch = ?",
+                                 (row["id"],)).fetchone()
+    if legacy_state == "reclaimed" or latest_type == "reclaimed":
+        status = "reclaimed"
+    elif latest_type == "cancelled" or legacy_state == "cancelled":
+        status = "cancelled"
+    elif latest_type == "done" or legacy_state == "done":
+        status = "completed"
+    elif latest_type == "question" or legacy_state == "asking":
+        status = "waiting-human"
+    elif latest_type == "blocked":
+        status = "blocked"
+    elif latest_type in ("stalled", "unknown", "fault"):
+        status = "unknown"
+    elif latest_type in ("exited", "failed") or legacy_state == "exited":
+        status = "failed"
+    elif alive:
+        status = "online"
+    else:
+        status = "unknown"
+    activity_after = seconds_setting("WFC_ACTIVITY_AFTER", 300)
+    idle = bool(watch and time.time() - watch["since"] >= activity_after)
+    fault = None
+    newer_fault = bool(persisted_fault and (not last or persisted_fault["created"] >= last["created"]))
+    if persisted_fault and (newer_fault or latest_type not in ("blocked", "stalled", "exited", "failed", "done", "cancelled", "reclaimed")):
+        fault = {"category": persisted_fault["category"], "kind": persisted_fault["outcome"],
+                 "diagnostic": persisted_fault["diagnostic"], "operation": persisted_fault["operation"],
+                 "requiresDecision": True}
+        status = "unknown"
+    if latest_type in ("blocked", "stalled", "unknown", "exited", "failed", "fault"):
+        stored_fault = body.get("fault") if isinstance(body.get("fault"), dict) else None
+        kind = body.get("kind") or latest_type
+        diagnostic = body.get("message") or body.get("reason") or body.get("screen")
+        fault = stored_fault or {"category": fault_category(kind, diagnostic), "kind": kind,
+                                 "diagnostic": diagnostic, "requiresDecision": True}
+    host_active = bool(alive and status in ("online", "waiting-human") and not idle)
+    activity = "active" if host_active else ("idle" if alive else "unknown")
+    return status, {"processOnline": bool(alive), "online": bool(alive), "hostActive": host_active,
+                    "activity": activity,
+                    "waitingHuman": status == "waiting-human", "blocked": status == "blocked",
+                    "idle": idle, "fault": fault}
 
 
 def dispatch_state(db, dispatch_id):
@@ -1436,13 +1548,20 @@ def cmd_status(args):
             continue
         last = db.execute("SELECT * FROM message WHERE dispatch = ? ORDER BY id DESC LIMIT 1", (row["id"],)).fetchone()
         watch = db.execute("SELECT since FROM screen_watch WHERE dispatch = ?", (row["id"],)).fetchone()
+        alive = session_alive(session_name(row["id"]))
+        canonical, signals = canonical_status(db, row, state, last, alive, watch)
+        lifecycle = "running" if canonical == "online" else canonical
         rounds = [dict(r) for r in db.execute("SELECT round, attempt, task, report, state, result, created, completed "
                                                "FROM dispatch_round WHERE dispatch = ? ORDER BY round, created", (row["id"],))]
         view = {"dispatch": row["id"], "scope": row["scope"], "role": row["role"],
                 "round": row["current_round"], "attempt": row["current_attempt"], "rounds": rounds,
                 "label": row["label"], "host": row["host"], "model": row["model"],
-                "git": bool(row["git"]), "state": state,
-                "tmux": session_name(row["id"]), "tmuxAlive": session_alive(session_name(row["id"])),
+                "git": bool(row["git"]), "state": state, "status": canonical, "lifecycle": lifecycle,
+                # queued/cancelled require backend lifecycle operations not exposed by this ticket;
+                # do not advertise states the current CLI cannot observe.
+                "canonicalStates": ["running", "online", "waiting-human", "blocked", "unknown",
+                                    "completed", "failed", "reclaimed"], "signals": signals,
+                "tmux": session_name(row["id"]), "tmuxAlive": alive,
                 "cwd": row["cwd"], "task": row["task"], "report": row["report"], "started": local_time(row["started"]),
                 "last": message_view(last) if last else None,
                 **({"screenIdleSeconds": int(now - watch["since"])} if watch else {}),
@@ -1601,6 +1720,7 @@ def cmd_resume(args):
     # From the locked re-check to the last keystroke under the input lock (taken before the SQLite
     # lock, as everywhere), so no nudge, done or continue can come between the launch and the brief.
     with input_lock(args.dispatch):
+        input_started = time.time()
         # Posted before launch so the new session's `done` sorts after it, and under the write lock the
         # watchdog also takes, so it cannot report the not-yet-started session as exited in between.
         db.execute("BEGIN IMMEDIATE")
@@ -1647,22 +1767,28 @@ def cmd_resume(args):
                              f"`wait` reports it exited if it never started.")
         if row["host"] == "opencode":
             brief = worker_brief(args.dispatch, task, report, opening=opening, attempt=attempt)
-            typed, notice = type_into(session, brief, row["host"]) if wait_for_quiet_screen(session) else (NOT_SENT, None)
+            typed, notice, diagnostic = (type_into(session, brief, row["host"]) if wait_for_quiet_screen(session)
+                                         else (NOT_SENT, None, "worker screen did not become ready"))
             if typed in (PARTIAL, UNCERTAIN):
+                persist_input_fault(db, args.dispatch, "resume", typed, diagnostic)
                 raise typing_error(session, "The brief", typed)
             if typed == READ_ONLY:
+                persist_input_fault(db, args.dispatch, "resume", typed, diagnostic)
                 mark_screen_reported(db, args.dispatch, session)
                 raise SystemExit(f"resumed {session}, but " + refusal(session, "the brief", notice))
             if typed == NOT_SENT:
+                persist_input_fault(db, args.dispatch, "resume", typed, diagnostic)
                 raise SystemExit(f"resumed {session} but could not type the brief into it; attach and paste it: {brief}")
         elif any(host == row["host"] for host, *_ in READ_ONLY_NOTICES):
             # The brief went in on the command line; a conversation that opens read-only drops it.
             notice = new_notice(session, [], seconds_setting("WFC_RESUME_CHECK_SECONDS", 5))
             if notice:
+                persist_input_fault(db, args.dispatch, "resume", READ_ONLY, notice)
                 mark_screen_reported(db, args.dispatch, session)
                 raise SystemExit(f"resumed {session}, but its screen says \"{notice}\" The brief was not sent, and "
                                  f"this conversation cannot go on; dispatch a new worker (the resumed round stays "
                                  f"recorded; close the session with tmux kill-session -t {session})")
+        clear_input_fault(db, args.dispatch, input_started)
     emit({"resumed": args.dispatch, "session": host_session, "tmux": session,
           "round": next_round, "attempt": attempt})
 
@@ -1871,6 +1997,7 @@ def check_workers(db, stall_after, scope=None, token=None):
     an idle prompt, a crash message or an approval dialog stays still."""
     candidates = (db.execute("SELECT * FROM dispatch WHERE started IS NOT NULL AND scope = ?", (scope,)).fetchall()
                   if scope else db.execute("SELECT * FROM dispatch WHERE started IS NOT NULL").fetchall())
+    max_turn = seconds_setting("WFC_MAX_TURN_SECONDS", 3600)
     for row in candidates:
         dispatch_id = row["id"]
         if not watched(db, dispatch_id) or reclaimed(db, dispatch_id):
@@ -1884,6 +2011,9 @@ def check_workers(db, stall_after, scope=None, token=None):
                                              (dispatch_id,)).fetchone()[0])
         turn_end = TURN_WATCHES.setdefault(watch_key, TurnWatch()).latest(row, now) if alive else None
         notice = read_only_notice(captured.stdout) if alive and captured.returncode == 0 else None
+        timeout_marker = f"timeout:{row['current_round']}:{row['current_attempt']}"
+        prior_timeout = db.execute("SELECT turn FROM host_error WHERE dispatch = ?", (dispatch_id,)).fetchone()
+        timeout_seen = bool(prior_timeout and prior_timeout["turn"] == timeout_marker)
         # Decide and post under one write lock, re-checking state a worker's `done` may have changed.
         db.execute("BEGIN IMMEDIATE")
         try:
@@ -1895,20 +2025,36 @@ def check_workers(db, stall_after, scope=None, token=None):
                 pass  # a stale sample: `resume` relaunched it while we sampled; look again next pass
             elif not alive:
                 post(db, dispatch_id, "controller", "exited",
-                     {"reason": f"tmux session {session} ended without done"})
+                     {"reason": f"tmux session {session} ended without done", "kind": "process_exit",
+                      "fault": {"category": "process_exited", "requiresDecision": True}})
             elif notice:
                 # Nothing typed into this session will arrive: report it now, once per screen.
                 watch = db.execute("SELECT reported_screen FROM screen_watch WHERE dispatch = ?",
                                    (dispatch_id,)).fetchone()
                 if watch is None or watch["reported_screen"] != captured.stdout:
                     post(db, dispatch_id, "controller", "blocked",
-                         {"host": row["host"], "kind": "session_read_only", "message": notice})
+                         {"host": row["host"], "kind": "session_read_only", "message": notice,
+                          "fault": {"category": "permission_required", "requiresDecision": True}})
                     db.execute("INSERT OR REPLACE INTO screen_watch (dispatch, screen, since, reported_screen) "
                                "VALUES (?, ?, ?, ?)", (dispatch_id, captured.stdout, now, captured.stdout))
             elif awaiting_answer(db, dispatch_id):
                 db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (dispatch_id,))
+            elif max_turn and now - round_started(db, dispatch_id) >= max_turn and not timeout_seen \
+                    and not blocked_turn(db, dispatch_id, turn_end):
+                marker = timeout_marker
+                post(db, dispatch_id, "controller", "unknown", {
+                     "kind": "turn_timeout", "message": f"turn exceeded {int(max_turn)} seconds",
+                     "idleSeconds": int(now - round_started(db, dispatch_id)),
+                     "fault": {"category": "timeout", "kind": "turn_timeout",
+                               "diagnostic": f"turn exceeded {int(max_turn)} seconds",
+                               "requiresDecision": True}})
+                db.execute("INSERT OR REPLACE INTO host_error (dispatch, turn) VALUES (?, ?)",
+                           (dispatch_id, marker))
             elif blocked_turn(db, dispatch_id, turn_end):
-                post(db, dispatch_id, "controller", "blocked", {"host": row["host"], **turn_end["error"]})
+                error = turn_end["error"]
+                post(db, dispatch_id, "controller", "blocked", {"host": row["host"], **error,
+                     "fault": {"category": fault_category(error.get("kind"), error.get("message")),
+                               "requiresDecision": True}})
                 db.execute("INSERT OR REPLACE INTO host_error (dispatch, turn) VALUES (?, ?)",
                            (dispatch_id, turn_end["turn"]))
                 if captured.returncode == 0:  # the stall that follows on this screen is the same news
@@ -1937,7 +2083,7 @@ def blocked_turn(db, dispatch_id, turn_end):
 def round_started(db, dispatch_id):
     """When the worker last got input from the router: its dispatch, or its latest continue,
     resume or nudge. A host error from before that belongs to an earlier turn."""
-    latest = db.execute("SELECT MAX(created) FROM message WHERE dispatch = ? AND type IN ('continue', 'resumed', 'nudge')",
+    latest = db.execute("SELECT MAX(created) FROM message WHERE dispatch = ? AND type IN ('continue', 'resumed', 'nudge', 'reply')",
                         (dispatch_id,)).fetchone()[0]
     started = db.execute("SELECT started FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()[0]
     return max(latest or 0, started or 0)
@@ -1952,7 +2098,8 @@ def watch_screen(db, dispatch_id, screen, now, stall_after):
     elif now - watch["since"] >= stall_after and watch["reported_screen"] != screen:
         tail = "\n".join([line for line in screen.splitlines() if line.strip()][-15:])
         post(db, dispatch_id, "controller", "stalled",
-             {"idleSeconds": int(now - watch["since"]), "screen": tail})
+             {"idleSeconds": int(now - watch["since"]), "screen": tail,
+              "kind": "stall_timeout", "fault": {"category": "timeout", "requiresDecision": True}})
         db.execute("UPDATE screen_watch SET reported_screen = ? WHERE dispatch = ?", (screen, dispatch_id))
 
 
