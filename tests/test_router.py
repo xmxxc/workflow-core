@@ -5,6 +5,7 @@ import fcntl
 import json
 import os
 import shlex
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -1576,9 +1577,14 @@ class ResumePartialTyping(unittest.TestCase):
         first = env.run("resume", dispatch, "--task", str(task2), "--report", str(report2),
                         env={**screen, "FAKE_ENTER_FAIL": "1"}, timeout=20)
         env.end_session(dispatch)
+        blocked = env.run("resume", dispatch, env=screen, timeout=20)
+        audit = env.json("status", "--dispatch", dispatch)["dispatches"][0]["audit"][-1]["id"]
+        env.json("reconcile", dispatch, str(audit), "--result", "definitely-not-sent",
+                 "--actor", "operator-1", "--evidence", "enter-failed")
         second = env.run("resume", dispatch, env=screen, timeout=20)
 
         self.assertNotEqual(first.returncode, 0)
+        self.assertNotEqual(blocked.returncode, 0)
         self.assertEqual(second.returncode, 0, second.stderr)
         typed = [c[-1] for c in env.host_calls() if c[:2] == ["tmux", "send-keys"] and "-l" in c]
         self.assertIn(str(report2), typed[-1])
@@ -1819,7 +1825,23 @@ class RoundIdentity(unittest.TestCase):
         done = self.env.run("done", "--report", str(report2), dispatch=dispatch)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("no longer accepted", done.stderr)
+        view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((view["rounds"][-1]["state"], view["audit"][-1]["result"]), ("unknown", "uncertain"))
+
+    def test_a_resume_definitely_not_sent_keeps_attempt_and_audit(self):
+        dispatch = self.env.dispatch("claude")
+        self.env.end_session(dispatch)
+        before = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]["attempt"]
+
+        result = self.env.run("resume", dispatch, env={"PATH": "/definitely/no-such-tmux"})
+
+        self.assertNotEqual(result.returncode, 0)
+        view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertNotEqual(view["attempt"], before)
+        self.assertEqual((view["rounds"][-1]["state"], view["audit"][-1]["result"]),
+                         ("unknown", "definitely-not-sent"))
 
 
 
@@ -3093,6 +3115,327 @@ class Reclaim(unittest.TestCase):
         nxt.write_text("# r2\n")
         self.env.run("done", "--report", str(nxt), dispatch=dispatch)
         self.assertEqual([m["type"] for m in self.env.json("wait", "--timeout", "2")["messages"]], ["done", "done"])
+
+
+class InterruptHandoff(unittest.TestCase):
+    """Control-plane interruption and host handoff keep attempts auditable and fenced."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+
+    def status(self, dispatch):
+        return self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+
+    def test_interrupt_is_unknown_and_fences_the_old_attempt(self):
+        dispatch = self.env.dispatch()
+        old_attempt = self.status(dispatch)["attempt"]
+
+        result = self.env.json("interrupt", dispatch)
+
+        self.assertEqual((result["operation"], result["result"]), ("interrupt", "accepted"))
+        view = self.status(dispatch)
+        self.assertEqual((view["status"], view["rounds"][0]["state"]), ("unknown", "unknown"))
+        self.assertEqual(view["audit"][0]["operation"], "interrupt")
+        self.env.report.write_text("# old\n")
+        rejected = self.env.run("done", "--report", str(self.env.report), "--attempt", old_attempt, dispatch=dispatch)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("no longer accepted", rejected.stderr)
+
+    def test_uncertain_interrupt_is_not_replayed(self):
+        dispatch = self.env.dispatch()
+        before = len([c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]])
+
+        result = self.env.json("interrupt", dispatch, env={"FAKE_FAIL": "send-keys"})
+        repeated = self.env.run("interrupt", dispatch, env={"FAKE_FAIL": "send-keys"})
+        audit = self.status(dispatch)["audit"][-1]["id"]
+        reconciled = self.env.json("reconcile", dispatch, str(audit), "--result", "unknown",
+                                   "--actor", "operator-1", "--evidence", "interrupt-uncertain")
+
+        self.assertEqual(result["result"], "uncertain")
+        self.assertNotEqual(repeated.returncode, 0)
+        self.assertIn("lifecycle_reconcile_required", repeated.stderr)
+        self.assertEqual(reconciled["result"], "unknown")
+        self.assertEqual(self.status(dispatch)["status"], "unknown")
+        after = len([c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]])
+        self.assertEqual(after, before)
+
+    def test_uncertain_close_is_not_replayed_until_reconciled(self):
+        dispatch = self.env.dispatch()
+        first = self.env.json("close", dispatch, env={"FAKE_KILL_FAIL": f"wfc-{dispatch}"})
+        repeated = self.env.run("close", dispatch, env={"FAKE_KILL_FAIL": f"wfc-{dispatch}"})
+        audit = self.status(dispatch)["audit"][-1]["id"]
+        reconciled = self.env.json("reconcile", dispatch, str(audit), "--result", "unknown",
+                                   "--actor", "operator-1", "--evidence", "close-uncertain")
+
+        self.assertEqual(first["result"], "uncertain")
+        self.assertNotEqual(repeated.returncode, 0)
+        self.assertIn("lifecycle_reconcile_required", repeated.stderr)
+        self.assertEqual(reconciled["result"], "unknown")
+
+    def test_close_is_distinct_and_records_cancellation(self):
+        dispatch = self.env.dispatch()
+
+        result = self.env.json("close", dispatch)
+
+        self.assertEqual((result["operation"], result["result"]), ("close", "completed"))
+        view = self.status(dispatch)
+        self.assertEqual((view["status"], view["audit"][-1]["operation"]), ("cancelled", "close"))
+        self.assertFalse(view["tmuxAlive"])
+
+    def test_handoff_changes_host_and_revokes_the_old_attempt(self):
+        dispatch = self.env.dispatch("codex")
+        old_attempt = self.status(dispatch)["attempt"]
+
+        result = self.env.json("handoff", dispatch, "--host", "claude")
+
+        self.assertEqual((result["operation"], result["result"]), ("handoff", "accepted"))
+        view = self.status(dispatch)
+        self.assertEqual((view["host"], view["audit"][-1]["operation"], view["audit"][-1]["result"]),
+                         ("claude", "handoff", "accepted"))
+        self.assertNotEqual(view["attempt"], old_attempt)
+        launches = len([c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]])
+        duplicate = self.env.json("handoff", dispatch, "--host", "claude")
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(len([c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]]), launches)
+        self.env.report.write_text("# handoff\n")
+        stale = self.env.run("done", "--report", str(self.env.report), "--attempt", old_attempt, dispatch=dispatch)
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertIn("no longer accepted", stale.stderr)
+        self.env.json("done", "--report", str(self.env.report), "--attempt", view["attempt"], dispatch=dispatch)
+
+    def test_pending_handoff_after_router_restart_refuses_implicit_retry(self):
+        dispatch = self.env.dispatch()
+        db = sqlite3.connect(self.env.state / "router.db")
+        attempt = self.status(dispatch)["attempt"]
+        db.execute("INSERT INTO lifecycle_event (dispatch, operation, round, attempt, from_attempt, to_attempt, "
+                   "from_host, to_host, result, diagnostic, created) VALUES (?, 'handoff', 1, ?, ?, 'a-pending', "
+                   "'codex', 'claude', 'pending', 'router stopped before tmux result', ?)",
+                   (dispatch, attempt, attempt, time.time()))
+        db.commit()
+        db.close()
+        before = len([c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]])
+
+        result = self.env.run("handoff", dispatch, "--host", "claude")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("lifecycle_reconcile_required", result.stderr)
+        view = self.status(dispatch)
+        self.assertEqual(len(view["rounds"]), 1)
+        self.assertEqual(len([c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]]), before)
+
+    def test_foreign_session_handoff_is_refused_and_audited(self):
+        dispatch = self.env.dispatch()
+        (self.env.sessions / f"wfc-{dispatch}").write_text(json.dumps({"WFC_STATE": "/other/state"}))
+
+        result = self.env.run("handoff", dispatch, "--host", "claude")
+
+        self.assertNotEqual(result.returncode, 0)
+        view = self.status(dispatch)
+        self.assertEqual((view["audit"][-1]["operation"], view["audit"][-1]["result"]), ("handoff", "refused"))
+        self.assertEqual(len(view["rounds"]), 1)
+
+    def test_pending_handoff_round_is_unknown_until_reconciled(self):
+        dispatch = self.env.dispatch()
+        db = sqlite3.connect(self.env.state / "router.db")
+        attempt = self.status(dispatch)["attempt"]
+        db.execute("UPDATE dispatch_round SET state='unknown' WHERE dispatch=? AND attempt=?", (dispatch, attempt))
+        db.execute("INSERT INTO lifecycle_event (dispatch, operation, round, attempt, from_attempt, to_attempt, "
+                   "from_host, to_host, result, diagnostic, created) VALUES (?, 'handoff', 1, ?, ?, ?, "
+                   "'codex', 'claude', 'pending', 'awaiting external result', ?)",
+                   (dispatch, attempt, attempt, attempt, time.time()))
+        db.commit(); db.close()
+
+        view = self.status(dispatch)
+
+        self.assertEqual((view["state"], view["status"], view["lifecycle"]), ("unknown", "unknown", "unknown"))
+
+    def test_reconcile_records_operator_evidence_and_is_idempotent(self):
+        dispatch = self.env.dispatch()
+        db = sqlite3.connect(self.env.state / "router.db")
+        attempt = self.status(dispatch)["attempt"]
+        db.execute("UPDATE dispatch_round SET state='unknown' WHERE dispatch=? AND attempt=?", (dispatch, attempt))
+        db.execute("INSERT INTO lifecycle_event (dispatch, operation, round, attempt, from_attempt, to_attempt, "
+                   "from_host, to_host, result, diagnostic, created) VALUES (?, 'handoff', 1, ?, ?, ?, "
+                   "'codex', 'claude', 'pending', 'awaiting external result', ?)",
+                   (dispatch, attempt, attempt, attempt, time.time()))
+        db.commit(); db.close()
+
+        result = self.env.json("reconcile", dispatch, "1", "--result", "accepted", "--actor", "operator-1",
+                               "--evidence", "tmux-receipt-1")
+        duplicate = self.env.json("reconcile", dispatch, "1", "--result", "accepted", "--actor", "operator-1",
+                                  "--evidence", "tmux-receipt-1")
+        view = self.status(dispatch)
+
+        self.assertFalse(result["duplicate"])
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(view["rounds"][-1]["state"], "running")
+        self.assertEqual(view["audit"][-1]["resolution"]["actor"], "operator-1")
+
+    def test_reconcile_can_record_definitely_not_sent_and_unknown(self):
+        for outcome in ("definitely-not-sent", "unknown", "refused"):
+            with self.subTest(outcome=outcome):
+                env = Env()
+                try:
+                    dispatch = env.dispatch()
+                    db = sqlite3.connect(env.state / "router.db")
+                    attempt = env.json("status", "--dispatch", dispatch)["dispatches"][0]["attempt"]
+                    db.execute("UPDATE dispatch_round SET state='unknown' WHERE dispatch=? AND attempt=?", (dispatch, attempt))
+                    db.execute("INSERT INTO lifecycle_event (dispatch, operation, round, attempt, from_attempt, to_attempt, "
+                               "from_host, to_host, result, diagnostic, created) VALUES (?, 'handoff', 1, ?, ?, ?, "
+                               "'codex', 'claude', 'pending', 'awaiting external result', ?)",
+                               (dispatch, attempt, attempt, attempt, time.time()))
+                    db.commit(); db.close()
+                    env.json("reconcile", dispatch, "1", "--result", outcome, "--actor", "operator-1", "--evidence", "proof")
+                    self.assertEqual(env.json("status", "--dispatch", dispatch)["dispatches"][0]["status"],
+                                     "unknown" if outcome != "accepted" else "online")
+                finally:
+                    env.close()
+
+    def test_pending_resume_blocks_repeat_and_reconcile_can_release_it(self):
+        dispatch = self.env.dispatch("claude")
+        self.env.end_session(dispatch)
+        db = sqlite3.connect(self.env.state / "router.db")
+        attempt = self.status(dispatch)["attempt"]
+        db.execute("UPDATE dispatch_round SET state='unknown' WHERE dispatch=? AND attempt=?", (dispatch, attempt))
+        db.execute("INSERT INTO lifecycle_event (dispatch, operation, round, attempt, from_attempt, to_attempt, "
+                   "from_host, to_host, result, diagnostic, created) VALUES (?, 'resume', 1, ?, ?, ?, "
+                   "'claude', 'claude', 'pending', 'router stopped before resume result', ?)",
+                   (dispatch, attempt, attempt, attempt, time.time()))
+        db.commit(); db.close()
+
+        blocked = self.env.run("resume", dispatch)
+        for command in ("interrupt", "close"):
+            other = self.env.run(command, dispatch)
+            self.assertNotEqual(other.returncode, 0)
+            self.assertIn("lifecycle_reconcile_required", other.stderr)
+        handoff = self.env.run("handoff", dispatch, "--host", "codex")
+        released = self.env.json("reconcile", dispatch, "1", "--result", "accepted", "--actor", "operator-1",
+                                 "--evidence", "resume-receipt-1")
+
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertNotEqual(handoff.returncode, 0)
+        self.assertIn("lifecycle_reconcile_required", blocked.stderr)
+        self.assertIn("lifecycle_reconcile_required", handoff.stderr)
+        self.assertEqual(released["result"], "accepted")
+
+    def test_reconcile_is_fenced_after_owner_takeover(self):
+        scope = "s-r8-owner"
+        first = self.env.json("owner", "acquire", "--scope", scope, "--owner", "first", "--lease", "60")
+        dispatch = self.env.dispatch(extra_args=("--scope", scope, "--owner-token", first["token"]))
+        db = sqlite3.connect(self.env.state / "router.db")
+        attempt = self.status(dispatch)["attempt"]
+        db.execute("UPDATE dispatch_round SET state='unknown' WHERE dispatch=? AND attempt=?", (dispatch, attempt))
+        db.execute("INSERT INTO lifecycle_event (dispatch, operation, round, attempt, from_attempt, to_attempt, "
+                   "from_host, to_host, result, diagnostic, created) VALUES (?, 'handoff', 1, ?, ?, ?, "
+                   "'codex', 'claude', 'pending', 'awaiting external result', ?)",
+                   (dispatch, attempt, attempt, attempt, time.time()))
+        db.commit(); db.close()
+        second = self.env.json("owner", "takeover", "--scope", scope, "--owner", "second")
+        stale = self.env.run("reconcile", dispatch, "1", "--result", "accepted", "--actor", "first",
+                             "--evidence", "old-proof", env={"WFC_CONTROLLER_TOKEN": first["token"]})
+
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertIn("stale_controller_owner", stale.stderr)
+        self.assertNotEqual(second["token"], first["token"])
+        resolved = self.env.json("reconcile", dispatch, "1", "--result", "accepted", "--actor", "second",
+                                 "--evidence", "new-proof", "--owner-token", second["token"])
+        self.assertEqual(resolved["result"], "accepted")
+
+    def test_resume_crash_after_external_launch_leaves_pending_attempt(self):
+        dispatch = self.env.dispatch("claude")
+        self.env.end_session(dispatch)
+        fake = self.env.bin / "tmux"
+        fake.write_text(fake.read_text() + (
+            "if sys.argv[1] == 'new-session' and os.environ.get('FAKE_KILL_PARENT'):\n"
+            "    import signal; os.kill(os.getppid(), signal.SIGKILL)\n"))
+        result = self.env.run("resume", dispatch, env={"FAKE_KILL_PARENT": "1"})
+
+        self.assertEqual(result.returncode, -signal.SIGKILL)
+        view = self.status(dispatch)
+        self.assertEqual((view["status"], view["audit"][-1]["result"], view["rounds"][-1]["state"]),
+                         ("unknown", "pending", "unknown"))
+
+    def test_handoff_model_is_persisted_for_status_and_resume(self):
+        dispatch = self.env.dispatch("codex", extra_args=("--model", "old/model"))
+
+        self.env.json("handoff", dispatch, "--host", "claude", "--model", "new/model")
+
+        self.assertEqual(self.status(dispatch)["model"], "new/model")
+        self.env.end_session(dispatch)
+        self.env.json("resume", dispatch)
+        launches = [c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]]
+        self.assertIn("new/model", launches[-1])
+
+    def test_resume_has_its_own_audit_event(self):
+        dispatch = self.env.dispatch("claude")
+        self.env.end_session(dispatch)
+
+        resumed = self.env.json("resume", dispatch)
+
+        self.assertEqual(resumed["resumed"], dispatch)
+        self.assertEqual((self.status(dispatch)["audit"][-1]["operation"],
+                          self.status(dispatch)["audit"][-1]["result"]), ("resume", "accepted"))
+
+class MultiSignalContract(unittest.TestCase):
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+
+    def test_status_exposes_canonical_lifecycle_and_activity(self):
+        dispatch = self.env.dispatch()
+        view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((view["status"], view["lifecycle"], view["signals"]["activity"]),
+                         ("online", "running", "active"))
+        self.assertEqual(view["canonicalStates"],
+                         ["running", "online", "waiting-human", "blocked", "unknown",
+                          "completed", "failed", "cancelled", "reclaimed"])
+
+    def test_repeated_redraw_reaches_a_bounded_turn_timeout(self):
+        alt = self.env.screen.with_name("screen-alt.txt")
+        self.env.screen.write_text("tick-a\n")
+        alt.write_text("tick-b\n")
+        dispatch = self.env.dispatch(env={"FAKE_SCREEN": str(self.env.screen), "FAKE_SCREEN_ALT": str(alt),
+                                          "WFC_MAX_TURN_SECONDS": "0.1"})
+        [message] = self.env.json("wait", "--timeout", "2", "--stall-after", "60",
+                                   env={"FAKE_SCREEN": str(self.env.screen), "FAKE_SCREEN_ALT": str(alt),
+                                        "WFC_MAX_TURN_SECONDS": "0.1"})["messages"]
+        self.assertEqual((message["type"], message["fault"]["category"]), ("unknown", "timeout"))
+
+    def test_uncertain_reply_is_persisted_as_an_input_fault(self):
+        dispatch = self.env.dispatch()
+        self.env.run("ask", "Continue?", dispatch=dispatch)
+        [question] = self.env.json("wait", "--timeout", "1")["messages"]
+        result = self.env.run("reply", str(question["id"]), "yes", env={"FAKE_FAIL": "send-keys"})
+        self.assertNotEqual(result.returncode, 0)
+        view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((view["status"], view["signals"]["fault"]["category"]), ("unknown", "input_uncertain"))
+
+    def test_successful_reply_resets_the_turn_deadline(self):
+        dispatch = self.env.dispatch(env={"WFC_MAX_TURN_SECONDS": "3"})
+        self.env.run("ask", "Continue?", dispatch=dispatch)
+        [question] = self.env.json("wait", "--timeout", "1", env={"WFC_MAX_TURN_SECONDS": "3"})["messages"]
+        self.env.json("reply", str(question["id"]), "yes", env={"WFC_MAX_TURN_SECONDS": "3"})
+        result = self.env.json("wait", "--timeout", "0.2", "--stall-after", "60",
+                               env={"WFC_MAX_TURN_SECONDS": "3"})
+        self.assertNotIn("unknown", [message["type"] for message in result.get("messages", [])])
+
+    def test_timeout_event_keeps_its_fault_after_controller_consumes_it(self):
+        dispatch = self.env.dispatch(env={"WFC_MAX_TURN_SECONDS": "0.1"})
+        self.env.json("wait", "--timeout", "2", "--stall-after", "60",
+                      env={"WFC_MAX_TURN_SECONDS": "0.1"})
+        view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((view["status"], view["signals"]["fault"]["category"]), ("unknown", "timeout"))
+
+    def test_read_only_reply_is_blocked_and_not_host_active(self):
+        dispatch = self.env.dispatch(env={"FAKE_SCREEN": str(self.env.screen)})
+        self.env.run("ask", "Continue?", dispatch=dispatch)
+        [question] = self.env.json("wait", "--timeout", "1")["messages"]
+        self.env.screen.write_text("This conversation is unavailable. Its cached transcript and draft remain here; input is paused.\n")
+        self.env.run("reply", str(question["id"]), "yes", env={"FAKE_SCREEN": str(self.env.screen)})
+        view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual(view["signals"]["fault"]["category"], "permission_required")
+        self.assertFalse(view["signals"]["hostActive"])
 
 
 if __name__ == "__main__":
