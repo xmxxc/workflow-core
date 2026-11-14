@@ -68,6 +68,10 @@ TABLES = {
     "screen_watch": "dispatch TEXT PRIMARY KEY, screen TEXT, since REAL, reported_screen TEXT",
     "host_error": "dispatch TEXT PRIMARY KEY, turn TEXT",
     "fault_event": "dispatch TEXT PRIMARY KEY, operation TEXT, outcome TEXT, category TEXT, diagnostic TEXT, created REAL",
+    # Durable lifecycle operations are separate from worker/controller messages.  An
+    # operation can cross a tmux boundary after the router has committed its fencing
+    # decision, so its pending/accepted/uncertain result must survive a router restart.
+    "lifecycle_event": "id INTEGER PRIMARY KEY AUTOINCREMENT, dispatch TEXT, operation TEXT, round INTEGER, attempt TEXT, from_attempt TEXT, to_attempt TEXT, from_host TEXT, to_host TEXT, result TEXT, diagnostic TEXT, created REAL",
     "waiter": "pid INTEGER PRIMARY KEY, kind TEXT, since REAL",
 }
 # Column upgrades: `started` is set once the worker's tmux session exists (the watchdog ignores
@@ -780,6 +784,36 @@ def post(db, dispatch_id, recipient, type_, body, request_key=None):
     return cur.lastrowid
 
 
+def lifecycle_event(db, dispatch_id, operation, *, round=None, attempt=None,
+                    from_attempt=None, to_attempt=None, from_host=None, to_host=None,
+                    result="pending", diagnostic=None):
+    """Append an auditable control-plane operation and return its id.
+
+    The event is deliberately independent of ``message``: interrupt/close/handoff
+    may have no worker message to deliver, and their external tmux result can be
+    updated after the fencing transaction has committed.
+    """
+    cur = db.execute(
+        "INSERT INTO lifecycle_event (dispatch, operation, round, attempt, from_attempt, to_attempt, "
+        "from_host, to_host, result, diagnostic, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (dispatch_id, operation, round, attempt, from_attempt, to_attempt, from_host, to_host,
+         result, diagnostic, time.time()))
+    return cur.lastrowid
+
+
+def finish_lifecycle_event(db, event_id, result, diagnostic=None):
+    db.execute("UPDATE lifecycle_event SET result = ?, diagnostic = COALESCE(?, diagnostic) WHERE id = ?",
+               (result, diagnostic, event_id))
+
+
+def lifecycle_view(row):
+    return {"id": row["id"], "operation": row["operation"], "round": row["round"],
+            "attempt": row["attempt"], "fromAttempt": row["from_attempt"], "toAttempt": row["to_attempt"],
+            "fromHost": row["from_host"], "toHost": row["to_host"], "result": row["result"],
+            **({"diagnostic": row["diagnostic"]} if row["diagnostic"] else {}),
+            "at": local_time(row["created"])}
+
+
 def receipt_response(db, message_id, duplicate=False):
     row = db.execute("SELECT * FROM message WHERE id = ?", (message_id,)).fetchone()
     result = {"message": row["id"], "messageId": row["message_uid"],
@@ -869,6 +903,14 @@ def finish_round(db, dispatch_id, report, head, expected_attempt=None, request_k
         raise SystemExit(f"attempt {expected_attempt or '(missing)'} is no longer accepted for {dispatch_id}; "
                          f"current attempt is {current_row['current_attempt']}")
     current = current_row["report"]
+    current_round = db.execute(
+        "SELECT state FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
+        (dispatch_id, current_row["current_round"], current_row["current_attempt"])).fetchone()
+    if (current_round is None or current_round["state"] != "running") and not (
+            current_round and current_round["state"] == "completed" and current and str(report) == current):
+        db.execute("ROLLBACK")
+        raise SystemExit(f"attempt {expected_attempt or current_row['current_attempt']} is no longer accepted for {dispatch_id}; "
+                         f"its state is {current_round['state'] if current_round else 'unknown'}")
     # A retried `done` from an earlier round must not finish the round that followed it.
     if current and str(report) != current:
         db.execute("ROLLBACK")
@@ -912,6 +954,12 @@ def cmd_ask(args):
             return
     same_report = db.execute("SELECT COUNT(*) FROM dispatch_round WHERE dispatch = ? AND report = ?",
                              (dispatch_id, identity["report"])).fetchone()[0]
+    current_round = db.execute("SELECT state FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
+                               (dispatch_id, identity["current_round"], identity["current_attempt"])).fetchone()
+    if current_round is None or current_round["state"] != "running":
+        db.execute("ROLLBACK")
+        raise SystemExit(f"attempt {args.attempt or identity['current_attempt']} is no longer accepted for {dispatch_id}; "
+                         f"its state is {current_round['state'] if current_round else 'unknown'}")
     # Missing attempt is accepted only for a truly legacy first attempt. Once the
     # dispatch has moved to another round, an old worker's question is ambiguous.
     legacy_missing = identity["current_round"] == 1 and same_report == 1
@@ -994,6 +1042,7 @@ def cmd_resolve(args):
 
 
 SENT, NOT_SENT, UNCERTAIN, PARTIAL = "sent", "not-sent", "uncertain", "partial"
+DEFINITELY_NOT_SENT = "definitely-not-sent"
 READ_ONLY = "read-only"
 
 # What a host draws when its conversation can no longer take input. `state` texts describe the
@@ -1299,6 +1348,22 @@ def cmd_reply(args):
     # Claim the question before typing, so two concurrent replies cannot both type an answer.
     db.execute("BEGIN IMMEDIATE")
     require_owner(db, owner_scope(db, question["dispatch"]), owner_token(args), "reply")
+    question_body = json.loads(question["body"])
+    current = db.execute("SELECT current_round, current_attempt FROM dispatch WHERE id = ?",
+                         (question["dispatch"],)).fetchone()
+    legacy_question = question_body.get("round") is None and question_body.get("attempt") is None
+    attempt_row = db.execute("SELECT state FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
+                             (question["dispatch"], question_body.get("round"), question_body.get("attempt"))).fetchone()
+    lifecycle_seen = db.execute("SELECT 1 FROM lifecycle_event WHERE dispatch = ? LIMIT 1",
+                                (question["dispatch"],)).fetchone()
+    valid_attempt = (legacy_question and current is not None and current["current_round"] == 1 and not lifecycle_seen
+                     or not legacy_question and current is not None
+                     and question_body.get("round") == current["current_round"]
+                     and question_body.get("attempt") == current["current_attempt"]
+                     and attempt_row is not None and attempt_row["state"] == "running")
+    if not valid_attempt:
+        db.execute("ROLLBACK")
+        raise SystemExit(f"question {args.message} belongs to an attempt that is no longer accepted")
     if answered(db, question["id"]):
         db.execute("ROLLBACK")
         raise SystemExit(f"question {question['id']} was already answered")
@@ -1428,6 +1493,235 @@ def cmd_nudge(args):
     emit({"nudged": args.dispatch, "message": message_id})
 
 
+def _current_attempt(db, dispatch_id):
+    row = db.execute("SELECT * FROM dispatch WHERE id = ? AND started IS NOT NULL", (dispatch_id,)).fetchone()
+    if row is None:
+        raise SystemExit(f"unknown dispatch {dispatch_id} in {state_dir()}")
+    round_row = db.execute("SELECT * FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
+                           (dispatch_id, row["current_round"], row["current_attempt"])).fetchone()
+    if round_row is None:
+        raise SystemExit(f"dispatch {dispatch_id} has no current attempt")
+    return row, round_row
+
+
+def _set_lifecycle_result(db, event_id, dispatch_id, result, diagnostic=None, state=None):
+    db.execute("BEGIN IMMEDIATE")
+    finish_lifecycle_event(db, event_id, result, diagnostic)
+    if state:
+        current = db.execute("SELECT current_round, current_attempt FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
+        db.execute("UPDATE dispatch_round SET state = ?, completed = CASE WHEN ? IN ('cancelled', 'completed') THEN ? ELSE completed END "
+                   "WHERE dispatch = ? AND round = ? AND attempt = ?",
+                   (state, state, time.time(), dispatch_id, current["current_round"], current["current_attempt"]))
+    db.execute("COMMIT")
+
+
+def cmd_interrupt(args):
+    """Fence the current attempt and request a host interrupt.
+
+    The attempt is made non-writable before the external keypress.  Any result that
+    cannot be confirmed remains ``unknown`` and requires an explicit resume/handoff.
+    """
+    db = connect()
+    with input_lock(args.dispatch):
+        row, current = _current_attempt(db, args.dispatch)
+        db.execute("BEGIN IMMEDIATE")
+        require_owner(db, row["scope"], owner_token(args), "interrupt")
+        event = lifecycle_event(db, args.dispatch, "interrupt", round=current["round"],
+                                attempt=current["attempt"], from_attempt=current["attempt"],
+                                from_host=row["host"], to_host=row["host"])
+        post(db, args.dispatch, "worker", "interrupted", {"round": current["round"],
+             "attempt": current["attempt"], "result": "pending"})
+        db.execute("UPDATE dispatch_round SET state = 'unknown', completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?",
+                   (time.time(), args.dispatch, current["round"], current["attempt"]))
+        db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
+        db.execute("COMMIT")
+        session = session_name(args.dispatch)
+        if not session_alive(session):
+            result, diagnostic = UNCERTAIN, f"tmux session {session} is gone; interruption cannot be confirmed"
+        else:
+            owned, why = session_owner(session)
+            if not owned:
+                result, diagnostic = "refused", why
+            else:
+                sent = tmux("send-keys", "-t", session, "C-c")
+                if sent.returncode == 0:
+                    result, diagnostic = "accepted", None
+                elif getattr(sent, "not_run", False):
+                    result, diagnostic = DEFINITELY_NOT_SENT, sent.stderr or sent.stdout or "tmux could not run"
+                else:
+                    result, diagnostic = UNCERTAIN, sent.stderr or sent.stdout or f"tmux exited {sent.returncode}"
+        _set_lifecycle_result(db, event, args.dispatch, result, diagnostic)
+    emit({"dispatch": args.dispatch, "operation": "interrupt", "result": result,
+          "round": current["round"], "attempt": current["attempt"],
+          **({"diagnostic": diagnostic} if diagnostic else {})})
+
+
+def cmd_close(args):
+    """Close only this router-owned session and record a durable cancellation audit."""
+    db = connect()
+    with input_lock(args.dispatch):
+        row, current = _current_attempt(db, args.dispatch)
+        db.execute("BEGIN IMMEDIATE")
+        require_owner(db, row["scope"], owner_token(args), "close")
+        session = session_name(args.dispatch)
+        if session_alive(session):
+            owned, why = session_owner(session)
+            if not owned:
+                db.execute("ROLLBACK")
+                db.execute("BEGIN IMMEDIATE")
+                lifecycle_event(db, args.dispatch, "close", round=current["round"], attempt=current["attempt"],
+                                from_attempt=current["attempt"], from_host=row["host"], to_host=row["host"],
+                                result="refused", diagnostic=why)
+                db.execute("COMMIT")
+                event = None
+                result, diagnostic = "refused", why
+            else:
+                event = lifecycle_event(db, args.dispatch, "close", round=current["round"],
+                                        attempt=current["attempt"], from_attempt=current["attempt"],
+                                        from_host=row["host"], to_host=row["host"])
+                post(db, args.dispatch, "worker", "closed", {"round": current["round"],
+                     "attempt": current["attempt"], "result": "pending"})
+                db.execute("UPDATE dispatch_round SET state = 'unknown', completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?",
+                           (time.time(), args.dispatch, current["round"], current["attempt"]))
+                db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
+                db.execute("COMMIT")
+                killed = tmux("kill-session", "-t", session)
+                if killed.returncode == 0:
+                    result, diagnostic = "completed", None
+                elif getattr(killed, "not_run", False):
+                    result, diagnostic = DEFINITELY_NOT_SENT, killed.stderr or killed.stdout or "tmux could not run"
+                else:
+                    result, diagnostic = UNCERTAIN, killed.stderr or killed.stdout or f"tmux exited {killed.returncode}"
+        else:
+            event = lifecycle_event(db, args.dispatch, "close", round=current["round"],
+                                    attempt=current["attempt"], from_attempt=current["attempt"],
+                                    from_host=row["host"], to_host=row["host"], result="completed",
+                                    diagnostic="session was already gone")
+            post(db, args.dispatch, "worker", "closed", {"round": current["round"],
+                 "attempt": current["attempt"], "result": "completed"})
+            db.execute("UPDATE dispatch_round SET state = 'cancelled', completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?",
+                       (time.time(), args.dispatch, current["round"], current["attempt"]))
+            db.execute("COMMIT")
+            result, diagnostic = "completed", "session was already gone"
+        if event is not None and result != "completed" and db.execute("SELECT result FROM lifecycle_event WHERE id = ?", (event,)).fetchone()[0] == "pending":
+            _set_lifecycle_result(db, event, args.dispatch, result, diagnostic)
+        elif event is not None and result == "completed" and db.execute("SELECT result FROM lifecycle_event WHERE id = ?", (event,)).fetchone()[0] == "pending":
+            _set_lifecycle_result(db, event, args.dispatch, result, diagnostic, state="cancelled")
+    if result == "refused":
+        raise SystemExit(diagnostic)
+    emit({"dispatch": args.dispatch, "operation": "close", "result": result,
+          "round": current["round"], "attempt": current["attempt"],
+          **({"diagnostic": diagnostic} if diagnostic else {})})
+
+
+def cmd_handoff(args):
+    """Fence an attempt, close its session, and start the task on a new host."""
+    db = connect()
+    with input_lock(args.dispatch):
+        row, current = _current_attempt(db, args.dispatch)
+        require_owner(db, row["scope"], owner_token(args), "handoff")
+        if bool(args.task) != bool(args.report):
+            raise SystemExit("give both --task and --report, or neither")
+        if args.task and not done_current_task(db, args.dispatch):
+            raise SystemExit(f"dispatch {args.dispatch} has not done its current task; handoff without --task to continue it")
+        if not args.task and done_current_task(db, args.dispatch):
+            raise SystemExit(f"dispatch {args.dispatch} already finished its task; give the next one with --task and --report")
+        task = Path(args.task).resolve() if args.task else Path(row["task"])
+        report = Path(args.report).resolve() if args.report else Path(row["report"])
+        if row["report_dir"] and str(report.parent) != row["report_dir"]:
+            raise SystemExit(f"the report must be in {row['report_dir']}, the directory this worker was given write access to")
+        if args.task:
+            db.execute("BEGIN IMMEDIATE")
+            refuse_used_report(db, args.dispatch, report)
+            db.execute("ROLLBACK")
+        session = session_name(args.dispatch)
+        old_alive = session_alive(session)
+        if old_alive:
+            owned, why = session_owner(session)
+            if not owned:
+                raise SystemExit(why)
+        next_round = current["round"] + (1 if args.task else 0)
+        attempt = "a-" + uuid.uuid4().hex[:12]
+        host_session = str(uuid.uuid4()) if args.host == "claude" else None
+        controller = db.execute("SELECT token FROM controller_owner WHERE scope = ?", (row["scope"],)).fetchone()
+        command, extra_env = LAUNCHERS[args.host](
+            worker_brief(args.dispatch, task, report, opening="[router] This task has been handed off to a new host",
+                         attempt=attempt, owner=bool(controller)),
+            [state_dir(), Path(row["report_dir"])], Path(row["cwd"]), args.model or row["model"], host_session,
+            effort=row["effort"], network=bool(row["network"]), label=row["label"], git=bool(row["git"]))
+        if controller:
+            extra_env = {**extra_env, "WFC_OWNER_TOKEN": controller["token"]}
+        db.execute("BEGIN IMMEDIATE")
+        require_owner(db, row["scope"], owner_token(args), "handoff")
+        latest, _ = _current_attempt(db, args.dispatch)
+        if latest["current_attempt"] != current["attempt"] or latest["host"] != row["host"]:
+            db.execute("ROLLBACK")
+            raise SystemExit(f"dispatch {args.dispatch} changed while handing off; inspect status and retry")
+        event = lifecycle_event(db, args.dispatch, "handoff", round=next_round, attempt=attempt,
+                                from_attempt=current["attempt"], to_attempt=attempt,
+                                from_host=row["host"], to_host=args.host)
+        post(db, args.dispatch, "worker", "handoff", {"round": next_round, "attempt": attempt,
+             "fromAttempt": current["attempt"], "fromHost": row["host"], "toHost": args.host, "result": "pending"})
+        if not args.task:
+            db.execute("UPDATE dispatch_round SET state = 'unknown', completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?",
+                       (time.time(), args.dispatch, current["round"], current["attempt"]))
+        db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, created) VALUES (?, ?, ?, ?, ?, ?)",
+                   (args.dispatch, next_round, attempt, str(task), str(report), time.time()))
+        db.execute("UPDATE dispatch SET host = ?, host_session = ?, task = ?, report = ?, current_round = ?, current_attempt = ? WHERE id = ?",
+                   (args.host, host_session, str(task), str(report), next_round, attempt, args.dispatch))
+        db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
+        db.execute("COMMIT")
+
+        if old_alive:
+            killed = tmux("kill-session", "-t", session)
+            if killed.returncode == 0:
+                close_result, close_diag = "completed", None
+            elif getattr(killed, "not_run", False):
+                close_result, close_diag = DEFINITELY_NOT_SENT, killed.stderr or killed.stdout or "tmux could not run"
+            else:
+                close_result, close_diag = UNCERTAIN, killed.stderr or killed.stdout or f"tmux exited {killed.returncode}"
+        else:
+            close_result, close_diag = "completed", "old session was already gone"
+        if close_result != "completed":
+            finish_result = close_result
+            diagnostic = f"could not confirm closing old session: {close_diag}"
+            _set_lifecycle_result(db, event, args.dispatch, finish_result, diagnostic, state="unknown")
+            emit({"dispatch": args.dispatch, "operation": "handoff", "result": finish_result,
+                  "fromAttempt": current["attempt"], "attempt": attempt, "host": args.host,
+                  "diagnostic": diagnostic})
+            return
+        launched = launch(args.dispatch, row["cwd"], command, extra_env, row["label"])
+        if launched == NOT_SENT:
+            diagnostic = "new host session was definitely not started"
+            _set_lifecycle_result(db, event, args.dispatch, DEFINITELY_NOT_SENT, diagnostic, state="unknown")
+            emit({"dispatch": args.dispatch, "operation": "handoff", "result": DEFINITELY_NOT_SENT,
+                  "fromAttempt": current["attempt"], "attempt": attempt, "host": args.host,
+                  "diagnostic": diagnostic})
+            return
+        if launched == UNCERTAIN:
+            diagnostic = "new host session start was not confirmed"
+            _set_lifecycle_result(db, event, args.dispatch, UNCERTAIN, diagnostic, state="unknown")
+            emit({"dispatch": args.dispatch, "operation": "handoff", "result": UNCERTAIN,
+                  "fromAttempt": current["attempt"], "attempt": attempt, "host": args.host,
+                  "diagnostic": diagnostic})
+            return
+        if args.host == "opencode":
+            typed, notice, diagnostic = (type_into(session, worker_brief(args.dispatch, task, report,
+                                      opening="[router] This task has been handed off to a new host", attempt=attempt), args.host)
+                                         if wait_for_quiet_screen(session) else (NOT_SENT, None, "worker screen did not become ready"))
+            if typed != SENT:
+                _set_lifecycle_result(db, event, args.dispatch, UNCERTAIN if typed in (PARTIAL, UNCERTAIN) else DEFINITELY_NOT_SENT,
+                                      diagnostic or notice, state="unknown")
+                emit({"dispatch": args.dispatch, "operation": "handoff", "result": UNCERTAIN if typed in (PARTIAL, UNCERTAIN) else DEFINITELY_NOT_SENT,
+                      "fromAttempt": current["attempt"], "attempt": attempt, "host": args.host,
+                      "diagnostic": diagnostic or notice})
+                return
+        _set_lifecycle_result(db, event, args.dispatch, "accepted")
+    emit({"dispatch": args.dispatch, "operation": "handoff", "result": "accepted",
+          "fromAttempt": current["attempt"], "attempt": attempt, "host": args.host,
+          "round": next_round})
+
+
 def local_time(epoch):
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch)) if epoch else None
 
@@ -1470,15 +1764,22 @@ def canonical_status(db, row, legacy_state, last, alive, watch):
     """Return the multi-signal status contract while retaining legacy ``state``."""
     latest_type = last["type"] if last else None
     body = json.loads(last["body"]) if last else {}
+    current = db.execute("SELECT current_round, current_attempt FROM dispatch WHERE id = ?", (row["id"],)).fetchone()
+    current_round = db.execute("SELECT state FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
+                               (row["id"], current["current_round"], current["current_attempt"])).fetchone() if current else None
+    current_round_state = current_round["state"] if current_round else None
+    current_message = bool(last and (body.get("attempt") is None or body.get("attempt") == current["current_attempt"]))
     persisted_fault = db.execute("SELECT operation, outcome, category, diagnostic, created FROM fault_event WHERE dispatch = ?",
                                  (row["id"],)).fetchone()
     if legacy_state == "reclaimed" or latest_type == "reclaimed":
         status = "reclaimed"
-    elif latest_type == "cancelled" or legacy_state == "cancelled":
+    elif current_round_state in ("unknown", "interrupted") or legacy_state == "unknown":
+        status = "unknown"
+    elif latest_type in ("closed", "cancelled") or legacy_state == "cancelled" or current_round_state == "cancelled":
         status = "cancelled"
-    elif latest_type == "done" or legacy_state == "done":
+    elif (current_message and latest_type == "done") or legacy_state == "done":
         status = "completed"
-    elif latest_type == "question" or legacy_state == "asking":
+    elif (current_message and latest_type == "question") or legacy_state == "asking":
         status = "waiting-human"
     elif latest_type == "blocked":
         status = "blocked"
@@ -1514,8 +1815,15 @@ def canonical_status(db, row, legacy_state, last, alive, watch):
 
 
 def dispatch_state(db, dispatch_id):
-    if done_current_task(db, dispatch_id):
+    current = db.execute("SELECT current_round, current_attempt FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
+    active_round = db.execute("SELECT state FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
+                              (dispatch_id, current["current_round"], current["current_attempt"])).fetchone() if current else None
+    if active_round and active_round["state"] == "completed":
         return "done"
+    if active_round and active_round["state"] == "cancelled":
+        return "cancelled"
+    if active_round and active_round["state"] in ("unknown", "interrupted"):
+        return "unknown"
     if reclaimed(db, dispatch_id):
         return "reclaimed"
     if not watched(db, dispatch_id):
@@ -1553,8 +1861,11 @@ def cmd_status(args):
         lifecycle = "running" if canonical == "online" else canonical
         rounds = [dict(r) for r in db.execute("SELECT round, attempt, task, report, state, result, created, completed "
                                                "FROM dispatch_round WHERE dispatch = ? ORDER BY round, created", (row["id"],))]
+        audit = [lifecycle_view(event) for event in db.execute(
+            "SELECT * FROM lifecycle_event WHERE dispatch = ? ORDER BY id", (row["id"],))]
         view = {"dispatch": row["id"], "scope": row["scope"], "role": row["role"],
                 "round": row["current_round"], "attempt": row["current_attempt"], "rounds": rounds,
+                "audit": audit,
                 "label": row["label"], "host": row["host"], "model": row["model"],
                 "git": bool(row["git"]), "state": state, "status": canonical, "lifecycle": lifecycle,
                 # queued/cancelled require backend lifecycle operations not exposed by this ticket;
@@ -1743,6 +2054,9 @@ def cmd_resume(args):
         # for an interrupted worker still preserves the prior attempt for diagnosis.
         next_round = identity["current_round"] + (1 if args.task else 0)
         attempt = resume_attempt
+        resume_event = lifecycle_event(db, args.dispatch, "resume", round=next_round, attempt=attempt,
+                                       from_attempt=identity["current_attempt"], to_attempt=attempt,
+                                       from_host=row["host"], to_host=row["host"])
         if not args.task:
             db.execute("UPDATE dispatch_round SET state = 'unknown', completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?",
                        (time.time(), args.dispatch, identity["current_round"], identity["current_attempt"]))
@@ -1763,6 +2077,8 @@ def cmd_resume(args):
                    (str(task), str(report), host_session, next_round, attempt, args.dispatch))
         db.execute("COMMIT")
         if launched == UNCERTAIN:
+            _set_lifecycle_result(db, resume_event, args.dispatch, UNCERTAIN,
+                                  f"tmux did not confirm {session}")
             raise SystemExit(f"tmux did not confirm {session}; the resumed round is recorded. Check `tmux ls`; "
                              f"`wait` reports it exited if it never started.")
         if row["host"] == "opencode":
@@ -1770,27 +2086,32 @@ def cmd_resume(args):
             typed, notice, diagnostic = (type_into(session, brief, row["host"]) if wait_for_quiet_screen(session)
                                          else (NOT_SENT, None, "worker screen did not become ready"))
             if typed in (PARTIAL, UNCERTAIN):
+                _set_lifecycle_result(db, resume_event, args.dispatch, UNCERTAIN, diagnostic)
                 persist_input_fault(db, args.dispatch, "resume", typed, diagnostic)
                 raise typing_error(session, "The brief", typed)
             if typed == READ_ONLY:
+                _set_lifecycle_result(db, resume_event, args.dispatch, "refused", notice)
                 persist_input_fault(db, args.dispatch, "resume", typed, diagnostic)
                 mark_screen_reported(db, args.dispatch, session)
                 raise SystemExit(f"resumed {session}, but " + refusal(session, "the brief", notice))
             if typed == NOT_SENT:
+                _set_lifecycle_result(db, resume_event, args.dispatch, DEFINITELY_NOT_SENT, diagnostic)
                 persist_input_fault(db, args.dispatch, "resume", typed, diagnostic)
                 raise SystemExit(f"resumed {session} but could not type the brief into it; attach and paste it: {brief}")
         elif any(host == row["host"] for host, *_ in READ_ONLY_NOTICES):
             # The brief went in on the command line; a conversation that opens read-only drops it.
             notice = new_notice(session, [], seconds_setting("WFC_RESUME_CHECK_SECONDS", 5))
             if notice:
+                _set_lifecycle_result(db, resume_event, args.dispatch, "refused", notice)
                 persist_input_fault(db, args.dispatch, "resume", READ_ONLY, notice)
                 mark_screen_reported(db, args.dispatch, session)
                 raise SystemExit(f"resumed {session}, but its screen says \"{notice}\" The brief was not sent, and "
                                  f"this conversation cannot go on; dispatch a new worker (the resumed round stays "
                                  f"recorded; close the session with tmux kill-session -t {session})")
         clear_input_fault(db, args.dispatch, input_started)
-    emit({"resumed": args.dispatch, "session": host_session, "tmux": session,
-          "round": next_round, "attempt": attempt})
+        _set_lifecycle_result(db, resume_event, args.dispatch, "accepted")
+    emit({"resumed": args.dispatch, "operation": "resume", "result": "accepted",
+          "session": host_session, "tmux": session, "round": next_round, "attempt": attempt})
 
 
 def session_owner(session):
@@ -1957,11 +2278,11 @@ def round_mark(db, dispatch_id):
 
 
 def done_current_task(db, dispatch_id):
-    """True once the dispatch reported done after its latest `continue` (or its first task)."""
-    return db.execute(
-        "SELECT 1 FROM message m WHERE m.dispatch = ? AND m.type = 'done' AND m.id > "
-        "COALESCE((SELECT MAX(c.id) FROM message c WHERE c.dispatch = m.dispatch AND c.type = 'continue'), 0)",
-        (dispatch_id,)).fetchone() is not None
+    """True once the current round has a durable completed result."""
+    current = db.execute("SELECT current_round, current_attempt FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
+    return bool(current and db.execute(
+        "SELECT 1 FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ? AND state = 'completed'",
+        (dispatch_id, current["current_round"], current["current_attempt"])).fetchone())
 
 
 def watched(db, dispatch_id):
@@ -1972,7 +2293,10 @@ def watched(db, dispatch_id):
         "SELECT 1 FROM message m WHERE m.dispatch = ? AND m.type = 'exited' AND m.id > "
         "COALESCE((SELECT MAX(r.id) FROM message r WHERE r.dispatch = m.dispatch AND r.type = 'resumed'), 0)",
         (dispatch_id,)).fetchone()
-    return started is not None and exited is None and not done_current_task(db, dispatch_id)
+    current = db.execute("SELECT current_round, current_attempt FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
+    active_round = db.execute("SELECT state FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
+                              (dispatch_id, current["current_round"], current["current_attempt"])).fetchone() if current else None
+    return started is not None and exited is None and active_round is not None and active_round["state"] == "running"
 
 
 def reclaimed(db, dispatch_id):
@@ -1987,8 +2311,13 @@ def reclaimed(db, dispatch_id):
 
 
 def awaiting_answer(db, dispatch_id):
+    current = db.execute("SELECT current_round, current_attempt FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
+    if current is None:
+        return False
     return any(not answered(db, q["id"]) for q in db.execute(
-        "SELECT id FROM message WHERE dispatch = ? AND type = 'question'", (dispatch_id,)))
+        "SELECT id FROM message WHERE dispatch = ? AND type = 'question' "
+        "AND json_extract(body, '$.round') = ? AND json_extract(body, '$.attempt') = ?",
+        (dispatch_id, current["current_round"], current["current_attempt"])))
 
 
 def check_workers(db, stall_after, scope=None, token=None):
@@ -2368,6 +2697,22 @@ def main(argv):
     p.add_argument("--text", required=True)
     p.add_argument("--owner-token")
     p.set_defaults(func=cmd_nudge)
+    p = sub.add_parser("interrupt", help="fence the current attempt and request a host interrupt")
+    p.add_argument("dispatch")
+    p.add_argument("--owner-token")
+    p.set_defaults(func=cmd_interrupt)
+    p = sub.add_parser("close", help="close a router-owned worker session and record cancellation")
+    p.add_argument("dispatch")
+    p.add_argument("--owner-token")
+    p.set_defaults(func=cmd_close)
+    p = sub.add_parser("handoff", help="move a task to a new host and attempt")
+    p.add_argument("dispatch")
+    p.add_argument("--host", required=True, choices=sorted(LAUNCHERS))
+    p.add_argument("--task", help="next task; required with --report when the current task is done")
+    p.add_argument("--report", help="next report in the dispatch report directory")
+    p.add_argument("--model", help="model for the new host")
+    p.add_argument("--owner-token")
+    p.set_defaults(func=cmd_handoff)
     p = sub.add_parser("status", help="show every dispatch, undelivered messages and running waiters")
     one = p.add_mutually_exclusive_group()
     one.add_argument("--dispatch", help="one dispatch, with its whole message history")

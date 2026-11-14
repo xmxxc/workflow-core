@@ -3094,6 +3094,80 @@ class Reclaim(unittest.TestCase):
         self.env.run("done", "--report", str(nxt), dispatch=dispatch)
         self.assertEqual([m["type"] for m in self.env.json("wait", "--timeout", "2")["messages"]], ["done", "done"])
 
+
+class InterruptHandoff(unittest.TestCase):
+    """Control-plane interruption and host handoff keep attempts auditable and fenced."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+
+    def status(self, dispatch):
+        return self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+
+    def test_interrupt_is_unknown_and_fences_the_old_attempt(self):
+        dispatch = self.env.dispatch()
+        old_attempt = self.status(dispatch)["attempt"]
+
+        result = self.env.json("interrupt", dispatch)
+
+        self.assertEqual((result["operation"], result["result"]), ("interrupt", "accepted"))
+        view = self.status(dispatch)
+        self.assertEqual((view["status"], view["rounds"][0]["state"]), ("unknown", "unknown"))
+        self.assertEqual(view["audit"][0]["operation"], "interrupt")
+        self.env.report.write_text("# old\n")
+        rejected = self.env.run("done", "--report", str(self.env.report), "--attempt", old_attempt, dispatch=dispatch)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("no longer accepted", rejected.stderr)
+
+    def test_uncertain_interrupt_is_not_replayed(self):
+        dispatch = self.env.dispatch()
+        before = len([c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]])
+
+        result = self.env.json("interrupt", dispatch, env={"FAKE_FAIL": "send-keys"})
+
+        self.assertEqual(result["result"], "uncertain")
+        self.assertEqual(self.status(dispatch)["status"], "unknown")
+        after = len([c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]])
+        self.assertEqual(after, before)
+
+    def test_close_is_distinct_and_records_cancellation(self):
+        dispatch = self.env.dispatch()
+
+        result = self.env.json("close", dispatch)
+
+        self.assertEqual((result["operation"], result["result"]), ("close", "completed"))
+        view = self.status(dispatch)
+        self.assertEqual((view["status"], view["audit"][-1]["operation"]), ("cancelled", "close"))
+        self.assertFalse(view["tmuxAlive"])
+
+    def test_handoff_changes_host_and_revokes_the_old_attempt(self):
+        dispatch = self.env.dispatch("codex")
+        old_attempt = self.status(dispatch)["attempt"]
+
+        result = self.env.json("handoff", dispatch, "--host", "claude")
+
+        self.assertEqual((result["operation"], result["result"]), ("handoff", "accepted"))
+        view = self.status(dispatch)
+        self.assertEqual((view["host"], view["audit"][-1]["operation"], view["audit"][-1]["result"]),
+                         ("claude", "handoff", "accepted"))
+        self.assertNotEqual(view["attempt"], old_attempt)
+        self.env.report.write_text("# handoff\n")
+        stale = self.env.run("done", "--report", str(self.env.report), "--attempt", old_attempt, dispatch=dispatch)
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertIn("no longer accepted", stale.stderr)
+        self.env.json("done", "--report", str(self.env.report), "--attempt", view["attempt"], dispatch=dispatch)
+
+    def test_resume_has_its_own_audit_event(self):
+        dispatch = self.env.dispatch("claude")
+        self.env.end_session(dispatch)
+
+        resumed = self.env.json("resume", dispatch)
+
+        self.assertEqual(resumed["resumed"], dispatch)
+        self.assertEqual((self.status(dispatch)["audit"][-1]["operation"],
+                          self.status(dispatch)["audit"][-1]["result"]), ("resume", "accepted"))
+
 class MultiSignalContract(unittest.TestCase):
     def setUp(self):
         self.env = Env()
