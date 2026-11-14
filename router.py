@@ -11,6 +11,7 @@ import argparse
 import collections
 import calendar
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -58,7 +59,11 @@ TABLES = {
     "dispatch": "id TEXT PRIMARY KEY, host TEXT, cwd TEXT, task TEXT, created REAL, scope TEXT, role TEXT, current_round INTEGER DEFAULT 1, current_attempt TEXT",
     "dispatch_round": "dispatch TEXT, round INTEGER, attempt TEXT, task TEXT, report TEXT, state TEXT DEFAULT 'running', result TEXT, created REAL, completed REAL, PRIMARY KEY (dispatch, round, attempt)",
     "message": "id INTEGER PRIMARY KEY AUTOINCREMENT, dispatch TEXT, recipient TEXT, "
-               "type TEXT, body TEXT, created REAL, delivered INTEGER DEFAULT 0",
+               "type TEXT, body TEXT, created REAL, delivered INTEGER DEFAULT 0, "
+               "message_uid TEXT, request_key TEXT, body_hash TEXT, state TEXT DEFAULT 'unsent', "
+               "status_version INTEGER DEFAULT 1",
+    "message_resolution": "id INTEGER PRIMARY KEY AUTOINCREMENT, message INTEGER, actor TEXT, source TEXT, "
+                          "reason TEXT, evidence TEXT, body_hash TEXT, from_state TEXT, to_state TEXT, created REAL",
     "screen_watch": "dispatch TEXT PRIMARY KEY, screen TEXT, since REAL, reported_screen TEXT",
     "host_error": "dispatch TEXT PRIMARY KEY, turn TEXT",
     "waiter": "pid INTEGER PRIMARY KEY, kind TEXT, since REAL",
@@ -74,6 +79,10 @@ ADDED_COLUMNS = {
     "dispatch": {"started": "REAL", "report_dir": "TEXT", "report": "TEXT", "model": "TEXT", "host_session": "TEXT",
                  "effort": "TEXT", "network": "INTEGER", "label": "TEXT", "git": "INTEGER",
                  "scope": "TEXT", "role": "TEXT", "current_round": "INTEGER", "current_attempt": "TEXT"},
+    "message": {"message_uid": "TEXT", "request_key": "TEXT", "body_hash": "TEXT",
+                "state": "TEXT", "status_version": "INTEGER", "resolver_actor": "TEXT",
+                "resolution_source": "TEXT", "resolution_reason": "TEXT", "resolution_evidence": "TEXT",
+                "resolved_at": "REAL"},
     "waiter": {"process_start": "TEXT"},
 }
 
@@ -106,6 +115,30 @@ def connect():
         except BaseException:
             db.execute("ROLLBACK")
             raise
+    # Older message rows predate the receipt ledger. Serialize identity allocation and
+    # state repair so concurrent first-use commands cannot return different UUIDs.
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        for message in db.execute("SELECT id, body, message_uid, body_hash, delivered, state, status_version FROM message").fetchall():
+            state = message["state"]
+        # A committed DDL default can expose delivered=1/state=unsent before the
+        # backfill ran. Reconcile the old delivery bit on every startup.
+            if message["delivered"] and state == "unsent":
+                state = "received"
+            elif not message["delivered"] and state == "received":
+                state = "unsent"
+            repaired = state != message["state"]
+            if message["message_uid"] and message["body_hash"] and state and message["status_version"] and not repaired:
+                continue
+            db.execute("UPDATE message SET message_uid = ?, body_hash = ?, state = ?, status_version = ? WHERE id = ?",
+                       (message["message_uid"] or "m-" + uuid.uuid4().hex,
+                        message["body_hash"] or hashlib.sha256(message["body"].encode()).hexdigest(),
+                        state or ("received" if message["delivered"] else "unsent"),
+                        (message["status_version"] or 1) + int(repaired), message["id"]))
+        db.execute("COMMIT")
+    except BaseException:
+        db.execute("ROLLBACK")
+        raise
     db.execute("BEGIN IMMEDIATE")
     try:
         backfill_dispatch_identity(db)
@@ -182,7 +215,8 @@ def worker_brief(dispatch_id, task, report, opening=FIRST_BRIEF, attempt=None):
             f"Stop any server or background process you started before you report. "
             f"When the task is finished, write your report and run: "
             f"{router} done --report {shlex.quote(str(report))}"
-            f"{(' --attempt ' + shlex.quote(attempt)) if attempt else ''}. "
+            f"{(' --attempt ' + shlex.quote(attempt)) if attempt else ''}"
+            f"{(' --message-id done:' + shlex.quote(dispatch_id) + ':' + shlex.quote(attempt)) if attempt else ''}. "
             f"If you need a decision, run: {router} ask \"<question>\" [--options a,b]"
             f"{(' --attempt ' + shlex.quote(attempt)) if attempt else ''}, then end your turn; "
             f"the answer arrives as your next message. Never ask questions in plain text "
@@ -630,10 +664,38 @@ def current_dispatch(db):
     return dispatch_id
 
 
-def post(db, dispatch_id, recipient, type_, body):
-    cur = db.execute("INSERT INTO message (dispatch, recipient, type, body, created) VALUES (?, ?, ?, ?, ?)",
-                     (dispatch_id, recipient, type_, json.dumps(body, ensure_ascii=False), time.time()))
+def post(db, dispatch_id, recipient, type_, body, request_key=None):
+    """Append a message, or replay the existing receipt for the same request key.
+
+    A key is the caller's stable idempotency identity. Reusing it with another payload is
+    a conflict; reusing it with the same payload returns the original message id.
+    """
+    encoded = json.dumps(body, ensure_ascii=False, sort_keys=True)
+    digest = hashlib.sha256(encoded.encode()).hexdigest()
+    if request_key:
+        prior = db.execute("SELECT id, body_hash FROM message WHERE dispatch = ? AND request_key = ?",
+                           (dispatch_id, request_key)).fetchone()
+        if prior:
+            if prior["body_hash"] != digest:
+                raise SystemExit(f"message request {request_key} conflicts with an existing receipt")
+            return prior["id"]
+    cur = db.execute("INSERT INTO message (dispatch, recipient, type, body, created, message_uid, request_key, body_hash, state, status_version) "
+                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'unsent', 1)",
+                     (dispatch_id, recipient, type_, encoded, time.time(), "m-" + uuid.uuid4().hex,
+                      request_key, digest))
     return cur.lastrowid
+
+
+def receipt_response(db, message_id, duplicate=False):
+    row = db.execute("SELECT * FROM message WHERE id = ?", (message_id,)).fetchone()
+    result = {"message": row["id"], "messageId": row["message_uid"],
+            "state": row["state"] or ("received" if row["delivered"] else "unsent"),
+            "statusVersion": row["status_version"] or 1, "duplicate": bool(duplicate)}
+    if row["resolver_actor"]:
+        result["resolution"] = {"actor": row["resolver_actor"], "source": row["resolution_source"],
+                                "reason": row["resolution_reason"], "evidence": row["resolution_evidence"],
+                                "at": local_time(row["resolved_at"])}
+    return result
 
 
 def cmd_done(args):
@@ -642,10 +704,23 @@ def cmd_done(args):
         raise SystemExit(f"report not found: {report}")
     db = connect()
     dispatch_id = current_dispatch(db)
+    request_key = args.message_id or (("done:" + dispatch_id + ":" + args.attempt) if args.attempt else None)
+    # Resolve an existing stable receipt before reading volatile worktree metadata.
+    # A retry must return its original head/dirty snapshot even if the worktree moved.
+    if request_key:
+        prior = db.execute("SELECT * FROM message WHERE dispatch = ? AND request_key = ?",
+                           (dispatch_id, request_key)).fetchone()
+        if prior:
+            old = json.loads(prior["body"])
+            if old.get("report") != str(report):
+                raise SystemExit(f"message request {request_key} conflicts with an existing receipt")
+            emit(receipt_response(db, prior["id"], duplicate=True))
+            return
     # Read before any lock: git may be slow, and it reads the worktree, not router.db.
     head = worktree_head(db.execute("SELECT cwd FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()["cwd"])
     with input_lock(dispatch_id):  # a nudge being typed lands before this done, as recorded
-        return finish_round(db, dispatch_id, report, head, expected_attempt=args.attempt)
+        return finish_round(db, dispatch_id, report, head, expected_attempt=args.attempt,
+                            request_key=request_key)
 
 
 GIT_TIMEOUT = 5
@@ -672,9 +747,23 @@ def worktree_head(cwd):
     return {"head": head, "dirty": dirty}
 
 
-def finish_round(db, dispatch_id, report, head, expected_attempt=None):
+def finish_round(db, dispatch_id, report, head, expected_attempt=None, request_key=None):
     db.execute("BEGIN IMMEDIATE")
     current_row = db.execute("SELECT report, current_round, current_attempt FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
+    scope, role = db.execute("SELECT scope, role FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
+    if request_key:
+        prior = db.execute("SELECT * FROM message WHERE dispatch = ? AND request_key = ?",
+                           (dispatch_id, request_key)).fetchone()
+        if prior:
+            old = json.loads(prior["body"])
+            candidate = {"report": str(report), "scope": scope, "role": role,
+                         "round": old.get("round"), "attempt": old.get("attempt"), **head}
+            if prior["body_hash"] != hashlib.sha256(json.dumps(candidate, ensure_ascii=False, sort_keys=True).encode()).hexdigest():
+                db.execute("ROLLBACK")
+                raise SystemExit(f"message request {request_key} conflicts with an existing receipt")
+            db.execute("ROLLBACK")
+            emit({**receipt_response(db, prior["id"], duplicate=True)})
+            return
     attempts = db.execute("SELECT COUNT(*) FROM dispatch_round WHERE dispatch = ?", (dispatch_id,)).fetchone()[0]
     same_report = db.execute("SELECT COUNT(*) FROM dispatch_round WHERE dispatch = ? AND report = ?",
                              (dispatch_id, current_row["report"])).fetchone()[0]
@@ -687,15 +776,14 @@ def finish_round(db, dispatch_id, report, head, expected_attempt=None):
     if current and str(report) != current:
         db.execute("ROLLBACK")
         raise SystemExit(f"{report} is the report of an earlier round; the current round reports to {current}")
-    message_id = post(db, dispatch_id, "controller", "done", {"report": str(report),
-        "scope": db.execute("SELECT scope FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()[0],
-        "role": db.execute("SELECT role FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()[0],
-        "round": current_row["current_round"], "attempt": current_row["current_attempt"], **head})
+    body = {"report": str(report), "scope": scope, "role": role,
+        "round": current_row["current_round"], "attempt": current_row["current_attempt"], **head}
+    message_id = post(db, dispatch_id, "controller", "done", body, request_key=request_key)
     db.execute("UPDATE dispatch_round SET state = 'completed', result = ?, completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?",
                (json.dumps({"report": str(report), **head}, ensure_ascii=False), time.time(), dispatch_id,
                 current_row["current_round"], current_row["current_attempt"]))
     db.execute("COMMIT")
-    emit({"message": message_id})
+    emit(receipt_response(db, message_id))
 
 
 def cmd_ask(args):
@@ -705,6 +793,25 @@ def cmd_ask(args):
     db.execute("BEGIN IMMEDIATE")
     identity = db.execute("SELECT scope, role, current_round, current_attempt, report FROM dispatch WHERE id = ?",
                           (dispatch_id,)).fetchone()
+    body = {"question": args.question, "options": options, "scope": identity["scope"],
+            "role": identity["role"], "round": identity["current_round"],
+            "attempt": identity["current_attempt"]}
+    request_key = args.message_id
+    if not request_key and args.attempt:
+        request_key = "ask:" + dispatch_id + ":" + args.attempt + ":" + hashlib.sha256(
+            json.dumps({"question": args.question, "options": options}, sort_keys=True).encode()).hexdigest()[:16]
+    if request_key:
+        prior = db.execute("SELECT * FROM message WHERE dispatch = ? AND request_key = ?",
+                           (dispatch_id, request_key)).fetchone()
+        if prior:
+            old = json.loads(prior["body"])
+            compare = {**body, "round": old.get("round"), "attempt": old.get("attempt")}
+            if prior["body_hash"] != hashlib.sha256(json.dumps(compare, ensure_ascii=False, sort_keys=True).encode()).hexdigest():
+                db.execute("ROLLBACK")
+                raise SystemExit(f"message request {request_key} conflicts with an existing receipt")
+            db.execute("ROLLBACK")
+            emit(receipt_response(db, prior["id"], duplicate=True))
+            return
     same_report = db.execute("SELECT COUNT(*) FROM dispatch_round WHERE dispatch = ? AND report = ?",
                              (dispatch_id, identity["report"])).fetchone()[0]
     # Missing attempt is accepted only for a truly legacy first attempt. Once the
@@ -714,12 +821,76 @@ def cmd_ask(args):
         db.execute("ROLLBACK")
         raise SystemExit(f"attempt {args.attempt or '(missing)'} is no longer accepted for {dispatch_id}; "
                          f"current attempt is {identity['current_attempt']}")
-    message_id = post(db, dispatch_id, "controller", "question",
-                      {"question": args.question, "options": options, "scope": identity["scope"],
-                       "role": identity["role"], "round": identity["current_round"],
-                       "attempt": identity["current_attempt"]})
+    message_id = post(db, dispatch_id, "controller", "question", body, request_key=request_key)
     db.execute("COMMIT")
-    emit({"message": message_id, "next": "End your turn now; the answer arrives as your next message."})
+    emit({**receipt_response(db, message_id),
+          "next": "End your turn now; the answer arrives as your next message."})
+
+
+def cmd_ack(args):
+    """Mark a controller message processed. Repeating the same ACK is harmless."""
+    db = connect()
+    db.execute("BEGIN IMMEDIATE")
+    row = db.execute("SELECT * FROM message WHERE id = ? OR message_uid = ?", (args.message, args.message)).fetchone()
+    if row is None or row["recipient"] != "controller":
+        db.execute("ROLLBACK")
+        raise SystemExit(f"no controller message with id {args.message}")
+    if row["state"] == "processed":
+        db.execute("ROLLBACK")
+        emit({**receipt_response(db, row["id"], duplicate=True)})
+        return
+    if row["state"] != "received":
+        db.execute("ROLLBACK")
+        raise SystemExit(f"message {args.message} is {row['state']}; ACK requires received")
+    if args.body is not None:
+        digest = hashlib.sha256(args.body.encode()).hexdigest()
+        if digest != row["body_hash"]:
+            db.execute("ROLLBACK")
+            raise SystemExit(f"message {args.message} ACK conflicts with its body")
+    db.execute("UPDATE message SET state = 'processed', status_version = status_version + 1 WHERE id = ?",
+               (row["id"],))
+    db.execute("COMMIT")
+    emit(receipt_response(db, row["id"]))
+
+
+def cmd_resolve(args):
+    """Record an operator-confirmed external delivery for an unknown receipt.
+
+    This is deliberately explicit: unknown messages are never replayed automatically.
+    """
+    db = connect()
+    if not args.actor or not args.reason or not args.evidence or not args.body_hash:
+        raise SystemExit("resolve requires --actor, --reason, --evidence and --body-hash")
+    db.execute("BEGIN IMMEDIATE")
+    row = db.execute("SELECT * FROM message WHERE id = ? OR message_uid = ?", (args.message, args.message)).fetchone()
+    if row is None or row["recipient"] != "controller":
+        db.execute("ROLLBACK")
+        raise SystemExit(f"no controller message with id {args.message}")
+    if row["state"] == "received" or row["state"] == "processed":
+        same_claim = (row["resolver_actor"] == args.actor and row["resolution_source"] == args.source
+                      and row["resolution_reason"] == args.reason and row["resolution_evidence"] == args.evidence
+                      and args.body_hash == row["body_hash"])
+        if same_claim:
+            db.execute("ROLLBACK")
+            emit({**receipt_response(db, row["id"], duplicate=True)})
+            return
+        db.execute("ROLLBACK")
+        raise SystemExit(f"message {args.message} conflicts with its existing resolution")
+    if row["state"] != "unknown":
+        db.execute("ROLLBACK")
+        raise SystemExit(f"message {args.message} is {row['state']}; resolve requires unknown")
+    if args.body_hash != row["body_hash"]:
+        db.execute("ROLLBACK")
+        raise SystemExit(f"message {args.message} body hash does not match the stored receipt")
+    now = time.time()
+    db.execute("UPDATE message SET delivered = 1, state = 'received', status_version = status_version + 1, "
+               "resolver_actor = ?, resolution_source = ?, resolution_reason = ?, resolution_evidence = ?, resolved_at = ? WHERE id = ?",
+               (args.actor, args.source, args.reason, args.evidence, now, row["id"]))
+    db.execute("INSERT INTO message_resolution (message, actor, source, reason, evidence, body_hash, from_state, to_state, created) "
+               "VALUES (?, ?, ?, ?, ?, ?, 'unknown', 'received', ?)",
+               (row["id"], args.actor, args.source, args.reason, args.evidence, args.body_hash, now))
+    db.execute("COMMIT")
+    emit(receipt_response(db, row["id"]))
 
 
 SENT, NOT_SENT, UNCERTAIN, PARTIAL = "sent", "not-sent", "uncertain", "partial"
@@ -1118,7 +1289,13 @@ def local_time(epoch):
 
 
 def message_view(r):
-    return {"id": r["id"], "dispatch": r["dispatch"], "type": r["type"], "to": r["recipient"], "at": local_time(r["created"]),
+    return {"id": r["id"], "messageId": r["message_uid"] or str(r["id"]),
+            "dispatch": r["dispatch"], "type": r["type"], "to": r["recipient"], "at": local_time(r["created"]),
+            "state": r["state"] or ("received" if r["delivered"] else "unsent"),
+            "statusVersion": r["status_version"] or 1,
+            **({"resolution": {"actor": r["resolver_actor"], "source": r["resolution_source"],
+                                "reason": r["resolution_reason"], "evidence": r["resolution_evidence"],
+                                "at": local_time(r["resolved_at"])} } if r["resolver_actor"] else {}),
             **({"delivered": bool(r["delivered"])} if r["recipient"] == "controller" else {}), **json.loads(r["body"])}
 
 
@@ -1486,12 +1663,21 @@ def reclaim_session(db, row, named):
     return {"result": "reclaimed", "message": message_id}
 
 
-def take_controller_messages(db):
+def take_controller_messages(db, relay=False):
     db.execute("BEGIN IMMEDIATE")
-    rows = db.execute("SELECT * FROM message WHERE recipient = 'controller' AND delivered = 0 ORDER BY id").fetchall()
-    db.executemany("UPDATE message SET delivered = 1 WHERE id = ?", [(r["id"],) for r in rows])
+    rows = db.execute("SELECT * FROM message WHERE recipient = 'controller' AND delivered = 0 AND state = 'unsent' ORDER BY id").fetchall()
+    if relay:
+        # Claim as unknown before crossing the external boundary. A process exit now
+        # leaves an auditable result that is never silently replayed.
+        db.executemany("UPDATE message SET state = 'unknown', status_version = status_version + 1 WHERE id = ?",
+                       [(r["id"],) for r in rows])
+    else:
+        db.executemany("UPDATE message SET delivered = 1, state = 'received', status_version = status_version + 1 WHERE id = ?",
+                       [(r["id"],) for r in rows])
     db.execute("COMMIT")
-    return [{"id": r["id"], "dispatch": r["dispatch"], "type": r["type"], **json.loads(r["body"])} for r in rows]
+    return [{"id": r["id"], "messageId": r["message_uid"] or str(r["id"]), "dispatch": r["dispatch"],
+             "type": r["type"], "state": ("unknown" if relay else "received"), "statusVersion": (r["status_version"] or 1) + 1,
+             **json.loads(r["body"])} for r in rows]
 
 
 def answered(db, question_id):
@@ -1801,13 +1987,32 @@ def cmd_relay(args):
     with registered_waiter(db, "relay"):
         while deadline is None or time.monotonic() < deadline:
             check_workers(db, args.stall_after)
-            messages = take_controller_messages(db)
-            outcome = deliver(messages) if messages else None
-            if outcome in ("failed", "missing"):
-                # Put the batch back so the next pass, or a `wait`, delivers it.
-                db.executemany("UPDATE message SET delivered = 0 WHERE id = ?", [(m["id"],) for m in messages])
+            messages = take_controller_messages(db, relay=True)
+            # The internal claim and the external envelope both remain explicitly
+            # uncertain until the backend call returns. A later durable transition
+            # records received; this envelope cannot pre-claim that outcome.
+            envelope = [{**message, "state": "unknown", "delivery": "pending",
+                          "deliveryAttempt": "relay:" + message["messageId"] + ":" + str(message["statusVersion"])}
+                         for message in messages]
+            outcome = deliver(envelope) if envelope else None
+            if messages and outcome == "delivered":
+                db.execute("BEGIN IMMEDIATE")
+                db.executemany("UPDATE message SET delivered = 1, state = 'received', status_version = status_version + 1 "
+                               "WHERE id = ? AND state = 'unknown'", [(m["id"],) for m in messages])
+                db.execute("COMMIT")
+            elif messages and outcome in ("failed", "missing"):
+                # Definitely not sent: make it available to a later explicit attempt.
+                db.execute("BEGIN IMMEDIATE")
+                db.executemany("UPDATE message SET delivered = 0, state = 'unsent', status_version = status_version + 1 "
+                               "WHERE id = ? AND state = 'unknown'",
+                               [(m["id"],) for m in messages])
+                db.execute("COMMIT")
                 if outcome == "missing":
                     return 1  # the thread is gone or wrong: every later batch would be lost too
+            elif messages and outcome == "uncertain":
+                # Keep unknown and undelivered. It is queryable, but wait/relay will not
+                # silently replay it after an external timeout.
+                pass
                 time.sleep(5)
             time.sleep(0.5)
     return 0
@@ -1839,12 +2044,26 @@ def main(argv):
     p = sub.add_parser("done")
     p.add_argument("--report", required=True)
     p.add_argument("--attempt", help="execution attempt identity from the worker brief")
+    p.add_argument("--message-id", help="stable worker receipt key; retries are idempotent")
     p.set_defaults(func=cmd_done)
     p = sub.add_parser("ask")
     p.add_argument("question")
     p.add_argument("--options")
     p.add_argument("--attempt", help="execution attempt identity from the worker brief")
+    p.add_argument("--message-id", help="stable worker receipt key; retries are idempotent")
     p.set_defaults(func=cmd_ask)
+    p = sub.add_parser("ack", help="mark a controller message processed")
+    p.add_argument("message", help="numeric message id or stable message id")
+    p.add_argument("--body", help="canonical receipt body, when available")
+    p.set_defaults(func=cmd_ack)
+    p = sub.add_parser("resolve", help="record an externally confirmed delivery for an unknown message")
+    p.add_argument("message", help="numeric message id or stable message id")
+    p.add_argument("--actor", required=True, help="controller/operator identity authorizing reconciliation")
+    p.add_argument("--source", default="operator", help="authorization source")
+    p.add_argument("--reason", required=True, help="why external delivery was confirmed")
+    p.add_argument("--evidence", required=True, help="external receipt/token or verification reference")
+    p.add_argument("--body-hash", required=True, help="SHA-256 of the canonical stored message body")
+    p.set_defaults(func=cmd_resolve)
     p = sub.add_parser("reply")
     p.add_argument("message", type=int)
     p.add_argument("answer")

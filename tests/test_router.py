@@ -184,6 +184,90 @@ class MessageRoundTrip(unittest.TestCase):
         self.assertIn(str(question["id"]), text_call[-1])
         self.assertEqual(enter_call, ["tmux", "send-keys", "-t", f"wfc-{dispatch}", "Enter"])
 
+    def test_stable_done_receipt_is_idempotent_and_ack_is_versioned(self):
+        dispatch = self.env.dispatch()
+        self.env.report.write_text("# report\n")
+        first = self.env.run("done", "--report", str(self.env.report), "--message-id", "receipt-1", dispatch=dispatch)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        first_json = json.loads(first.stdout)
+        delivered = self.env.json("wait", "--timeout", "2")["messages"]
+        self.assertEqual(delivered[0]["messageId"], first_json["messageId"])
+        self.assertEqual(delivered[0]["state"], "received")
+        duplicate = self.env.run("done", "--report", str(self.env.report), "--message-id", "receipt-1", dispatch=dispatch)
+        self.assertEqual(duplicate.returncode, 0, duplicate.stderr)
+        self.assertEqual(json.loads(duplicate.stdout)["messageId"], first_json["messageId"])
+        self.assertEqual(self.env.json("wait", "--timeout", "0.1"), {"messages": [], "timedOut": True})
+        ack = self.env.json("ack", first_json["messageId"])
+        self.assertEqual((ack["state"], ack["statusVersion"], ack["duplicate"]), ("processed", 3, False))
+        again = self.env.json("ack", first_json["messageId"])
+        self.assertTrue(again["duplicate"])
+
+    def test_stable_receipt_with_different_content_is_rejected(self):
+        dispatch = self.env.dispatch()
+        first = self.env.run("ask", "first", "--message-id", "receipt-2", dispatch=dispatch)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        result = self.env.run("ask", "second", "--message-id", "receipt-2", dispatch=dispatch)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("conflicts", result.stderr)
+
+    def test_ack_before_receive_is_rejected_and_does_not_regress(self):
+        dispatch = self.env.dispatch()
+        self.env.report.write_text("# report\n")
+        done = self.env.run("done", "--report", str(self.env.report), "--message-id", "receipt-3", dispatch=dispatch)
+        message_id = json.loads(done.stdout)["messageId"]
+        rejected = self.env.run("ack", message_id)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("requires received", rejected.stderr)
+        received = self.env.json("wait", "--timeout", "2")["messages"][0]
+        self.assertEqual(received["state"], "received")
+
+    def test_attempt_aware_legacy_shape_gets_a_stable_default_receipt_key(self):
+        dispatch = self.env.dispatch()
+        self.env.report.write_text("# report\n")
+        attempt = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]["attempt"]
+        first = self.env.run("done", "--report", str(self.env.report), "--attempt", attempt, dispatch=dispatch)
+        second = self.env.run("done", "--report", str(self.env.report), "--attempt", attempt, dispatch=dispatch)
+        self.assertEqual((first.returncode, second.returncode), (0, 0))
+        self.env.json("wait", "--timeout", "2")
+        self.assertEqual(self.env.json("wait", "--timeout", "0.1"), {"messages": [], "timedOut": True})
+
+    def test_unknown_receipt_has_explicit_resolve_path(self):
+        dispatch = self.env.dispatch()
+        self.env.report.write_text("# report\n")
+        done = self.env.json("done", "--report", str(self.env.report), "--message-id", "receipt-4", dispatch=dispatch)
+        db = sqlite3.connect(self.env.state / "router.db")
+        db.execute("UPDATE message SET state='unknown', delivered=0, status_version=2 WHERE id=?", (done["message"],))
+        db.commit(); db.close()
+        db = sqlite3.connect(self.env.state / "router.db")
+        body_hash = db.execute("SELECT body_hash FROM message WHERE id=?", (done["message"],)).fetchone()[0]
+        db.close()
+        rejected = self.env.run("resolve", done["messageId"], "--actor", "controller-1", "--reason", "verified",
+                                "--evidence", "queue-receipt-1", "--body-hash", "bad")
+        self.assertNotEqual(rejected.returncode, 0)
+        resolved = self.env.json("resolve", done["messageId"], "--actor", "controller-1", "--reason", "verified",
+                                 "--evidence", "queue-receipt-1", "--body-hash", body_hash)
+        self.assertEqual((resolved["state"], resolved["statusVersion"], resolved["resolution"]["actor"]),
+                         ("received", 3, "controller-1"))
+        duplicate = self.env.json("resolve", done["messageId"], "--actor", "controller-1", "--reason", "verified",
+                                  "--evidence", "queue-receipt-1", "--body-hash", body_hash)
+        self.assertTrue(duplicate["duplicate"])
+        conflict = self.env.run("resolve", done["messageId"], "--actor", "controller-2", "--reason", "verified",
+                                "--evidence", "queue-receipt-2", "--body-hash", body_hash)
+        self.assertNotEqual(conflict.returncode, 0)
+        self.assertIn("conflicts", conflict.stderr)
+
+    def test_done_replay_uses_stored_snapshot_when_worktree_changes(self):
+        subprocess.run(["git", "-C", str(self.env.cwd), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(self.env.cwd), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                        "commit", "-q", "--allow-empty", "-m", "one"], check=True)
+        dispatch = self.env.dispatch()
+        self.env.report.write_text("# report\n")
+        attempt = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]["attempt"]
+        first = self.env.json("done", "--report", str(self.env.report), "--attempt", attempt, dispatch=dispatch)
+        (self.env.cwd / "unrelated.txt").write_text("later\n")
+        second = self.env.json("done", "--report", str(self.env.report), "--attempt", attempt, dispatch=dispatch)
+        self.assertEqual((second["messageId"], second["duplicate"]), (first["messageId"], True))
+
 
 def make_repo(main, worktree=None):
     """A git repository at `main` with one commit and, if given, a linked worktree at `worktree`."""
@@ -921,6 +1005,10 @@ class CodexRelay(unittest.TestCase):
         message = call[call.index("--message") + 1]
         self.assertIn('"type": "done"', message)
         self.assertIn(self.dispatch, message)
+        self.assertIn('"state": "unknown"', message)
+        self.assertIn('"delivery": "pending"', message)
+        self.assertEqual(self.env.json("status", "--dispatch", self.dispatch)["dispatches"][0]["messages"][0]["state"],
+                         "received")
 
     def test_a_queue_that_exited_non_zero_is_not_retried(self):
         # A non-zero exit does not prove codex did not take the batch (it may die after accepting),
@@ -932,6 +1020,8 @@ class CodexRelay(unittest.TestCase):
         self.assertEqual(len([c for c in self.env.host_calls() if c[:2] == ["codex", "queue"]]), 1)
         self.assertIn("uncertain", result.stdout)
         self.assertEqual(self.env.json("wait", "--timeout", "0.5")["messages"], [])
+        self.assertEqual(self.env.json("status", "--dispatch", self.dispatch)["dispatches"][0]["messages"][0]["state"],
+                         "unknown")
 
     def test_messages_stay_waiting_when_codex_is_not_installed(self):
         self.env.run("done", "--report", str(self.env.report), dispatch=self.dispatch)
