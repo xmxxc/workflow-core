@@ -299,17 +299,18 @@ FIRST_BRIEF = "You are a worker dispatched by the controller"
 
 def worker_brief(dispatch_id, task, report, opening=FIRST_BRIEF, attempt=None, owner=False):
     router = f"{shlex.quote(sys.executable)} {shlex.quote(str(PROGRAM))}"
+    owner_arg = ' --owner-token "$WFC_OWNER_TOKEN"' if owner else ""
+    attempt_arg = " --attempt " + shlex.quote(attempt) if attempt else ""
+    message_arg = (" --message-id done:" + shlex.quote(dispatch_id) + ":" + shlex.quote(attempt)
+                   if attempt else "")
     return (f"{opening} (dispatch {dispatch_id}). "
             f"Read and do the task in {shlex.quote(str(task))}. "
             f"Stop any server or background process you started before you report. "
             f"When the task is finished, write your report and run: "
             f"{router} done --report {shlex.quote(str(report))}"
-            f"{(' --owner-token "$WFC_OWNER_TOKEN"') if owner else ''}"
-            f"{(' --attempt ' + shlex.quote(attempt)) if attempt else ''}"
-            f"{(' --message-id done:' + shlex.quote(dispatch_id) + ':' + shlex.quote(attempt)) if attempt else ''}; "
+            f"{owner_arg}{attempt_arg}{message_arg}; "
             f"If you need a decision, run: {router} ask \"<question>\" [--options a,b]"
-            f"{(' --owner-token "$WFC_OWNER_TOKEN"') if owner else ''}"
-            f"{(' --attempt ' + shlex.quote(attempt)) if attempt else ''}; then end your turn; "
+            f"{owner_arg}{attempt_arg}; then end your turn; "
             f"the answer arrives as your next message. Never ask questions in plain text "
             f"or with an interactive question tool; nobody watches this window.")
 
