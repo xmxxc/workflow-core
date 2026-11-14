@@ -71,7 +71,7 @@ TABLES = {
     # Durable lifecycle operations are separate from worker/controller messages.  An
     # operation can cross a tmux boundary after the router has committed its fencing
     # decision, so its pending/accepted/uncertain result must survive a router restart.
-    "lifecycle_event": "id INTEGER PRIMARY KEY AUTOINCREMENT, dispatch TEXT, operation TEXT, round INTEGER, attempt TEXT, from_attempt TEXT, to_attempt TEXT, from_host TEXT, to_host TEXT, result TEXT, diagnostic TEXT, created REAL",
+    "lifecycle_event": "id INTEGER PRIMARY KEY AUTOINCREMENT, dispatch TEXT, operation TEXT, round INTEGER, attempt TEXT, from_attempt TEXT, to_attempt TEXT, from_host TEXT, to_host TEXT, result TEXT, diagnostic TEXT, resolver_actor TEXT, resolution_evidence TEXT, resolved_at REAL, created REAL",
     "waiter": "pid INTEGER PRIMARY KEY, kind TEXT, since REAL",
 }
 # Column upgrades: `started` is set once the worker's tmux session exists (the watchdog ignores
@@ -89,6 +89,7 @@ ADDED_COLUMNS = {
                 "state": "TEXT", "status_version": "INTEGER", "resolver_actor": "TEXT",
                 "resolution_source": "TEXT", "resolution_reason": "TEXT", "resolution_evidence": "TEXT",
                 "resolved_at": "REAL"},
+    "lifecycle_event": {"resolver_actor": "TEXT", "resolution_evidence": "TEXT", "resolved_at": "REAL"},
     "waiter": {"process_start": "TEXT"},
 }
 
@@ -801,9 +802,11 @@ def lifecycle_event(db, dispatch_id, operation, *, round=None, attempt=None,
     return cur.lastrowid
 
 
-def finish_lifecycle_event(db, event_id, result, diagnostic=None):
-    db.execute("UPDATE lifecycle_event SET result = ?, diagnostic = COALESCE(?, diagnostic) WHERE id = ?",
-               (result, diagnostic, event_id))
+def finish_lifecycle_event(db, event_id, result, diagnostic=None, actor=None, evidence=None):
+    db.execute("UPDATE lifecycle_event SET result = ?, diagnostic = COALESCE(?, diagnostic), "
+               "resolver_actor = COALESCE(?, resolver_actor), resolution_evidence = COALESCE(?, resolution_evidence), "
+               "resolved_at = CASE WHEN ? IS NULL THEN resolved_at ELSE ? END WHERE id = ?",
+               (result, diagnostic, actor, evidence, actor, time.time(), event_id))
 
 
 def lifecycle_view(row):
@@ -811,6 +814,8 @@ def lifecycle_view(row):
             "attempt": row["attempt"], "fromAttempt": row["from_attempt"], "toAttempt": row["to_attempt"],
             "fromHost": row["from_host"], "toHost": row["to_host"], "result": row["result"],
             **({"diagnostic": row["diagnostic"]} if row["diagnostic"] else {}),
+            **({"resolution": {"actor": row["resolver_actor"], "evidence": row["resolution_evidence"],
+                                "at": local_time(row["resolved_at"])}} if row["resolver_actor"] else {}),
             "at": local_time(row["created"])}
 
 
@@ -1504,6 +1509,11 @@ def _current_attempt(db, dispatch_id):
     return row, round_row
 
 
+def lifecycle_generation(db, dispatch_id):
+    return db.execute("SELECT COALESCE(MAX(id), 0) FROM lifecycle_event WHERE dispatch = ?",
+                      (dispatch_id,)).fetchone()[0]
+
+
 def _set_lifecycle_result(db, event_id, dispatch_id, result, diagnostic=None, state=None):
     db.execute("BEGIN IMMEDIATE")
     finish_lifecycle_event(db, event_id, result, diagnostic)
@@ -1614,6 +1624,41 @@ def cmd_close(args):
           **({"diagnostic": diagnostic} if diagnostic else {})})
 
 
+def cmd_reconcile(args):
+    """Resolve a persisted handoff result after an external operator check."""
+    db = connect()
+    with input_lock(args.dispatch):
+        row, current = _current_attempt(db, args.dispatch)
+        require_owner(db, row["scope"], owner_token(args), "reconcile")
+        db.execute("BEGIN IMMEDIATE")
+        event = db.execute("SELECT * FROM lifecycle_event WHERE id = ? AND dispatch = ? AND operation = 'handoff'",
+                           (args.audit, args.dispatch)).fetchone()
+        if event is None:
+            db.execute("ROLLBACK")
+            raise SystemExit(f"no handoff audit {args.audit} for dispatch {args.dispatch}")
+        if event["result"] not in ("pending", "uncertain"):
+            same = (event["result"] == args.result and event["resolver_actor"] == args.actor
+                    and event["resolution_evidence"] == args.evidence)
+            db.execute("ROLLBACK")
+            if same:
+                emit({"dispatch": args.dispatch, "operation": "reconcile", "result": args.result,
+                      "audit": event["id"], "duplicate": True})
+                return
+            raise SystemExit(f"handoff audit {args.audit} is already {event['result']}")
+        if current["attempt"] != event["to_attempt"]:
+            db.execute("ROLLBACK")
+            raise SystemExit(f"handoff audit {args.audit} is no longer the current attempt")
+        state = "running" if args.result == "accepted" else "unknown"
+        finish_lifecycle_event(db, event["id"], args.result,
+                               f"reconciled by {args.actor}: {args.evidence}", args.actor, args.evidence)
+        db.execute("UPDATE dispatch_round SET state = ?, completed = CASE WHEN ? = 'unknown' THEN ? ELSE completed END "
+                   "WHERE dispatch = ? AND round = ? AND attempt = ?",
+                   (state, state, time.time(), args.dispatch, event["round"], event["to_attempt"]))
+        db.execute("COMMIT")
+    emit({"dispatch": args.dispatch, "operation": "reconcile", "result": args.result,
+          "audit": event["id"], "attempt": event["to_attempt"], "duplicate": False})
+
+
 def cmd_handoff(args):
     """Fence an attempt, close its session, and start the task on a new host."""
     db = connect()
@@ -1687,10 +1732,10 @@ def cmd_handoff(args):
         if not args.task:
             db.execute("UPDATE dispatch_round SET state = 'unknown', completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?",
                        (time.time(), args.dispatch, current["round"], current["attempt"]))
-        db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, created) VALUES (?, ?, ?, ?, ?, ?)",
+        db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, state, created) VALUES (?, ?, ?, ?, ?, 'unknown', ?)",
                    (args.dispatch, next_round, attempt, str(task), str(report), time.time()))
-        db.execute("UPDATE dispatch SET host = ?, host_session = ?, task = ?, report = ?, current_round = ?, current_attempt = ? WHERE id = ?",
-                   (args.host, host_session, str(task), str(report), next_round, attempt, args.dispatch))
+        db.execute("UPDATE dispatch SET host = ?, host_session = ?, model = ?, task = ?, report = ?, current_round = ?, current_attempt = ? WHERE id = ?",
+                   (args.host, host_session, args.model or row["model"], str(task), str(report), next_round, attempt, args.dispatch))
         db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
         db.execute("COMMIT")
 
@@ -1738,7 +1783,7 @@ def cmd_handoff(args):
                       "fromAttempt": current["attempt"], "attempt": attempt, "host": args.host,
                       "diagnostic": diagnostic or notice})
                 return
-        _set_lifecycle_result(db, event, args.dispatch, "accepted")
+        _set_lifecycle_result(db, event, args.dispatch, "accepted", state="running")
     emit({"dispatch": args.dispatch, "operation": "handoff", "result": "accepted",
           "fromAttempt": current["attempt"], "attempt": attempt, "host": args.host,
           "round": next_round})
@@ -1890,8 +1935,8 @@ def cmd_status(args):
                 "audit": audit,
                 "label": row["label"], "host": row["host"], "model": row["model"],
                 "git": bool(row["git"]), "state": state, "status": canonical, "lifecycle": lifecycle,
-                # queued/cancelled require backend lifecycle operations not exposed by this ticket;
-                # do not advertise states the current CLI cannot observe.
+                # queued remains a backend concern; cancelled is produced by `close` and is part of
+                # the stable state contract exposed here.
                 "canonicalStates": ["running", "online", "waiting-human", "blocked", "unknown",
                                     "completed", "failed", "cancelled", "reclaimed"], "signals": signals,
                 "tmux": session_name(row["id"]), "tmuxAlive": alive,
@@ -2014,6 +2059,10 @@ def cmd_resume(args):
         raise SystemExit(f"unknown dispatch {args.dispatch} in {state_dir()}")
     require_owner(db, row["scope"], owner_token(args), "resume")
     mark = round_mark(db, args.dispatch)
+    generation = lifecycle_generation(db, args.dispatch)
+    initial_round = db.execute("SELECT state FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
+                               (args.dispatch, row["current_round"], row["current_attempt"])).fetchone()
+    initial_state = initial_round["state"] if initial_round else None
     session = session_name(args.dispatch)
     if session_alive(session):
         raise SystemExit(f"tmux session {session} is still running; use `continue` or attach to it")
@@ -2054,17 +2103,24 @@ def cmd_resume(args):
     # lock, as everywhere), so no nudge, done or continue can come between the launch and the brief.
     with input_lock(args.dispatch):
         input_started = time.time()
-        # Posted before launch so the new session's `done` sorts after it, and under the write lock the
-        # watchdog also takes, so it cannot report the not-yet-started session as exited in between.
+        # Persist the fence and pending attempt before crossing the tmux boundary. A router crash
+        # after tmux creates a session therefore leaves a visible pending attempt instead of rolling
+        # the identity back and orphaning an unaccounted writer.
         db.execute("BEGIN IMMEDIATE")
         require_owner(db, row["scope"], owner_token(args), "resume")
         # Everything above was decided without the lock: give up if the round moved on meanwhile
         # (another resume, a continue, a done) or a session came back.
         # The row read before the lock must still be the current one, as must the round mark: an old
         # row paired with a newer mark would relaunch the wrong round.
-        now = db.execute("SELECT task, report, host_session FROM dispatch WHERE id = ?", (args.dispatch,)).fetchone()
-        if (round_mark(db, args.dispatch) != mark or session_alive(session)
-                or (now["task"], now["report"], now["host_session"]) != (row["task"], row["report"], row["host_session"])):
+        now = db.execute("SELECT task, report, host, host_session, current_round, current_attempt FROM dispatch WHERE id = ?",
+                         (args.dispatch,)).fetchone()
+        now_round = db.execute("SELECT state FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
+                               (args.dispatch, now["current_round"], now["current_attempt"])).fetchone()
+        if (round_mark(db, args.dispatch) != mark or lifecycle_generation(db, args.dispatch) != generation
+                or session_alive(session)
+                or (now["task"], now["report"], now["host"], now["host_session"], now["current_round"], now["current_attempt"])
+                != (row["task"], row["report"], row["host"], row["host_session"], row["current_round"], row["current_attempt"])
+                or not now_round or now_round["state"] != initial_state):
             db.execute("ROLLBACK")
             raise SystemExit(f"dispatch {args.dispatch} changed while resuming (another resume, continue or done); "
                              f"look at its state and run resume again if it is still needed")
@@ -2087,14 +2143,13 @@ def cmd_resume(args):
         if args.task:
             post(db, args.dispatch, "worker", "continue", {"task": str(task), "report": str(report),
                  "scope": identity["scope"], "role": identity["role"], "round": next_round, "attempt": attempt})
-        db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, created) VALUES (?, ?, ?, ?, ?, ?)",
+        db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, state, created) VALUES (?, ?, ?, ?, ?, 'unknown', ?)",
                    (args.dispatch, next_round, attempt, str(task), str(report), time.time()))
         db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
-        launched = launch(args.dispatch, row["cwd"], command, extra_env, row["label"])
-        # The session (possibly) runs this task: record it with the launch, before typing can fail.
         db.execute("UPDATE dispatch SET task = ?, report = ?, host_session = ?, current_round = ?, current_attempt = ? WHERE id = ?",
                    (str(task), str(report), host_session, next_round, attempt, args.dispatch))
         db.execute("COMMIT")
+        launched = launch(args.dispatch, row["cwd"], command, extra_env, row["label"])
         if launched == NOT_SENT:
             diagnostic = f"could not start tmux session {session}"
             _set_lifecycle_result(db, resume_event, args.dispatch, DEFINITELY_NOT_SENT, diagnostic, state="unknown")
@@ -2132,7 +2187,7 @@ def cmd_resume(args):
                                  f"this conversation cannot go on; dispatch a new worker (the resumed round stays "
                                  f"recorded; close the session with tmux kill-session -t {session})")
         clear_input_fault(db, args.dispatch, input_started)
-        _set_lifecycle_result(db, resume_event, args.dispatch, "accepted")
+        _set_lifecycle_result(db, resume_event, args.dispatch, "accepted", state="running")
     emit({"resumed": args.dispatch, "operation": "resume", "result": "accepted",
           "session": host_session, "tmux": session, "round": next_round, "attempt": attempt})
 
@@ -2728,6 +2783,14 @@ def main(argv):
     p.add_argument("dispatch")
     p.add_argument("--owner-token")
     p.set_defaults(func=cmd_close)
+    p = sub.add_parser("reconcile", help="resolve a pending or uncertain handoff with operator evidence")
+    p.add_argument("dispatch")
+    p.add_argument("audit", type=int, help="lifecycle audit id from status")
+    p.add_argument("--result", required=True, choices=("accepted", "definitely-not-sent", "unknown", "refused"))
+    p.add_argument("--actor", required=True)
+    p.add_argument("--evidence", required=True)
+    p.add_argument("--owner-token")
+    p.set_defaults(func=cmd_reconcile)
     p = sub.add_parser("handoff", help="move a task to a new host and attempt")
     p.add_argument("dispatch")
     p.add_argument("--host", required=True, choices=sorted(LAUNCHERS))
