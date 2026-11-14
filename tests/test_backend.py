@@ -18,6 +18,7 @@ class FakeBackend(router.ExecutionBackend):
         self.inspect_result = inspect_result
         self.submit_category = None
         self.read_calls = 0
+        self.resume_calls = 0
 
     def create(self, dispatch_id, cwd, command, extra_env, label=None):
         return router.backend_result(self.create_result, "fake create diagnostic")
@@ -40,6 +41,7 @@ class FakeBackend(router.ExecutionBackend):
 
     def resume(self, dispatch_id, cwd, command, extra_env, label=None, text=None, host=None,
                probe_read_only=False):
+        self.resume_calls += 1
         return router.backend_result("accepted")
 
     def close(self, dispatch_id):
@@ -156,6 +158,38 @@ class BackendContract(unittest.TestCase):
 
         state = db.execute("SELECT state FROM dispatch_round WHERE dispatch = 'd-resume'").fetchone()[0]
         self.assertEqual(state, "running")
+        db.close()
+
+    def test_accepted_reconcile_is_consumed_by_resume_override(self):
+        self.fake.inspect_result = "uncertain"
+        db = router.connect()
+        db.execute("INSERT INTO dispatch (id, host, backend, cwd, task, created, started, report_dir, report, "
+                   "model, host_session, effort, network, label, git, scope, role, current_round, current_attempt) "
+                   "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                   ("d-release", "codex", "fake", str(self.cwd), "task", 1, 1, str(self.cwd), "report",
+                    None, "session", None, 0, "label", 0, "s-fake", "worker", 1, "a-fake"))
+        db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, state, created) "
+                   "VALUES (?, ?, ?, ?, ?, 'running', ?)",
+                   ("d-release", 1, "a-fake", "task", "report", 1))
+        db.commit()
+        original_find = router.find_host_session
+        router.find_host_session = lambda row: "session"
+        args = argparse.Namespace(dispatch="d-release", owner_token=None, task=None, report=None)
+        try:
+            with self.assertRaises(SystemExit) as raised:
+                router.cmd_resume(args)
+            audit = json.loads(str(raised.exception))["audit"]
+            router.cmd_reconcile(argparse.Namespace(dispatch="d-release", audit=audit, result="accepted",
+                                                    actor="operator", evidence="confirmed-absent", owner_token=None))
+            router.cmd_resume(args)
+        finally:
+            router.find_host_session = original_find
+
+        self.assertEqual(self.fake.resume_calls, 1)
+        current_attempt = db.execute("SELECT current_attempt FROM dispatch WHERE id = 'd-release'").fetchone()[0]
+        consumed = db.execute("SELECT consumed_at FROM lifecycle_event WHERE id = ?", (audit,)).fetchone()[0]
+        self.assertNotEqual(current_attempt, "a-fake")
+        self.assertIsNotNone(consumed)
         db.close()
 
 

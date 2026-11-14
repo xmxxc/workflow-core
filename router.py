@@ -71,7 +71,7 @@ TABLES = {
     # Durable lifecycle operations are separate from worker/controller messages.  An
     # operation can cross a tmux boundary after the router has committed its fencing
     # decision, so its pending/accepted/uncertain result must survive a router restart.
-    "lifecycle_event": "id INTEGER PRIMARY KEY AUTOINCREMENT, dispatch TEXT, operation TEXT, round INTEGER, attempt TEXT, from_attempt TEXT, to_attempt TEXT, from_host TEXT, to_host TEXT, result TEXT, diagnostic TEXT, owner_generation INTEGER, owner_token TEXT, resolver_actor TEXT, resolution_evidence TEXT, resolved_at REAL, created REAL",
+    "lifecycle_event": "id INTEGER PRIMARY KEY AUTOINCREMENT, dispatch TEXT, operation TEXT, round INTEGER, attempt TEXT, from_attempt TEXT, to_attempt TEXT, from_host TEXT, to_host TEXT, result TEXT, diagnostic TEXT, owner_generation INTEGER, owner_token TEXT, resolver_actor TEXT, resolution_evidence TEXT, resolved_at REAL, consumed_at REAL, created REAL",
     "waiter": "pid INTEGER PRIMARY KEY, kind TEXT, since REAL",
 }
 # Column upgrades: `started` is set once the worker's tmux session exists (the watchdog ignores
@@ -89,7 +89,7 @@ ADDED_COLUMNS = {
                 "state": "TEXT", "status_version": "INTEGER", "resolver_actor": "TEXT",
                 "resolution_source": "TEXT", "resolution_reason": "TEXT", "resolution_evidence": "TEXT",
                 "resolved_at": "REAL"},
-    "lifecycle_event": {"owner_generation": "INTEGER", "owner_token": "TEXT", "resolver_actor": "TEXT", "resolution_evidence": "TEXT", "resolved_at": "REAL"},
+    "lifecycle_event": {"owner_generation": "INTEGER", "owner_token": "TEXT", "resolver_actor": "TEXT", "resolution_evidence": "TEXT", "resolved_at": "REAL", "consumed_at": "REAL"},
     "waiter": {"process_start": "TEXT"},
 }
 
@@ -843,7 +843,9 @@ def lifecycle_view(row):
             "fromHost": row["from_host"], "toHost": row["to_host"], "result": row["result"],
             **({"diagnostic": row["diagnostic"]} if row["diagnostic"] else {}),
             **({"resolution": {"actor": row["resolver_actor"], "evidence": row["resolution_evidence"],
-                                "at": local_time(row["resolved_at"])}} if row["resolver_actor"] else {}),
+                                "at": local_time(row["resolved_at"]),
+                                **({"consumedAt": local_time(row["consumed_at"])} if row["consumed_at"] else {})}}
+               if row["resolver_actor"] else {}),
             "at": local_time(row["created"])}
 
 
@@ -1849,6 +1851,12 @@ def cmd_reconcile(args):
         if event is None:
             db.execute("ROLLBACK")
             raise SystemExit(f"no lifecycle audit {args.audit} for dispatch {args.dispatch}")
+        if event["owner_generation"] is not None and (
+                current_owner is None or current_owner["generation"] != event["owner_generation"]):
+            db.execute("ROLLBACK")
+            raise SystemExit(json.dumps({"error": "stale_controller_owner", "operation": "reconcile",
+                                         "scope": row["scope"], "generation": event["owner_generation"]},
+                                        ensure_ascii=False))
         if event["result"] not in ("pending", "uncertain"):
             same = (event["result"] == args.result and event["resolver_actor"] == args.actor
                     and event["resolution_evidence"] == args.evidence)
@@ -2295,7 +2303,12 @@ def cmd_resume(args):
                                (args.dispatch, row["current_round"], row["current_attempt"])).fetchone()
     initial_state = initial_round["state"] if initial_round else None
     session = session_name(args.dispatch)
-    inspection = backend.inspect(args.dispatch)
+    override = db.execute("SELECT id FROM lifecycle_event WHERE dispatch = ? AND operation = 'resume' "
+                          "AND result = 'accepted' AND to_attempt = ? AND resolution_evidence IS NOT NULL "
+                          "AND consumed_at IS NULL ORDER BY id DESC LIMIT 1",
+                          (args.dispatch, row["current_attempt"])).fetchone()
+    inspection = ({"result": "accepted", "alive": False, "confirmedAbsent": True}
+                  if override else backend.inspect(args.dispatch))
     if inspection["result"] != "accepted" and not inspection.get("confirmedAbsent", False):
         resume_reconcile_required(db, row, inspection, owner_token(args))
     if inspection.get("alive", False):
@@ -2350,7 +2363,12 @@ def cmd_resume(args):
                          (args.dispatch,)).fetchone()
         now_round = db.execute("SELECT state FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
                                (args.dispatch, now["current_round"], now["current_attempt"])).fetchone()
-        locked_inspection = backend.inspect(args.dispatch)
+        override = db.execute("SELECT id FROM lifecycle_event WHERE dispatch = ? AND operation = 'resume' "
+                              "AND result = 'accepted' AND to_attempt = ? AND resolution_evidence IS NOT NULL "
+                              "AND consumed_at IS NULL ORDER BY id DESC LIMIT 1",
+                              (args.dispatch, now["current_attempt"])).fetchone()
+        locked_inspection = ({"result": "accepted", "alive": False, "confirmedAbsent": True}
+                             if override else backend.inspect(args.dispatch))
         if locked_inspection["result"] != "accepted" and not locked_inspection.get("confirmedAbsent", False):
             db.execute("ROLLBACK")
             resume_reconcile_required(db, row, locked_inspection, owner_token(args))
@@ -2364,6 +2382,9 @@ def cmd_resume(args):
                              f"look at its state and run resume again if it is still needed")
         if args.task:
             refuse_used_report(db, args.dispatch, report)
+        if override:
+            db.execute("UPDATE lifecycle_event SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL",
+                       (time.time(), override["id"]))
         identity = db.execute("SELECT scope, role, current_round, current_attempt FROM dispatch WHERE id = ?",
                               (args.dispatch,)).fetchone()
         # Every resume is a new execution attempt and snapshot.  Keeping the same task/report
@@ -2651,7 +2672,7 @@ def check_workers(db, stall_after, scope=None, token=None):
         watch_key = (dispatch_id, db.execute("SELECT MAX(id) FROM message WHERE dispatch = ? AND type = 'resumed'",
                                              (dispatch_id,)).fetchone()[0])
         turn_end = TURN_WATCHES.setdefault(watch_key, TurnWatch()).latest(row, now) if alive and not backend_fault else None
-        notice = read_only_notice(captured.stdout) if alive and captured.returncode == 0 else None
+        notice = read_only_notice(captured.stdout) if alive and captured is not None and captured.returncode == 0 else None
         timeout_marker = f"timeout:{row['current_round']}:{row['current_attempt']}"
         prior_timeout = db.execute("SELECT turn FROM host_error WHERE dispatch = ?", (dispatch_id,)).fetchone()
         timeout_seen = bool(prior_timeout and prior_timeout["turn"] == timeout_marker)
