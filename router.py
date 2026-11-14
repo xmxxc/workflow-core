@@ -71,7 +71,7 @@ TABLES = {
     # Durable lifecycle operations are separate from worker/controller messages.  An
     # operation can cross a tmux boundary after the router has committed its fencing
     # decision, so its pending/accepted/uncertain result must survive a router restart.
-    "lifecycle_event": "id INTEGER PRIMARY KEY AUTOINCREMENT, dispatch TEXT, operation TEXT, round INTEGER, attempt TEXT, from_attempt TEXT, to_attempt TEXT, from_host TEXT, to_host TEXT, result TEXT, diagnostic TEXT, resolver_actor TEXT, resolution_evidence TEXT, resolved_at REAL, created REAL",
+    "lifecycle_event": "id INTEGER PRIMARY KEY AUTOINCREMENT, dispatch TEXT, operation TEXT, round INTEGER, attempt TEXT, from_attempt TEXT, to_attempt TEXT, from_host TEXT, to_host TEXT, result TEXT, diagnostic TEXT, owner_generation INTEGER, owner_token TEXT, resolver_actor TEXT, resolution_evidence TEXT, resolved_at REAL, created REAL",
     "waiter": "pid INTEGER PRIMARY KEY, kind TEXT, since REAL",
 }
 # Column upgrades: `started` is set once the worker's tmux session exists (the watchdog ignores
@@ -89,7 +89,7 @@ ADDED_COLUMNS = {
                 "state": "TEXT", "status_version": "INTEGER", "resolver_actor": "TEXT",
                 "resolution_source": "TEXT", "resolution_reason": "TEXT", "resolution_evidence": "TEXT",
                 "resolved_at": "REAL"},
-    "lifecycle_event": {"resolver_actor": "TEXT", "resolution_evidence": "TEXT", "resolved_at": "REAL"},
+    "lifecycle_event": {"owner_generation": "INTEGER", "owner_token": "TEXT", "resolver_actor": "TEXT", "resolution_evidence": "TEXT", "resolved_at": "REAL"},
     "waiter": {"process_start": "TEXT"},
 }
 
@@ -787,18 +787,25 @@ def post(db, dispatch_id, recipient, type_, body, request_key=None):
 
 def lifecycle_event(db, dispatch_id, operation, *, round=None, attempt=None,
                     from_attempt=None, to_attempt=None, from_host=None, to_host=None,
-                    result="pending", diagnostic=None):
+                    result="pending", diagnostic=None, owner_generation=None, owner_token=None):
     """Append an auditable control-plane operation and return its id.
 
     The event is deliberately independent of ``message``: interrupt/close/handoff
     may have no worker message to deliver, and their external tmux result can be
     updated after the fencing transaction has committed.
     """
+    if owner_generation is None or owner_token is None:
+        owner = db.execute("SELECT o.generation, o.token FROM controller_owner o JOIN dispatch d ON d.scope = o.scope "
+                           "WHERE d.id = ?", (dispatch_id,)).fetchone()
+        if owner:
+            owner_generation = owner_generation if owner_generation is not None else owner["generation"]
+            owner_token = owner_token if owner_token is not None else owner["token"]
     cur = db.execute(
         "INSERT INTO lifecycle_event (dispatch, operation, round, attempt, from_attempt, to_attempt, "
-        "from_host, to_host, result, diagnostic, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "from_host, to_host, result, diagnostic, owner_generation, owner_token, created) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (dispatch_id, operation, round, attempt, from_attempt, to_attempt, from_host, to_host,
-         result, diagnostic, time.time()))
+         result, diagnostic, owner_generation, owner_token, time.time()))
     return cur.lastrowid
 
 
@@ -1514,8 +1521,19 @@ def lifecycle_generation(db, dispatch_id):
                       (dispatch_id,)).fetchone()[0]
 
 
-def _set_lifecycle_result(db, event_id, dispatch_id, result, diagnostic=None, state=None):
+def _set_lifecycle_result(db, event_id, dispatch_id, result, diagnostic=None, state=None, owner_credential=None):
     db.execute("BEGIN IMMEDIATE")
+    event = db.execute("SELECT operation, owner_generation FROM lifecycle_event WHERE id = ? AND dispatch = ?",
+                       (event_id, dispatch_id)).fetchone()
+    if event is None:
+        db.execute("ROLLBACK")
+        raise SystemExit(f"unknown lifecycle event {event_id} for {dispatch_id}")
+    scope = owner_scope(db, dispatch_id)
+    current_owner = require_owner(db, scope, owner_credential, event["operation"])
+    if event["owner_generation"] is not None and (current_owner is None or current_owner["generation"] != event["owner_generation"]):
+        db.execute("ROLLBACK")
+        raise SystemExit(json.dumps({"error": "stale_controller_owner", "operation": event["operation"],
+                                     "scope": scope, "generation": event["owner_generation"]}, ensure_ascii=False))
     finish_lifecycle_event(db, event_id, result, diagnostic)
     if state:
         current = db.execute("SELECT current_round, current_attempt FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
@@ -1560,7 +1578,7 @@ def cmd_interrupt(args):
                     result, diagnostic = DEFINITELY_NOT_SENT, sent.stderr or sent.stdout or "tmux could not run"
                 else:
                     result, diagnostic = UNCERTAIN, sent.stderr or sent.stdout or f"tmux exited {sent.returncode}"
-        _set_lifecycle_result(db, event, args.dispatch, result, diagnostic)
+        _set_lifecycle_result(db, event, args.dispatch, result, diagnostic, owner_credential=owner_token(args))
     emit({"dispatch": args.dispatch, "operation": "interrupt", "result": result,
           "round": current["round"], "attempt": current["attempt"],
           **({"diagnostic": diagnostic} if diagnostic else {})})
@@ -1614,9 +1632,10 @@ def cmd_close(args):
             db.execute("COMMIT")
             result, diagnostic = "completed", "session was already gone"
         if event is not None and result != "completed" and db.execute("SELECT result FROM lifecycle_event WHERE id = ?", (event,)).fetchone()[0] == "pending":
-            _set_lifecycle_result(db, event, args.dispatch, result, diagnostic)
+            _set_lifecycle_result(db, event, args.dispatch, result, diagnostic, owner_credential=owner_token(args))
         elif event is not None and result == "completed" and db.execute("SELECT result FROM lifecycle_event WHERE id = ?", (event,)).fetchone()[0] == "pending":
-            _set_lifecycle_result(db, event, args.dispatch, result, diagnostic, state="cancelled")
+            _set_lifecycle_result(db, event, args.dispatch, result, diagnostic, state="cancelled",
+                                  owner_credential=owner_token(args))
     if result == "refused":
         raise SystemExit(diagnostic)
     emit({"dispatch": args.dispatch, "operation": "close", "result": result,
@@ -1629,13 +1648,13 @@ def cmd_reconcile(args):
     db = connect()
     with input_lock(args.dispatch):
         row, current = _current_attempt(db, args.dispatch)
-        require_owner(db, row["scope"], owner_token(args), "reconcile")
         db.execute("BEGIN IMMEDIATE")
-        event = db.execute("SELECT * FROM lifecycle_event WHERE id = ? AND dispatch = ? AND operation = 'handoff'",
+        current_owner = require_owner(db, row["scope"], owner_token(args), "reconcile")
+        event = db.execute("SELECT * FROM lifecycle_event WHERE id = ? AND dispatch = ? AND operation IN ('handoff', 'resume')",
                            (args.audit, args.dispatch)).fetchone()
         if event is None:
             db.execute("ROLLBACK")
-            raise SystemExit(f"no handoff audit {args.audit} for dispatch {args.dispatch}")
+            raise SystemExit(f"no handoff/resume audit {args.audit} for dispatch {args.dispatch}")
         if event["result"] not in ("pending", "uncertain"):
             same = (event["result"] == args.result and event["resolver_actor"] == args.actor
                     and event["resolution_evidence"] == args.evidence)
@@ -1752,7 +1771,8 @@ def cmd_handoff(args):
         if close_result != "completed":
             finish_result = close_result
             diagnostic = f"could not confirm closing old session: {close_diag}"
-            _set_lifecycle_result(db, event, args.dispatch, finish_result, diagnostic, state="unknown")
+            _set_lifecycle_result(db, event, args.dispatch, finish_result, diagnostic, state="unknown",
+                                  owner_credential=owner_token(args))
             emit({"dispatch": args.dispatch, "operation": "handoff", "result": finish_result,
                   "fromAttempt": current["attempt"], "attempt": attempt, "host": args.host,
                   "diagnostic": diagnostic})
@@ -1760,14 +1780,16 @@ def cmd_handoff(args):
         launched = launch(args.dispatch, row["cwd"], command, extra_env, row["label"])
         if launched == NOT_SENT:
             diagnostic = "new host session was definitely not started"
-            _set_lifecycle_result(db, event, args.dispatch, DEFINITELY_NOT_SENT, diagnostic, state="unknown")
+            _set_lifecycle_result(db, event, args.dispatch, DEFINITELY_NOT_SENT, diagnostic, state="unknown",
+                                  owner_credential=owner_token(args))
             emit({"dispatch": args.dispatch, "operation": "handoff", "result": DEFINITELY_NOT_SENT,
                   "fromAttempt": current["attempt"], "attempt": attempt, "host": args.host,
                   "diagnostic": diagnostic})
             return
         if launched == UNCERTAIN:
             diagnostic = "new host session start was not confirmed"
-            _set_lifecycle_result(db, event, args.dispatch, UNCERTAIN, diagnostic, state="unknown")
+            _set_lifecycle_result(db, event, args.dispatch, UNCERTAIN, diagnostic, state="unknown",
+                                  owner_credential=owner_token(args))
             emit({"dispatch": args.dispatch, "operation": "handoff", "result": UNCERTAIN,
                   "fromAttempt": current["attempt"], "attempt": attempt, "host": args.host,
                   "diagnostic": diagnostic})
@@ -1778,12 +1800,13 @@ def cmd_handoff(args):
                                          if wait_for_quiet_screen(session) else (NOT_SENT, None, "worker screen did not become ready"))
             if typed != SENT:
                 _set_lifecycle_result(db, event, args.dispatch, UNCERTAIN if typed in (PARTIAL, UNCERTAIN) else DEFINITELY_NOT_SENT,
-                                      diagnostic or notice, state="unknown")
+                                      diagnostic or notice, state="unknown", owner_credential=owner_token(args))
                 emit({"dispatch": args.dispatch, "operation": "handoff", "result": UNCERTAIN if typed in (PARTIAL, UNCERTAIN) else DEFINITELY_NOT_SENT,
                       "fromAttempt": current["attempt"], "attempt": attempt, "host": args.host,
                       "diagnostic": diagnostic or notice})
                 return
-        _set_lifecycle_result(db, event, args.dispatch, "accepted", state="running")
+        _set_lifecycle_result(db, event, args.dispatch, "accepted", state="running",
+                              owner_credential=owner_token(args))
     emit({"dispatch": args.dispatch, "operation": "handoff", "result": "accepted",
           "fromAttempt": current["attempt"], "attempt": attempt, "host": args.host,
           "round": next_round})
@@ -2058,6 +2081,14 @@ def cmd_resume(args):
     if row is None:
         raise SystemExit(f"unknown dispatch {args.dispatch} in {state_dir()}")
     require_owner(db, row["scope"], owner_token(args), "resume")
+    unresolved = db.execute("SELECT id, operation, result, diagnostic FROM lifecycle_event WHERE dispatch = ? "
+                            "AND operation IN ('handoff', 'resume') AND result IN ('pending', 'uncertain') "
+                            "ORDER BY id DESC LIMIT 1", (args.dispatch,)).fetchone()
+    if unresolved:
+        raise SystemExit(json.dumps({"error": "lifecycle_reconcile_required", "dispatch": args.dispatch,
+                                     "audit": unresolved["id"], "operation": unresolved["operation"],
+                                     "result": unresolved["result"], "diagnostic": unresolved["diagnostic"]},
+                                    ensure_ascii=False))
     mark = round_mark(db, args.dispatch)
     generation = lifecycle_generation(db, args.dispatch)
     initial_round = db.execute("SELECT state FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
@@ -2152,11 +2183,13 @@ def cmd_resume(args):
         launched = launch(args.dispatch, row["cwd"], command, extra_env, row["label"])
         if launched == NOT_SENT:
             diagnostic = f"could not start tmux session {session}"
-            _set_lifecycle_result(db, resume_event, args.dispatch, DEFINITELY_NOT_SENT, diagnostic, state="unknown")
+            _set_lifecycle_result(db, resume_event, args.dispatch, DEFINITELY_NOT_SENT, diagnostic, state="unknown",
+                                  owner_credential=owner_token(args))
             raise SystemExit(diagnostic)
         if launched == UNCERTAIN:
             _set_lifecycle_result(db, resume_event, args.dispatch, UNCERTAIN,
-                                  f"tmux did not confirm {session}", state="unknown")
+                                  f"tmux did not confirm {session}", state="unknown",
+                                  owner_credential=owner_token(args))
             raise SystemExit(f"tmux did not confirm {session}; the resumed round is recorded. Check `tmux ls`; "
                              f"`wait` reports it exited if it never started.")
         if row["host"] == "opencode":
@@ -2164,30 +2197,35 @@ def cmd_resume(args):
             typed, notice, diagnostic = (type_into(session, brief, row["host"]) if wait_for_quiet_screen(session)
                                          else (NOT_SENT, None, "worker screen did not become ready"))
             if typed in (PARTIAL, UNCERTAIN):
-                _set_lifecycle_result(db, resume_event, args.dispatch, UNCERTAIN, diagnostic, state="unknown")
+                _set_lifecycle_result(db, resume_event, args.dispatch, UNCERTAIN, diagnostic, state="unknown",
+                                      owner_credential=owner_token(args))
                 persist_input_fault(db, args.dispatch, "resume", typed, diagnostic)
                 raise typing_error(session, "The brief", typed)
             if typed == READ_ONLY:
-                _set_lifecycle_result(db, resume_event, args.dispatch, "refused", notice, state="unknown")
+                _set_lifecycle_result(db, resume_event, args.dispatch, "refused", notice, state="unknown",
+                                      owner_credential=owner_token(args))
                 persist_input_fault(db, args.dispatch, "resume", typed, diagnostic)
                 mark_screen_reported(db, args.dispatch, session)
                 raise SystemExit(f"resumed {session}, but " + refusal(session, "the brief", notice))
             if typed == NOT_SENT:
-                _set_lifecycle_result(db, resume_event, args.dispatch, DEFINITELY_NOT_SENT, diagnostic, state="unknown")
+                _set_lifecycle_result(db, resume_event, args.dispatch, DEFINITELY_NOT_SENT, diagnostic, state="unknown",
+                                      owner_credential=owner_token(args))
                 persist_input_fault(db, args.dispatch, "resume", typed, diagnostic)
                 raise SystemExit(f"resumed {session} but could not type the brief into it; attach and paste it: {brief}")
         elif any(host == row["host"] for host, *_ in READ_ONLY_NOTICES):
             # The brief went in on the command line; a conversation that opens read-only drops it.
             notice = new_notice(session, [], seconds_setting("WFC_RESUME_CHECK_SECONDS", 5))
             if notice:
-                _set_lifecycle_result(db, resume_event, args.dispatch, "refused", notice, state="unknown")
+                _set_lifecycle_result(db, resume_event, args.dispatch, "refused", notice, state="unknown",
+                                      owner_credential=owner_token(args))
                 persist_input_fault(db, args.dispatch, "resume", READ_ONLY, notice)
                 mark_screen_reported(db, args.dispatch, session)
                 raise SystemExit(f"resumed {session}, but its screen says \"{notice}\" The brief was not sent, and "
                                  f"this conversation cannot go on; dispatch a new worker (the resumed round stays "
                                  f"recorded; close the session with tmux kill-session -t {session})")
         clear_input_fault(db, args.dispatch, input_started)
-        _set_lifecycle_result(db, resume_event, args.dispatch, "accepted", state="running")
+        _set_lifecycle_result(db, resume_event, args.dispatch, "accepted", state="running",
+                              owner_credential=owner_token(args))
     emit({"resumed": args.dispatch, "operation": "resume", "result": "accepted",
           "session": host_session, "tmux": session, "round": next_round, "attempt": attempt})
 

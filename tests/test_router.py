@@ -1577,9 +1577,14 @@ class ResumePartialTyping(unittest.TestCase):
         first = env.run("resume", dispatch, "--task", str(task2), "--report", str(report2),
                         env={**screen, "FAKE_ENTER_FAIL": "1"}, timeout=20)
         env.end_session(dispatch)
+        blocked = env.run("resume", dispatch, env=screen, timeout=20)
+        audit = env.json("status", "--dispatch", dispatch)["dispatches"][0]["audit"][-1]["id"]
+        env.json("reconcile", dispatch, str(audit), "--result", "definitely-not-sent",
+                 "--actor", "operator-1", "--evidence", "enter-failed")
         second = env.run("resume", dispatch, env=screen, timeout=20)
 
         self.assertNotEqual(first.returncode, 0)
+        self.assertNotEqual(blocked.returncode, 0)
         self.assertEqual(second.returncode, 0, second.stderr)
         typed = [c[-1] for c in env.host_calls() if c[:2] == ["tmux", "send-keys"] and "-l" in c]
         self.assertIn(str(report2), typed[-1])
@@ -3266,6 +3271,49 @@ class InterruptHandoff(unittest.TestCase):
                                      "unknown" if outcome != "accepted" else "online")
                 finally:
                     env.close()
+
+    def test_pending_resume_blocks_repeat_and_reconcile_can_release_it(self):
+        dispatch = self.env.dispatch("claude")
+        self.env.end_session(dispatch)
+        db = sqlite3.connect(self.env.state / "router.db")
+        attempt = self.status(dispatch)["attempt"]
+        db.execute("UPDATE dispatch_round SET state='unknown' WHERE dispatch=? AND attempt=?", (dispatch, attempt))
+        db.execute("INSERT INTO lifecycle_event (dispatch, operation, round, attempt, from_attempt, to_attempt, "
+                   "from_host, to_host, result, diagnostic, created) VALUES (?, 'resume', 1, ?, ?, ?, "
+                   "'claude', 'claude', 'pending', 'router stopped before resume result', ?)",
+                   (dispatch, attempt, attempt, attempt, time.time()))
+        db.commit(); db.close()
+
+        blocked = self.env.run("resume", dispatch)
+        released = self.env.json("reconcile", dispatch, "1", "--result", "accepted", "--actor", "operator-1",
+                                 "--evidence", "resume-receipt-1")
+
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("lifecycle_reconcile_required", blocked.stderr)
+        self.assertEqual(released["result"], "accepted")
+
+    def test_reconcile_is_fenced_after_owner_takeover(self):
+        scope = "s-r8-owner"
+        first = self.env.json("owner", "acquire", "--scope", scope, "--owner", "first", "--lease", "60")
+        dispatch = self.env.dispatch(extra_args=("--scope", scope, "--owner-token", first["token"]))
+        db = sqlite3.connect(self.env.state / "router.db")
+        attempt = self.status(dispatch)["attempt"]
+        db.execute("UPDATE dispatch_round SET state='unknown' WHERE dispatch=? AND attempt=?", (dispatch, attempt))
+        db.execute("INSERT INTO lifecycle_event (dispatch, operation, round, attempt, from_attempt, to_attempt, "
+                   "from_host, to_host, result, diagnostic, created) VALUES (?, 'handoff', 1, ?, ?, ?, "
+                   "'codex', 'claude', 'pending', 'awaiting external result', ?)",
+                   (dispatch, attempt, attempt, attempt, time.time()))
+        db.commit(); db.close()
+        second = self.env.json("owner", "takeover", "--scope", scope, "--owner", "second")
+        stale = self.env.run("reconcile", dispatch, "1", "--result", "accepted", "--actor", "first",
+                             "--evidence", "old-proof", env={"WFC_CONTROLLER_TOKEN": first["token"]})
+
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertIn("stale_controller_owner", stale.stderr)
+        self.assertNotEqual(second["token"], first["token"])
+        resolved = self.env.json("reconcile", dispatch, "1", "--result", "accepted", "--actor", "second",
+                                 "--evidence", "new-proof", "--owner-token", second["token"])
+        self.assertEqual(resolved["result"], "accepted")
 
     def test_resume_crash_after_external_launch_leaves_pending_attempt(self):
         dispatch = self.env.dispatch("claude")
