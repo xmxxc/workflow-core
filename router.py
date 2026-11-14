@@ -1620,6 +1620,23 @@ def cmd_handoff(args):
     with input_lock(args.dispatch):
         row, current = _current_attempt(db, args.dispatch)
         require_owner(db, row["scope"], owner_token(args), "handoff")
+        pending = db.execute("SELECT id, result, diagnostic FROM lifecycle_event "
+                             "WHERE dispatch = ? AND operation = 'handoff' AND result IN ('pending', 'uncertain') "
+                             "ORDER BY id DESC LIMIT 1", (args.dispatch,)).fetchone()
+        if pending:
+            raise SystemExit(json.dumps({"error": "handoff_reconcile_required", "dispatch": args.dispatch,
+                                         "audit": pending["id"], "result": pending["result"],
+                                         "diagnostic": pending["diagnostic"]}, ensure_ascii=False))
+        if not args.task and not args.report:
+            prior = db.execute("SELECT * FROM lifecycle_event WHERE dispatch = ? AND operation = 'handoff' "
+                               "AND result = 'accepted' AND to_attempt = ? AND to_host = ? "
+                               "ORDER BY id DESC LIMIT 1",
+                               (args.dispatch, current["attempt"], args.host)).fetchone()
+            if prior:
+                emit({"dispatch": args.dispatch, "operation": "handoff", "result": "accepted",
+                      "duplicate": True, "audit": prior["id"], "attempt": current["attempt"],
+                      "host": args.host, "round": current["round"]})
+                return
         if bool(args.task) != bool(args.report):
             raise SystemExit("give both --task and --report, or neither")
         if args.task and not done_current_task(db, args.dispatch):
@@ -1639,6 +1656,11 @@ def cmd_handoff(args):
         if old_alive:
             owned, why = session_owner(session)
             if not owned:
+                db.execute("BEGIN IMMEDIATE")
+                lifecycle_event(db, args.dispatch, "handoff", round=current["round"], attempt=current["attempt"],
+                                from_attempt=current["attempt"], from_host=row["host"], to_host=args.host,
+                                result="refused", diagnostic=why)
+                db.execute("COMMIT")
                 raise SystemExit(why)
         next_round = current["round"] + (1 if args.task else 0)
         attempt = "a-" + uuid.uuid4().hex[:12]
@@ -1871,7 +1893,7 @@ def cmd_status(args):
                 # queued/cancelled require backend lifecycle operations not exposed by this ticket;
                 # do not advertise states the current CLI cannot observe.
                 "canonicalStates": ["running", "online", "waiting-human", "blocked", "unknown",
-                                    "completed", "failed", "reclaimed"], "signals": signals,
+                                    "completed", "failed", "cancelled", "reclaimed"], "signals": signals,
                 "tmux": session_name(row["id"]), "tmuxAlive": alive,
                 "cwd": row["cwd"], "task": row["task"], "report": row["report"], "started": local_time(row["started"]),
                 "last": message_view(last) if last else None,
@@ -2069,16 +2091,17 @@ def cmd_resume(args):
                    (args.dispatch, next_round, attempt, str(task), str(report), time.time()))
         db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
         launched = launch(args.dispatch, row["cwd"], command, extra_env, row["label"])
-        if launched == NOT_SENT:
-            db.execute("ROLLBACK")
-            raise SystemExit(f"could not start tmux session {session}")
         # The session (possibly) runs this task: record it with the launch, before typing can fail.
         db.execute("UPDATE dispatch SET task = ?, report = ?, host_session = ?, current_round = ?, current_attempt = ? WHERE id = ?",
                    (str(task), str(report), host_session, next_round, attempt, args.dispatch))
         db.execute("COMMIT")
+        if launched == NOT_SENT:
+            diagnostic = f"could not start tmux session {session}"
+            _set_lifecycle_result(db, resume_event, args.dispatch, DEFINITELY_NOT_SENT, diagnostic, state="unknown")
+            raise SystemExit(diagnostic)
         if launched == UNCERTAIN:
             _set_lifecycle_result(db, resume_event, args.dispatch, UNCERTAIN,
-                                  f"tmux did not confirm {session}")
+                                  f"tmux did not confirm {session}", state="unknown")
             raise SystemExit(f"tmux did not confirm {session}; the resumed round is recorded. Check `tmux ls`; "
                              f"`wait` reports it exited if it never started.")
         if row["host"] == "opencode":
@@ -2086,23 +2109,23 @@ def cmd_resume(args):
             typed, notice, diagnostic = (type_into(session, brief, row["host"]) if wait_for_quiet_screen(session)
                                          else (NOT_SENT, None, "worker screen did not become ready"))
             if typed in (PARTIAL, UNCERTAIN):
-                _set_lifecycle_result(db, resume_event, args.dispatch, UNCERTAIN, diagnostic)
+                _set_lifecycle_result(db, resume_event, args.dispatch, UNCERTAIN, diagnostic, state="unknown")
                 persist_input_fault(db, args.dispatch, "resume", typed, diagnostic)
                 raise typing_error(session, "The brief", typed)
             if typed == READ_ONLY:
-                _set_lifecycle_result(db, resume_event, args.dispatch, "refused", notice)
+                _set_lifecycle_result(db, resume_event, args.dispatch, "refused", notice, state="unknown")
                 persist_input_fault(db, args.dispatch, "resume", typed, diagnostic)
                 mark_screen_reported(db, args.dispatch, session)
                 raise SystemExit(f"resumed {session}, but " + refusal(session, "the brief", notice))
             if typed == NOT_SENT:
-                _set_lifecycle_result(db, resume_event, args.dispatch, DEFINITELY_NOT_SENT, diagnostic)
+                _set_lifecycle_result(db, resume_event, args.dispatch, DEFINITELY_NOT_SENT, diagnostic, state="unknown")
                 persist_input_fault(db, args.dispatch, "resume", typed, diagnostic)
                 raise SystemExit(f"resumed {session} but could not type the brief into it; attach and paste it: {brief}")
         elif any(host == row["host"] for host, *_ in READ_ONLY_NOTICES):
             # The brief went in on the command line; a conversation that opens read-only drops it.
             notice = new_notice(session, [], seconds_setting("WFC_RESUME_CHECK_SECONDS", 5))
             if notice:
-                _set_lifecycle_result(db, resume_event, args.dispatch, "refused", notice)
+                _set_lifecycle_result(db, resume_event, args.dispatch, "refused", notice, state="unknown")
                 persist_input_fault(db, args.dispatch, "resume", READ_ONLY, notice)
                 mark_screen_reported(db, args.dispatch, session)
                 raise SystemExit(f"resumed {session}, but its screen says \"{notice}\" The brief was not sent, and "

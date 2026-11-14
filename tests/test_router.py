@@ -1819,7 +1819,23 @@ class RoundIdentity(unittest.TestCase):
         done = self.env.run("done", "--report", str(report2), dispatch=dispatch)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("no longer accepted", done.stderr)
+        view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((view["rounds"][-1]["state"], view["audit"][-1]["result"]), ("unknown", "uncertain"))
+
+    def test_a_resume_definitely_not_sent_keeps_attempt_and_audit(self):
+        dispatch = self.env.dispatch("claude")
+        self.env.end_session(dispatch)
+        before = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]["attempt"]
+
+        result = self.env.run("resume", dispatch, env={"PATH": "/definitely/no-such-tmux"})
+
+        self.assertNotEqual(result.returncode, 0)
+        view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertNotEqual(view["attempt"], before)
+        self.assertEqual((view["rounds"][-1]["state"], view["audit"][-1]["result"]),
+                         ("unknown", "definitely-not-sent"))
 
 
 
@@ -3152,11 +3168,46 @@ class InterruptHandoff(unittest.TestCase):
         self.assertEqual((view["host"], view["audit"][-1]["operation"], view["audit"][-1]["result"]),
                          ("claude", "handoff", "accepted"))
         self.assertNotEqual(view["attempt"], old_attempt)
+        launches = len([c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]])
+        duplicate = self.env.json("handoff", dispatch, "--host", "claude")
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(len([c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]]), launches)
         self.env.report.write_text("# handoff\n")
         stale = self.env.run("done", "--report", str(self.env.report), "--attempt", old_attempt, dispatch=dispatch)
         self.assertNotEqual(stale.returncode, 0)
         self.assertIn("no longer accepted", stale.stderr)
         self.env.json("done", "--report", str(self.env.report), "--attempt", view["attempt"], dispatch=dispatch)
+
+    def test_pending_handoff_after_router_restart_refuses_implicit_retry(self):
+        dispatch = self.env.dispatch()
+        db = sqlite3.connect(self.env.state / "router.db")
+        attempt = self.status(dispatch)["attempt"]
+        db.execute("INSERT INTO lifecycle_event (dispatch, operation, round, attempt, from_attempt, to_attempt, "
+                   "from_host, to_host, result, diagnostic, created) VALUES (?, 'handoff', 1, ?, ?, 'a-pending', "
+                   "'codex', 'claude', 'pending', 'router stopped before tmux result', ?)",
+                   (dispatch, attempt, attempt, time.time()))
+        db.commit()
+        db.close()
+        before = len([c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]])
+
+        result = self.env.run("handoff", dispatch, "--host", "claude")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("handoff_reconcile_required", result.stderr)
+        view = self.status(dispatch)
+        self.assertEqual(len(view["rounds"]), 1)
+        self.assertEqual(len([c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]]), before)
+
+    def test_foreign_session_handoff_is_refused_and_audited(self):
+        dispatch = self.env.dispatch()
+        (self.env.sessions / f"wfc-{dispatch}").write_text(json.dumps({"WFC_STATE": "/other/state"}))
+
+        result = self.env.run("handoff", dispatch, "--host", "claude")
+
+        self.assertNotEqual(result.returncode, 0)
+        view = self.status(dispatch)
+        self.assertEqual((view["audit"][-1]["operation"], view["audit"][-1]["result"]), ("handoff", "refused"))
+        self.assertEqual(len(view["rounds"]), 1)
 
     def test_resume_has_its_own_audit_event(self):
         dispatch = self.env.dispatch("claude")
@@ -3180,7 +3231,7 @@ class MultiSignalContract(unittest.TestCase):
                          ("online", "running", "active"))
         self.assertEqual(view["canonicalStates"],
                          ["running", "online", "waiting-human", "blocked", "unknown",
-                          "completed", "failed", "reclaimed"])
+                          "completed", "failed", "cancelled", "reclaimed"])
 
     def test_repeated_redraw_reaches_a_bounded_turn_timeout(self):
         alt = self.env.screen.with_name("screen-alt.txt")
