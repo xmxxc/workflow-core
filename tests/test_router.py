@@ -562,6 +562,13 @@ class Delivery(unittest.TestCase):
         self.assertIn(f"{router} ask ", brief)
         self.assertIn("Never ask questions in plain text or with an interactive question tool", brief)
 
+    def test_dispatch_and_status_expose_the_execution_backend(self):
+        dispatch = self.env.dispatch("codex")
+
+        view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+
+        self.assertEqual(view["backend"], "tmux")
+
     def test_every_host_gets_its_worker_identity_and_a_created_report_directory(self):
         self.env.report = self.env.report.parent / "new-scope" / "113-impl-r1.md"
         for host in ("codex", "opencode", "claude"):
@@ -3436,7 +3443,6 @@ class MultiSignalContract(unittest.TestCase):
         view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
         self.assertEqual(view["signals"]["fault"]["category"], "permission_required")
         self.assertFalse(view["signals"]["hostActive"])
-
 
 if __name__ == "__main__":
     unittest.main()
