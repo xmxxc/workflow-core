@@ -899,7 +899,7 @@ def text_left_in_box(session, host, text):
 
 
 def type_into(session, text, host=None):
-    """Type one line into a TUI and submit it. Returns (state, notice), the state being
+    """Type one line into a TUI and submit it. Returns (state, notice, diagnostic), the state being
     SENT;
     NOT_SENT when the text certainly did not arrive (tmux could not be run at all): safe to type again;
     READ_ONLY when the host's screen says its conversation takes no input (`notice` is that line):
@@ -918,29 +918,35 @@ def type_into(session, text, host=None):
     screen = capture(session)
     before = screen_notices(screen) if screen is not None else None
     if before and any(kind == "state" for kind, _ in before):
-        return READ_ONLY, next(t for kind, t in before if kind == "state")
+        notice = next(t for kind, t in before if kind == "state")
+        return READ_ONLY, notice, notice
     sent = tmux("send-keys", "-t", session, "-l", text)
     if sent.returncode != 0:
-        return (NOT_SENT if getattr(sent, "not_run", False) else UNCERTAIN), None
+        state = NOT_SENT if getattr(sent, "not_run", False) else UNCERTAIN
+        return state, None, sent.stderr or sent.stdout or f"tmux send-keys exited {sent.returncode}"
     time.sleep(0.5)  # TUIs drop an Enter that arrives in the same burst as the text
-    if tmux("send-keys", "-t", session, "Enter").returncode != 0:
-        return PARTIAL, None
+    entered = tmux("send-keys", "-t", session, "Enter")
+    if entered.returncode != 0:
+        return PARTIAL, None, entered.stderr or entered.stdout or f"tmux Enter exited {entered.returncode}"
     if before is None:  # no screen to compare with: tmux could not capture it
-        return SENT, None
+        return SENT, None, None
     window = seconds_setting("WFC_TYPED_CHECK_SECONDS", 1.5)
     notice = new_notice(session, before, window)
     if notice:
-        return READ_ONLY, notice
+        return READ_ONLY, notice, notice
     for _ in range(ENTER_RETRIES):
         left = text_left_in_box(session, host, text)
         if left is None:
-            return SENT, None
-        if tmux("send-keys", "-t", session, "Enter").returncode != 0:
-            return PARTIAL, None
+            return SENT, None, None
+        entered = tmux("send-keys", "-t", session, "Enter")
+        if entered.returncode != 0:
+            return PARTIAL, None, entered.stderr or entered.stdout or f"tmux Enter exited {entered.returncode}"
         notice = new_notice(session, screen_notices(left), window)
         if notice:
-            return READ_ONLY, notice
-    return (PARTIAL, None) if text_left_in_box(session, host, text) is not None else (SENT, None)
+            return READ_ONLY, notice, notice
+    if text_left_in_box(session, host, text) is not None:
+        return PARTIAL, None, "typed text remained in the host input box"
+    return SENT, None, None
 
 
 def refusal(session, what, notice):
@@ -978,6 +984,10 @@ def persist_input_fault(db, dispatch_id, operation, outcome, diagnostic=None):
         db.execute("ROLLBACK")
         raise
     return None
+
+
+def clear_input_fault(db, dispatch_id):
+    db.execute("DELETE FROM fault_event WHERE dispatch = ?", (dispatch_id,))
 
 
 class input_lock:
@@ -1023,18 +1033,19 @@ def cmd_reply(args):
     session = session_name(question["dispatch"])
     host = db.execute("SELECT host FROM dispatch WHERE id = ?", (question["dispatch"],)).fetchone()
     with input_lock(question["dispatch"]):
-        typed, notice = type_into(session, f"[router] Answer to question {question['id']}: {answer}",
-                                  host["host"] if host else None)
+        typed, notice, diagnostic = type_into(session, f"[router] Answer to question {question['id']}: {answer}",
+                                              host["host"] if host else None)
     if typed in (NOT_SENT, READ_ONLY):
         db.execute("DELETE FROM message WHERE id = ?", (reply_id,))
-        persist_input_fault(db, question["dispatch"], "reply", typed, notice)
+        persist_input_fault(db, question["dispatch"], "reply", typed, diagnostic)
         if typed == READ_ONLY:
             mark_screen_reported(db, question["dispatch"], session)
             raise SystemExit(refusal(session, "the answer", notice))
         raise SystemExit(f"could not type the answer into tmux session {session}; is the worker still running?")
     if typed in (PARTIAL, UNCERTAIN):
-        persist_input_fault(db, question["dispatch"], "reply", typed)
+        persist_input_fault(db, question["dispatch"], "reply", typed, diagnostic)
         raise typing_error(session, f"The answer to question {question['id']}", typed)  # the claim stays
+    clear_input_fault(db, question["dispatch"])
     emit({"replied": question["id"], "dispatch": question["dispatch"]})
 
 
@@ -1076,7 +1087,7 @@ def cmd_continue(args):
     db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
     db.execute("COMMIT")
     brief = worker_brief(args.dispatch, task, report, opening="[router] New task for you", attempt=attempt)
-    typed, notice = type_into(session, brief, row["host"])
+    typed, notice, diagnostic = type_into(session, brief, row["host"])
     if typed in (NOT_SENT, READ_ONLY):
         why = (refusal(session, "the next task", notice) if typed == READ_ONLY
                else f"could not type the next task into tmux session {session}")
@@ -1093,15 +1104,16 @@ def cmd_continue(args):
             db.execute("UPDATE dispatch SET task = ?, report = ?, current_round = ?, current_attempt = ? WHERE id = ?",
                        (previous["task"], previous["report"], previous["current_round"], previous["current_attempt"], args.dispatch))
             db.execute("COMMIT")
-            persist_input_fault(db, args.dispatch, "continue", typed, notice)
+            persist_input_fault(db, args.dispatch, "continue", typed, diagnostic)
             raise SystemExit(why)
         db.execute("COMMIT")
-        persist_input_fault(db, args.dispatch, "continue", typed, notice)
+        persist_input_fault(db, args.dispatch, "continue", typed, diagnostic)
         raise SystemExit(f"{why}. But dispatch {args.dispatch} moved on meanwhile (a resume took the round over); "
                          f"its current state is kept")
     if typed in (PARTIAL, UNCERTAIN):
-        persist_input_fault(db, args.dispatch, "continue", typed)
+        persist_input_fault(db, args.dispatch, "continue", typed, diagnostic)
         raise typing_error(session, "The next task", typed)
+    clear_input_fault(db, args.dispatch)
     emit({"continued": args.dispatch, "message": message_id})
 
 
@@ -1124,17 +1136,18 @@ def cmd_nudge(args):
     message_id = post(db, args.dispatch, "worker", "nudge", {"text": text})
     db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
     db.execute("COMMIT")
-    typed, notice = type_into(session, f"[router] Message from the controller: {text}", row["host"])
+    typed, notice, diagnostic = type_into(session, f"[router] Message from the controller: {text}", row["host"])
     if typed in (NOT_SENT, READ_ONLY):
         db.execute("DELETE FROM message WHERE id = ?", (message_id,))
-        persist_input_fault(db, args.dispatch, "nudge", typed, notice)
+        persist_input_fault(db, args.dispatch, "nudge", typed, diagnostic)
         if typed == READ_ONLY:
             mark_screen_reported(db, args.dispatch, session)
             raise SystemExit(refusal(session, "the message", notice))
         raise SystemExit(f"could not type the message into tmux session {session}")
     if typed in (PARTIAL, UNCERTAIN):
-        persist_input_fault(db, args.dispatch, "nudge", typed)
+        persist_input_fault(db, args.dispatch, "nudge", typed, diagnostic)
         raise typing_error(session, "The message", typed)
+    clear_input_fault(db, args.dispatch)
     emit({"nudged": args.dispatch, "message": message_id})
 
 
@@ -1174,7 +1187,7 @@ def canonical_status(db, row, legacy_state, last, alive, watch):
     """Return the multi-signal status contract while retaining legacy ``state``."""
     latest_type = last["type"] if last else None
     body = json.loads(last["body"]) if last else {}
-    persisted_fault = db.execute("SELECT operation, outcome, category, diagnostic FROM fault_event WHERE dispatch = ?",
+    persisted_fault = db.execute("SELECT operation, outcome, category, diagnostic, created FROM fault_event WHERE dispatch = ?",
                                  (row["id"],)).fetchone()
     if legacy_state == "reclaimed" or latest_type == "reclaimed":
         status = "reclaimed"
@@ -1198,12 +1211,13 @@ def canonical_status(db, row, legacy_state, last, alive, watch):
     idle = bool(watch and time.time() - watch["since"] >= activity_after)
     host_active = bool(alive and status in ("online", "waiting-human") and not idle)
     fault = None
-    if persisted_fault and latest_type not in ("blocked", "stalled", "exited", "failed", "done", "cancelled", "reclaimed"):
+    newer_fault = bool(persisted_fault and (not last or persisted_fault["created"] >= last["created"]))
+    if persisted_fault and (newer_fault or latest_type not in ("blocked", "stalled", "exited", "failed", "done", "cancelled", "reclaimed")):
         fault = {"category": persisted_fault["category"], "kind": persisted_fault["outcome"],
                  "diagnostic": persisted_fault["diagnostic"], "operation": persisted_fault["operation"],
                  "requiresDecision": True}
         status = "unknown"
-    if latest_type in ("blocked", "stalled", "exited", "failed", "fault"):
+    if latest_type in ("blocked", "stalled", "unknown", "exited", "failed", "fault"):
         stored_fault = body.get("fault") if isinstance(body.get("fault"), dict) else None
         kind = body.get("kind") or latest_type
         diagnostic = body.get("message") or body.get("reason") or body.get("screen")
@@ -1260,8 +1274,10 @@ def cmd_status(args):
                 "round": row["current_round"], "attempt": row["current_attempt"], "rounds": rounds,
                 "label": row["label"], "host": row["host"], "model": row["model"],
                 "git": bool(row["git"]), "state": state, "status": canonical, "lifecycle": lifecycle,
-                "canonicalStates": ["queued", "running", "online", "waiting-human", "blocked", "unknown",
-                                    "completed", "failed", "cancelled", "reclaimed"], "signals": signals,
+                # queued/cancelled require backend lifecycle operations not exposed by this ticket;
+                # do not advertise states the current CLI cannot observe.
+                "canonicalStates": ["running", "online", "waiting-human", "blocked", "unknown",
+                                    "completed", "failed", "reclaimed"], "signals": signals,
                 "tmux": session_name(row["id"]), "tmuxAlive": alive,
                 "cwd": row["cwd"], "task": row["task"], "report": row["report"], "started": local_time(row["started"]),
                 "last": message_view(last) if last else None,
@@ -1457,16 +1473,17 @@ def cmd_resume(args):
                              f"`wait` reports it exited if it never started.")
         if row["host"] == "opencode":
             brief = worker_brief(args.dispatch, task, report, opening=opening, attempt=attempt)
-            typed, notice = type_into(session, brief, row["host"]) if wait_for_quiet_screen(session) else (NOT_SENT, None)
+            typed, notice, diagnostic = (type_into(session, brief, row["host"]) if wait_for_quiet_screen(session)
+                                         else (NOT_SENT, None, "worker screen did not become ready"))
             if typed in (PARTIAL, UNCERTAIN):
-                persist_input_fault(db, args.dispatch, "resume", typed)
+                persist_input_fault(db, args.dispatch, "resume", typed, diagnostic)
                 raise typing_error(session, "The brief", typed)
             if typed == READ_ONLY:
-                persist_input_fault(db, args.dispatch, "resume", typed, notice)
+                persist_input_fault(db, args.dispatch, "resume", typed, diagnostic)
                 mark_screen_reported(db, args.dispatch, session)
                 raise SystemExit(f"resumed {session}, but " + refusal(session, "the brief", notice))
             if typed == NOT_SENT:
-                persist_input_fault(db, args.dispatch, "resume", typed)
+                persist_input_fault(db, args.dispatch, "resume", typed, diagnostic)
                 raise SystemExit(f"resumed {session} but could not type the brief into it; attach and paste it: {brief}")
         elif any(host == row["host"] for host, *_ in READ_ONLY_NOTICES):
             # The brief went in on the command line; a conversation that opens read-only drops it.
@@ -1477,6 +1494,7 @@ def cmd_resume(args):
                 raise SystemExit(f"resumed {session}, but its screen says \"{notice}\" The brief was not sent, and "
                                  f"this conversation cannot go on; dispatch a new worker (the resumed round stays "
                                  f"recorded; close the session with tmux kill-session -t {session})")
+    clear_input_fault(db, args.dispatch)
     emit({"resumed": args.dispatch, "session": host_session, "tmux": session,
           "round": next_round, "attempt": attempt})
 
@@ -1749,7 +1767,7 @@ def blocked_turn(db, dispatch_id, turn_end):
 def round_started(db, dispatch_id):
     """When the worker last got input from the router: its dispatch, or its latest continue,
     resume or nudge. A host error from before that belongs to an earlier turn."""
-    latest = db.execute("SELECT MAX(created) FROM message WHERE dispatch = ? AND type IN ('continue', 'resumed', 'nudge')",
+    latest = db.execute("SELECT MAX(created) FROM message WHERE dispatch = ? AND type IN ('continue', 'resumed', 'nudge', 'reply')",
                         (dispatch_id,)).fetchone()[0]
     started = db.execute("SELECT started FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()[0]
     return max(latest or 0, started or 0)

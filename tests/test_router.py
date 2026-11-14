@@ -3014,7 +3014,9 @@ class MultiSignalContract(unittest.TestCase):
         view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
         self.assertEqual((view["status"], view["lifecycle"], view["signals"]["activity"]),
                          ("online", "running", "active"))
-        self.assertIn("cancelled", view["canonicalStates"])
+        self.assertEqual(view["canonicalStates"],
+                         ["running", "online", "waiting-human", "blocked", "unknown",
+                          "completed", "failed", "reclaimed"])
 
     def test_repeated_redraw_reaches_a_bounded_turn_timeout(self):
         alt = self.env.screen.with_name("screen-alt.txt")
@@ -3035,6 +3037,22 @@ class MultiSignalContract(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
         self.assertEqual((view["status"], view["signals"]["fault"]["category"]), ("unknown", "input_uncertain"))
+
+    def test_successful_reply_resets_the_turn_deadline(self):
+        dispatch = self.env.dispatch(env={"WFC_MAX_TURN_SECONDS": "3"})
+        self.env.run("ask", "Continue?", dispatch=dispatch)
+        [question] = self.env.json("wait", "--timeout", "1", env={"WFC_MAX_TURN_SECONDS": "3"})["messages"]
+        self.env.json("reply", str(question["id"]), "yes", env={"WFC_MAX_TURN_SECONDS": "3"})
+        result = self.env.json("wait", "--timeout", "0.2", "--stall-after", "60",
+                               env={"WFC_MAX_TURN_SECONDS": "3"})
+        self.assertNotIn("unknown", [message["type"] for message in result.get("messages", [])])
+
+    def test_timeout_event_keeps_its_fault_after_controller_consumes_it(self):
+        dispatch = self.env.dispatch(env={"WFC_MAX_TURN_SECONDS": "0.1"})
+        self.env.json("wait", "--timeout", "2", "--stall-after", "60",
+                      env={"WFC_MAX_TURN_SECONDS": "0.1"})
+        view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((view["status"], view["signals"]["fault"]["category"]), ("unknown", "timeout"))
 
 
 if __name__ == "__main__":
