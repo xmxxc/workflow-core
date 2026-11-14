@@ -3004,6 +3004,38 @@ class Reclaim(unittest.TestCase):
         self.env.run("done", "--report", str(nxt), dispatch=dispatch)
         self.assertEqual([m["type"] for m in self.env.json("wait", "--timeout", "2")["messages"]], ["done", "done"])
 
+class MultiSignalContract(unittest.TestCase):
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+
+    def test_status_exposes_canonical_lifecycle_and_activity(self):
+        dispatch = self.env.dispatch()
+        view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((view["status"], view["lifecycle"], view["signals"]["activity"]),
+                         ("online", "running", "active"))
+        self.assertIn("cancelled", view["canonicalStates"])
+
+    def test_repeated_redraw_reaches_a_bounded_turn_timeout(self):
+        alt = self.env.screen.with_name("screen-alt.txt")
+        self.env.screen.write_text("tick-a\n")
+        alt.write_text("tick-b\n")
+        dispatch = self.env.dispatch(env={"FAKE_SCREEN": str(self.env.screen), "FAKE_SCREEN_ALT": str(alt),
+                                          "WFC_MAX_TURN_SECONDS": "0.1"})
+        [message] = self.env.json("wait", "--timeout", "2", "--stall-after", "60",
+                                   env={"FAKE_SCREEN": str(self.env.screen), "FAKE_SCREEN_ALT": str(alt),
+                                        "WFC_MAX_TURN_SECONDS": "0.1"})["messages"]
+        self.assertEqual((message["type"], message["fault"]["category"]), ("unknown", "timeout"))
+
+    def test_uncertain_reply_is_persisted_as_an_input_fault(self):
+        dispatch = self.env.dispatch()
+        self.env.run("ask", "Continue?", dispatch=dispatch)
+        [question] = self.env.json("wait", "--timeout", "1")["messages"]
+        result = self.env.run("reply", str(question["id"]), "yes", env={"FAKE_FAIL": "send-keys"})
+        self.assertNotEqual(result.returncode, 0)
+        view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((view["status"], view["signals"]["fault"]["category"]), ("unknown", "input_uncertain"))
+
 
 if __name__ == "__main__":
     unittest.main()
