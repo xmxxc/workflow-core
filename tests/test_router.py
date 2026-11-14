@@ -3199,7 +3199,7 @@ class InterruptHandoff(unittest.TestCase):
         result = self.env.run("handoff", dispatch, "--host", "claude")
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("handoff_reconcile_required", result.stderr)
+        self.assertIn("lifecycle_reconcile_required", result.stderr)
         view = self.status(dispatch)
         self.assertEqual(len(view["rounds"]), 1)
         self.assertEqual(len([c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]]), before)
@@ -3285,11 +3285,18 @@ class InterruptHandoff(unittest.TestCase):
         db.commit(); db.close()
 
         blocked = self.env.run("resume", dispatch)
+        for command in ("interrupt", "close"):
+            other = self.env.run(command, dispatch)
+            self.assertNotEqual(other.returncode, 0)
+            self.assertIn("lifecycle_reconcile_required", other.stderr)
+        handoff = self.env.run("handoff", dispatch, "--host", "codex")
         released = self.env.json("reconcile", dispatch, "1", "--result", "accepted", "--actor", "operator-1",
                                  "--evidence", "resume-receipt-1")
 
         self.assertNotEqual(blocked.returncode, 0)
+        self.assertNotEqual(handoff.returncode, 0)
         self.assertIn("lifecycle_reconcile_required", blocked.stderr)
+        self.assertIn("lifecycle_reconcile_required", handoff.stderr)
         self.assertEqual(released["result"], "accepted")
 
     def test_reconcile_is_fenced_after_owner_takeover(self):

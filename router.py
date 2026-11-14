@@ -1521,6 +1521,17 @@ def lifecycle_generation(db, dispatch_id):
                       (dispatch_id,)).fetchone()[0]
 
 
+def require_no_unresolved_lifecycle(db, dispatch_id):
+    event = db.execute("SELECT id, operation, result, diagnostic FROM lifecycle_event WHERE dispatch = ? "
+                       "AND operation IN ('handoff', 'resume') AND result IN ('pending', 'uncertain') "
+                       "ORDER BY id DESC LIMIT 1", (dispatch_id,)).fetchone()
+    if event:
+        raise SystemExit(json.dumps({"error": "lifecycle_reconcile_required", "dispatch": dispatch_id,
+                                     "audit": event["id"], "operation": event["operation"],
+                                     "result": event["result"], "diagnostic": event["diagnostic"]},
+                                    ensure_ascii=False))
+
+
 def _set_lifecycle_result(db, event_id, dispatch_id, result, diagnostic=None, state=None, owner_credential=None):
     db.execute("BEGIN IMMEDIATE")
     event = db.execute("SELECT operation, owner_generation FROM lifecycle_event WHERE id = ? AND dispatch = ?",
@@ -1554,6 +1565,7 @@ def cmd_interrupt(args):
         row, current = _current_attempt(db, args.dispatch)
         db.execute("BEGIN IMMEDIATE")
         require_owner(db, row["scope"], owner_token(args), "interrupt")
+        require_no_unresolved_lifecycle(db, args.dispatch)
         event = lifecycle_event(db, args.dispatch, "interrupt", round=current["round"],
                                 attempt=current["attempt"], from_attempt=current["attempt"],
                                 from_host=row["host"], to_host=row["host"])
@@ -1591,6 +1603,7 @@ def cmd_close(args):
         row, current = _current_attempt(db, args.dispatch)
         db.execute("BEGIN IMMEDIATE")
         require_owner(db, row["scope"], owner_token(args), "close")
+        require_no_unresolved_lifecycle(db, args.dispatch)
         session = session_name(args.dispatch)
         if session_alive(session):
             owned, why = session_owner(session)
@@ -1684,13 +1697,7 @@ def cmd_handoff(args):
     with input_lock(args.dispatch):
         row, current = _current_attempt(db, args.dispatch)
         require_owner(db, row["scope"], owner_token(args), "handoff")
-        pending = db.execute("SELECT id, result, diagnostic FROM lifecycle_event "
-                             "WHERE dispatch = ? AND operation = 'handoff' AND result IN ('pending', 'uncertain') "
-                             "ORDER BY id DESC LIMIT 1", (args.dispatch,)).fetchone()
-        if pending:
-            raise SystemExit(json.dumps({"error": "handoff_reconcile_required", "dispatch": args.dispatch,
-                                         "audit": pending["id"], "result": pending["result"],
-                                         "diagnostic": pending["diagnostic"]}, ensure_ascii=False))
+        require_no_unresolved_lifecycle(db, args.dispatch)
         if not args.task and not args.report:
             prior = db.execute("SELECT * FROM lifecycle_event WHERE dispatch = ? AND operation = 'handoff' "
                                "AND result = 'accepted' AND to_attempt = ? AND to_host = ? "
@@ -2081,14 +2088,7 @@ def cmd_resume(args):
     if row is None:
         raise SystemExit(f"unknown dispatch {args.dispatch} in {state_dir()}")
     require_owner(db, row["scope"], owner_token(args), "resume")
-    unresolved = db.execute("SELECT id, operation, result, diagnostic FROM lifecycle_event WHERE dispatch = ? "
-                            "AND operation IN ('handoff', 'resume') AND result IN ('pending', 'uncertain') "
-                            "ORDER BY id DESC LIMIT 1", (args.dispatch,)).fetchone()
-    if unresolved:
-        raise SystemExit(json.dumps({"error": "lifecycle_reconcile_required", "dispatch": args.dispatch,
-                                     "audit": unresolved["id"], "operation": unresolved["operation"],
-                                     "result": unresolved["result"], "diagnostic": unresolved["diagnostic"]},
-                                    ensure_ascii=False))
+    require_no_unresolved_lifecycle(db, args.dispatch)
     mark = round_mark(db, args.dispatch)
     generation = lifecycle_generation(db, args.dispatch)
     initial_round = db.execute("SELECT state FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
