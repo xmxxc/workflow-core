@@ -3147,11 +3147,31 @@ class InterruptHandoff(unittest.TestCase):
         before = len([c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]])
 
         result = self.env.json("interrupt", dispatch, env={"FAKE_FAIL": "send-keys"})
+        repeated = self.env.run("interrupt", dispatch, env={"FAKE_FAIL": "send-keys"})
+        audit = self.status(dispatch)["audit"][-1]["id"]
+        reconciled = self.env.json("reconcile", dispatch, str(audit), "--result", "unknown",
+                                   "--actor", "operator-1", "--evidence", "interrupt-uncertain")
 
         self.assertEqual(result["result"], "uncertain")
+        self.assertNotEqual(repeated.returncode, 0)
+        self.assertIn("lifecycle_reconcile_required", repeated.stderr)
+        self.assertEqual(reconciled["result"], "unknown")
         self.assertEqual(self.status(dispatch)["status"], "unknown")
         after = len([c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]])
         self.assertEqual(after, before)
+
+    def test_uncertain_close_is_not_replayed_until_reconciled(self):
+        dispatch = self.env.dispatch()
+        first = self.env.json("close", dispatch, env={"FAKE_KILL_FAIL": f"wfc-{dispatch}"})
+        repeated = self.env.run("close", dispatch, env={"FAKE_KILL_FAIL": f"wfc-{dispatch}"})
+        audit = self.status(dispatch)["audit"][-1]["id"]
+        reconciled = self.env.json("reconcile", dispatch, str(audit), "--result", "unknown",
+                                   "--actor", "operator-1", "--evidence", "close-uncertain")
+
+        self.assertEqual(first["result"], "uncertain")
+        self.assertNotEqual(repeated.returncode, 0)
+        self.assertIn("lifecycle_reconcile_required", repeated.stderr)
+        self.assertEqual(reconciled["result"], "unknown")
 
     def test_close_is_distinct_and_records_cancellation(self):
         dispatch = self.env.dispatch()

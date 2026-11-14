@@ -1523,7 +1523,7 @@ def lifecycle_generation(db, dispatch_id):
 
 def require_no_unresolved_lifecycle(db, dispatch_id):
     event = db.execute("SELECT id, operation, result, diagnostic FROM lifecycle_event WHERE dispatch = ? "
-                       "AND operation IN ('handoff', 'resume') AND result IN ('pending', 'uncertain') "
+        "AND operation IN ('interrupt', 'close', 'handoff', 'resume') AND result IN ('pending', 'uncertain') "
                        "ORDER BY id DESC LIMIT 1", (dispatch_id,)).fetchone()
     if event:
         raise SystemExit(json.dumps({"error": "lifecycle_reconcile_required", "dispatch": dispatch_id,
@@ -1663,11 +1663,12 @@ def cmd_reconcile(args):
         row, current = _current_attempt(db, args.dispatch)
         db.execute("BEGIN IMMEDIATE")
         current_owner = require_owner(db, row["scope"], owner_token(args), "reconcile")
-        event = db.execute("SELECT * FROM lifecycle_event WHERE id = ? AND dispatch = ? AND operation IN ('handoff', 'resume')",
+        event = db.execute("SELECT * FROM lifecycle_event WHERE id = ? AND dispatch = ? "
+                           "AND operation IN ('interrupt', 'close', 'handoff', 'resume')",
                            (args.audit, args.dispatch)).fetchone()
         if event is None:
             db.execute("ROLLBACK")
-            raise SystemExit(f"no handoff/resume audit {args.audit} for dispatch {args.dispatch}")
+            raise SystemExit(f"no lifecycle audit {args.audit} for dispatch {args.dispatch}")
         if event["result"] not in ("pending", "uncertain"):
             same = (event["result"] == args.result and event["resolver_actor"] == args.actor
                     and event["resolution_evidence"] == args.evidence)
@@ -1677,18 +1678,24 @@ def cmd_reconcile(args):
                       "audit": event["id"], "duplicate": True})
                 return
             raise SystemExit(f"handoff audit {args.audit} is already {event['result']}")
-        if current["attempt"] != event["to_attempt"]:
+        expected_attempt = event["to_attempt"] or event["attempt"]
+        if current["attempt"] != expected_attempt:
             db.execute("ROLLBACK")
             raise SystemExit(f"handoff audit {args.audit} is no longer the current attempt")
-        state = "running" if args.result == "accepted" else "unknown"
+        if args.result == "accepted" and event["operation"] in ("handoff", "resume"):
+            state = "running"
+        elif args.result == "accepted" and event["operation"] == "close":
+            state = "cancelled"
+        else:
+            state = "unknown"
         finish_lifecycle_event(db, event["id"], args.result,
                                f"reconciled by {args.actor}: {args.evidence}", args.actor, args.evidence)
         db.execute("UPDATE dispatch_round SET state = ?, completed = CASE WHEN ? = 'unknown' THEN ? ELSE completed END "
                    "WHERE dispatch = ? AND round = ? AND attempt = ?",
-                   (state, state, time.time(), args.dispatch, event["round"], event["to_attempt"]))
+                   (state, state, time.time(), args.dispatch, event["round"], expected_attempt))
         db.execute("COMMIT")
     emit({"dispatch": args.dispatch, "operation": "reconcile", "result": args.result,
-          "audit": event["id"], "attempt": event["to_attempt"], "duplicate": False})
+          "audit": event["id"], "attempt": expected_attempt, "duplicate": False})
 
 
 def cmd_handoff(args):
