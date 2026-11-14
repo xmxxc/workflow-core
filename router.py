@@ -986,8 +986,11 @@ def persist_input_fault(db, dispatch_id, operation, outcome, diagnostic=None):
     return None
 
 
-def clear_input_fault(db, dispatch_id):
-    db.execute("DELETE FROM fault_event WHERE dispatch = ?", (dispatch_id,))
+def clear_input_fault(db, dispatch_id, before=None):
+    if before is None:
+        db.execute("DELETE FROM fault_event WHERE dispatch = ?", (dispatch_id,))
+    else:
+        db.execute("DELETE FROM fault_event WHERE dispatch = ? AND created <= ?", (dispatch_id, before))
 
 
 class input_lock:
@@ -1033,19 +1036,20 @@ def cmd_reply(args):
     session = session_name(question["dispatch"])
     host = db.execute("SELECT host FROM dispatch WHERE id = ?", (question["dispatch"],)).fetchone()
     with input_lock(question["dispatch"]):
+        input_started = time.time()
         typed, notice, diagnostic = type_into(session, f"[router] Answer to question {question['id']}: {answer}",
                                               host["host"] if host else None)
-    if typed in (NOT_SENT, READ_ONLY):
-        db.execute("DELETE FROM message WHERE id = ?", (reply_id,))
-        persist_input_fault(db, question["dispatch"], "reply", typed, diagnostic)
-        if typed == READ_ONLY:
-            mark_screen_reported(db, question["dispatch"], session)
-            raise SystemExit(refusal(session, "the answer", notice))
-        raise SystemExit(f"could not type the answer into tmux session {session}; is the worker still running?")
-    if typed in (PARTIAL, UNCERTAIN):
-        persist_input_fault(db, question["dispatch"], "reply", typed, diagnostic)
-        raise typing_error(session, f"The answer to question {question['id']}", typed)  # the claim stays
-    clear_input_fault(db, question["dispatch"])
+        if typed in (NOT_SENT, READ_ONLY):
+            db.execute("DELETE FROM message WHERE id = ?", (reply_id,))
+            persist_input_fault(db, question["dispatch"], "reply", typed, diagnostic)
+            if typed == READ_ONLY:
+                mark_screen_reported(db, question["dispatch"], session)
+                raise SystemExit(refusal(session, "the answer", notice))
+            raise SystemExit(f"could not type the answer into tmux session {session}; is the worker still running?")
+        if typed in (PARTIAL, UNCERTAIN):
+            persist_input_fault(db, question["dispatch"], "reply", typed, diagnostic)
+            raise typing_error(session, f"The answer to question {question['id']}", typed)  # the claim stays
+        clear_input_fault(db, question["dispatch"], input_started)
     emit({"replied": question["id"], "dispatch": question["dispatch"]})
 
 
@@ -1209,7 +1213,6 @@ def canonical_status(db, row, legacy_state, last, alive, watch):
         status = "unknown"
     activity_after = seconds_setting("WFC_ACTIVITY_AFTER", 300)
     idle = bool(watch and time.time() - watch["since"] >= activity_after)
-    host_active = bool(alive and status in ("online", "waiting-human") and not idle)
     fault = None
     newer_fault = bool(persisted_fault and (not last or persisted_fault["created"] >= last["created"]))
     if persisted_fault and (newer_fault or latest_type not in ("blocked", "stalled", "exited", "failed", "done", "cancelled", "reclaimed")):
@@ -1223,6 +1226,7 @@ def canonical_status(db, row, legacy_state, last, alive, watch):
         diagnostic = body.get("message") or body.get("reason") or body.get("screen")
         fault = stored_fault or {"category": fault_category(kind, diagnostic), "kind": kind,
                                  "diagnostic": diagnostic, "requiresDecision": True}
+    host_active = bool(alive and status in ("online", "waiting-human") and not idle)
     activity = "active" if host_active else ("idle" if alive else "unknown")
     return status, {"processOnline": bool(alive), "online": bool(alive), "hostActive": host_active,
                     "activity": activity,
@@ -1428,6 +1432,7 @@ def cmd_resume(args):
     # From the locked re-check to the last keystroke under the input lock (taken before the SQLite
     # lock, as everywhere), so no nudge, done or continue can come between the launch and the brief.
     with input_lock(args.dispatch):
+        input_started = time.time()
         # Posted before launch so the new session's `done` sorts after it, and under the write lock the
         # watchdog also takes, so it cannot report the not-yet-started session as exited in between.
         db.execute("BEGIN IMMEDIATE")
@@ -1494,7 +1499,7 @@ def cmd_resume(args):
                 raise SystemExit(f"resumed {session}, but its screen says \"{notice}\" The brief was not sent, and "
                                  f"this conversation cannot go on; dispatch a new worker (the resumed round stays "
                                  f"recorded; close the session with tmux kill-session -t {session})")
-    clear_input_fault(db, args.dispatch)
+        clear_input_fault(db, args.dispatch, input_started)
     emit({"resumed": args.dispatch, "session": host_session, "tmux": session,
           "round": next_round, "attempt": attempt})
 

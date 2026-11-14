@@ -3054,6 +3054,16 @@ class MultiSignalContract(unittest.TestCase):
         view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
         self.assertEqual((view["status"], view["signals"]["fault"]["category"]), ("unknown", "timeout"))
 
+    def test_read_only_reply_is_blocked_and_not_host_active(self):
+        dispatch = self.env.dispatch(env={"FAKE_SCREEN": str(self.env.screen)})
+        self.env.run("ask", "Continue?", dispatch=dispatch)
+        [question] = self.env.json("wait", "--timeout", "1")["messages"]
+        self.env.screen.write_text("This conversation is unavailable. Its cached transcript and draft remain here; input is paused.\n")
+        self.env.run("reply", str(question["id"]), "yes", env={"FAKE_SCREEN": str(self.env.screen)})
+        view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual(view["signals"]["fault"]["category"], "permission_required")
+        self.assertFalse(view["signals"]["hostActive"])
+
 
 if __name__ == "__main__":
     unittest.main()
