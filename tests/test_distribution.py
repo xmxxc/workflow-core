@@ -31,14 +31,14 @@ class WindowsDistribution(unittest.TestCase):
                 env['PATH'] = str(Path(sys.executable).parent) + os.pathsep + env['PATH']
                 # cmd /c consumes its own command language, not CRT argv quoting.
                 command_line = ('"' + os.environ['COMSPEC'] + '" /d /s /c ""'
-                                + str(directory / 'wfc.cmd') + '" status --scope "范围 with spaces""')
+                                + str(directory / 'wfc.cmd') + '" status --dispatch "范围 with spaces""')
                 cmd = subprocess.run(command_line, executable=os.environ['COMSPEC'],
                                      env=env, capture_output=True, text=True, encoding='utf-8', timeout=20)
                 self.assertEqual(cmd.returncode, 0, cmd.stderr)
                 self.assertEqual(json.loads(cmd.stdout)['dispatches'], [])
                 ps_path = str(directory / 'wfc.cmd').replace("'", "''")
                 powershell = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
-                                            "& '" + ps_path + "' status --scope '范围 with spaces'; exit $LASTEXITCODE"],
+                                            "& '" + ps_path + "' status --dispatch '范围 with spaces'; exit $LASTEXITCODE"],
                                            env=env, capture_output=True, text=True, encoding='utf-8', timeout=20)
                 self.assertEqual(powershell.returncode, 0, powershell.stderr)
                 self.assertEqual(json.loads(powershell.stdout)['dispatches'], [])
