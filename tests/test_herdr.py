@@ -56,7 +56,13 @@ class HerdrContract(unittest.TestCase):
 
     def stop_server(self):
         if self.server.poll() is None:
-            self.server.terminate()
+            if os.name == 'nt':
+                # This Popen is the isolated test-owned service. Kill its test process tree
+                # so crash/restart coverage cannot leave a child holding server.log open.
+                subprocess.run(['taskkill', '/PID', str(self.server.pid), '/T', '/F'],
+                               capture_output=True, timeout=10, check=True)
+            else:
+                self.server.terminate()
             self.server.wait(timeout=10)
 
     def cli(self, *args):
@@ -176,14 +182,19 @@ for line in sys.stdin:
         self.assertEqual(self.cli('status', '--dispatch', dispatch)['dispatches'][0]['attempt'], before['attempt'])
         handle = before['backendHandle']
         # Herdr 0.9.5 may restore IDs without WFC's transient metadata. Never adopt that unit.
+        snapshot = self.api('session.snapshot')['snapshot']
+        workspace = next((w for w in snapshot['workspaces'] if w['workspace_id'] == handle['workspace']), None)
+        matches = workspace is not None and workspace.get('tokens', {}).get('wfc_owner') == handle['nonce']
         rebound = subprocess.run([sys.executable, str(ROOT / 'wfc.py'), 'herdr-reconcile', dispatch,
                                   '--pane', handle['pane'], '--terminal', handle['terminal'], '--actor', 'operator',
                                   '--evidence', 'inspected restarted service', '--old-writer-evidence', 'old service reaped'],
                                  env=self.env, capture_output=True, text=True, encoding='utf-8', timeout=15)
-        if rebound.returncode:
+        if not matches:
+            self.assertNotEqual(rebound.returncode, 0)
             self.assertIn('herdr_ownership', rebound.stderr)
             self.assertEqual(self.cli('status', '--dispatch', dispatch)['dispatches'][0]['backendHandle'], handle)
         else:
+            self.assertEqual(rebound.returncode, 0, rebound.stderr)
             self.assertFalse(json.loads(rebound.stdout)['inputReplayed'])
 
     def test_read_only_host_refuses_input(self):

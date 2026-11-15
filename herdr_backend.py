@@ -273,11 +273,17 @@ class HerdrBackend:
         if launched['result'] != 'accepted':
             return {**launched, 'result': 'uncertain', 'category': 'unknown', 'receipt': str(receipt)}
         handle['pane'] = launched['data']['layout']['focused_pane_id']
-        snapshot = self._call(handle, 'session.snapshot')
-        if snapshot['result'] != 'accepted':
-            self._save(dispatch_id, handle)
-            return {**snapshot, 'result': 'uncertain', 'category': 'unknown', 'receipt': str(receipt)}
-        pane = next((p for p in snapshot['data']['snapshot']['panes'] if p['pane_id'] == handle['pane']), None)
+        self._save(dispatch_id, handle)
+        deadline = time.monotonic() + 2
+        pane = None
+        while True:
+            snapshot = self._call(handle, 'session.snapshot')
+            if snapshot['result'] != 'accepted':
+                return {**snapshot, 'result': 'uncertain', 'category': 'unknown', 'receipt': str(receipt)}
+            pane = next((p for p in snapshot['data']['snapshot']['panes'] if p['pane_id'] == handle['pane']), None)
+            if pane is not None or time.monotonic() >= deadline:
+                break
+            time.sleep(.02)  # observe async layout publication; never replay layout.apply
         if pane is None:
             return {'result': 'uncertain', 'category': 'unknown', 'receipt': str(receipt),
                     'diagnostic': 'Herdr started a unit but its identity is not confirmed'}
