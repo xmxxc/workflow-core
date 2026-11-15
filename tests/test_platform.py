@@ -183,7 +183,9 @@ for _ in range(15):
         import router
         with tempfile.TemporaryDirectory() as tmp:
             report = Path(tmp) / 'report.md'
-            brief = router.worker_brief('d-demo', Path(tmp) / 'task.md', report, attempt='a-demo')
+            from unittest.mock import patch
+            with patch.dict(os.environ, {'WFC_STATE': str(Path(tmp) / 'state')}):
+                brief = router.worker_brief('d-demo', Path(tmp) / 'task.md', report, attempt='a-demo')
             ask = brief.split('run in PowerShell: ')[2].split('; then end your turn;')[0]
             ask = ask.replace('<question text>', 'May I retry?')
             # Core reaches dispatch validation rather than argparse extra-argument rejection.
