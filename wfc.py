@@ -12,7 +12,7 @@ import sys
 
 import router
 
-VERSION = "0.4.7-rc.1"
+VERSION = "0.4.7-rc.2"
 
 
 def main(argv=None):

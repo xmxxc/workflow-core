@@ -1,10 +1,10 @@
 # Windows 便携分发与验收
 
-这是 #10 的 Windows 预发布测试版，版本为 0.4.7-rc.1，包含 #8、#9、#17、#19 的合并改动。原生 Windows 的 Codex worker 闭环仍待实机验证。用户已回传 OpenCode worker + Codex Desktop controller 的同聊天唤醒与 ack 闭环，见 [实测记录](verification/windows-opencode-20261115.md)；该次首派曾需人工 Enter。OpenCode 2.x 修复的 [候选包复测](verification/windows-opencode-candidate.md) 另行记录。默认后端仍为 tmux；Windows 派发显式选择 `--backend herdr`。
+这是 #10 的 Windows 预发布测试版，版本为 0.4.7-rc.2，包含 #8、#9、#17、#19 的合并改动及 PR #25 的 OpenCode 2.x 修复。原生 Windows 的 Codex worker 闭环仍待实机验证。用户已回传 OpenCode worker + Codex Desktop controller 的同聊天唤醒与 ack 闭环，见 [实测记录](https://github.com/xmxxc/workflow-core/blob/v0.4.7-rc.2/docs/verification/windows-opencode-20261115.md)；该次首派曾需人工 Enter。OpenCode 2.x 修复待实机复测；ZIP 内附 `OPENCode-Windows.md`，详见 [复测说明](https://github.com/xmxxc/workflow-core/blob/v0.4.7-rc.2/docs/verification/windows-opencode-release.md)。默认后端仍为 tmux；Windows 派发显式选择 `--backend herdr`。
 
 ## 下载
 
-从 [v0.4.7-rc.1 发布页](https://github.com/xmxxc/workflow-core/releases/tag/v0.4.7-rc.1) 下载 `wfc-v0.4.7-rc.1-windows-x64.zip`，解压后在目录内使用 `wfc.cmd`。`SHA256SUMS` 提供校验和；此 ZIP 包含 WFC Python payload 与启动入口，依赖按下文单独安装。
+从 [v0.4.7-rc.2 发布页](https://github.com/xmxxc/workflow-core/releases/tag/v0.4.7-rc.2) 下载 `wfc-v0.4.7-rc.2-windows-x64.zip`，解压后在目录内使用 `wfc.cmd`。`SHA256SUMS` 提供校验和；此 ZIP 包含 WFC Python payload 与启动入口，依赖按下文单独安装。
 
 ## 安装与启动
 
