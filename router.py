@@ -303,12 +303,13 @@ FIRST_BRIEF = "You are a worker dispatched by the controller"
 
 
 def worker_brief(dispatch_id, task, report, opening=FIRST_BRIEF, attempt=None, owner=False):
+    context = {"dispatch": dispatch_id, "state": str(state_dir())}
     if wfc_platform.WINDOWS:
         base = [sys.executable, str(PROGRAM)]
         identity = ["--attempt", attempt] if attempt else []
         done = wfc_platform.callback_command([*base, "done", "--report", str(report), *identity,
-                                              *(["--message-id", f"done:{dispatch_id}:{attempt}"] if attempt else [])])
-        ask = wfc_platform.callback_command([*base, "ask", "<question text>", *identity])
+                                              *(["--message-id", f"done:{dispatch_id}:{attempt}"] if attempt else [])], **context)
+        ask = wfc_platform.callback_command([*base, "ask", "<question text>", *identity], **context)
         return (f"{opening} (dispatch {dispatch_id}). Read and do the task in {task}. "
                 f"Stop any server or background process you started before you report. "
                 f"When finished, write your report and run in PowerShell: {done}; "
@@ -316,7 +317,7 @@ def worker_brief(dispatch_id, task, report, opening=FIRST_BRIEF, attempt=None, o
                 f'and double single quotes inside the PowerShell literal; run in PowerShell: {ask}; '
                 f"then end your turn; the answer arrives as your next message. "
                 f"Never ask questions in plain text or with an interactive question tool; nobody watches this window.")
-    router = f"{shlex.quote(sys.executable)} {shlex.quote(str(PROGRAM))}"
+    router = wfc_platform.callback_command([sys.executable, str(PROGRAM)], **context)
     owner_arg = ' --owner-token "$WFC_OWNER_TOKEN"' if owner else ""
     attempt_arg = " --attempt " + shlex.quote(attempt) if attempt else ""
     message_arg = (" --message-id done:" + shlex.quote(dispatch_id) + ":" + shlex.quote(attempt)
@@ -2798,7 +2799,7 @@ def check_workers(db, stall_after, scope=None, token=None):
         dispatch_id = row["id"]
         if not watched(db, dispatch_id) or reclaimed(db, dispatch_id):
             continue
-        backend = backend_for(row, db)
+        backend = backend_for(row)
         inspected = backend.inspect(dispatch_id)
         alive = inspected["result"] == "accepted" and inspected.get("alive", False)
         read_view = backend.read(dispatch_id) if alive else None

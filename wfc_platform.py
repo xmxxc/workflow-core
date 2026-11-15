@@ -57,17 +57,23 @@ def detached_options():
     return {'start_new_session': True, 'close_fds': True}
 
 
-def callback_command(argv):
+def callback_command(argv, *, dispatch=None, state=None):
     """A command for the documented worker shell; argv is never executed here."""
+    context = {key: str(value) for key, value in
+               (("WFC_DISPATCH", dispatch), ("WFC_STATE", state)) if value is not None}
     if WINDOWS:
         # Use one explicit CRT command line: Windows PowerShell 5.1's native
         # invocation would otherwise discard empty arguments and embedded quotes.
         literal = lambda text: "'" + str(text).replace("'", "''") + "'"
-        return ("Start-Process -FilePath " + literal(argv[0]) + " -ArgumentList "
+        prefix = "".join("$env:" + key + " = " + literal(value) + "; " for key, value in context.items())
+        return (prefix + "Start-Process -FilePath " + literal(argv[0]) + " -ArgumentList "
                 + literal(subprocess.list2cmdline([str(arg) for arg in argv[1:]]))
                 + " -NoNewWindow -Wait")
     import shlex
-    return shlex.join([str(arg) for arg in argv])
+    values = [str(arg) for arg in argv]
+    if context:
+        values = ["env", *[key + "=" + value for key, value in context.items()], *values]
+    return shlex.join(values)
 
 
 def windows_process(pid):
