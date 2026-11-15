@@ -2799,7 +2799,7 @@ def check_workers(db, stall_after, scope=None, token=None):
         dispatch_id = row["id"]
         if not watched(db, dispatch_id) or reclaimed(db, dispatch_id):
             continue
-        backend = backend_for(row, db)
+        backend = backend_for(row)
         inspected = backend.inspect(dispatch_id)
         alive = inspected["result"] == "accepted" and inspected.get("alive", False)
         read_view = backend.read(dispatch_id) if alive else None
