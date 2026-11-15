@@ -1041,6 +1041,13 @@ def finish_round(db, dispatch_id, report, head, expected_attempt=None, request_k
         db.execute("ROLLBACK")
         raise SystemExit(f"attempt {expected_attempt or current_row['current_attempt']} is no longer accepted for {dispatch_id}; "
                          f"its state is {current_round['state'] if current_round else 'unknown'}")
+    if current_round["state"] == "completed" and db.execute(
+            "SELECT 1 FROM lifecycle_event WHERE dispatch = ? AND attempt = ? AND operation = 'close' "
+            "AND result IN ('pending', 'uncertain', 'completed', 'accepted', 'unknown')",
+            (dispatch_id, current_row["current_attempt"])).fetchone():
+        db.execute("ROLLBACK")
+        raise SystemExit(f"attempt {current_row['current_attempt']} is no longer accepted for {dispatch_id}; "
+                         "its execution resources are closing or closed")
     # A retried `done` from an earlier round must not finish the round that followed it.
     if current and str(report) != current:
         db.execute("ROLLBACK")
@@ -1780,6 +1787,7 @@ def cmd_continue(args):
     # `done` above its `continue`.
     db.execute("BEGIN IMMEDIATE")
     require_owner(db, row["scope"], owner_token(args), "continue")
+    require_no_unresolved_lifecycle(db, args.dispatch)
     if watched(db, args.dispatch) or not done_current_task(db, args.dispatch):
         db.execute("ROLLBACK")
         raise SystemExit(f"dispatch {args.dispatch} has not done its current task yet")
@@ -1891,6 +1899,15 @@ def require_no_unresolved_lifecycle(db, dispatch_id):
                                     ensure_ascii=False))
 
 
+def unresolved_close(db, dispatch_id):
+    return db.execute("SELECT id FROM lifecycle_event WHERE dispatch = ? AND operation = 'close' "
+                      "AND result IN ('pending', 'uncertain') ORDER BY id DESC LIMIT 1", (dispatch_id,)).fetchone()
+
+
+# Lifecycle operations can fence an unfinished attempt, but cannot replace its terminal result.
+UNFINISHED_ROUND = " AND state NOT IN ('completed', 'cancelled', 'failed')"
+
+
 def _set_lifecycle_result(db, event_id, dispatch_id, result, diagnostic=None, state=None, owner_credential=None,
                           launch_result=None):
     db.execute("BEGIN IMMEDIATE")
@@ -1918,7 +1935,7 @@ def _set_lifecycle_result(db, event_id, dispatch_id, result, diagnostic=None, st
     if state:
         current = db.execute("SELECT current_round, current_attempt FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
         db.execute("UPDATE dispatch_round SET state = ?, completed = CASE WHEN ? IN ('cancelled', 'completed') THEN ? ELSE completed END "
-                   "WHERE dispatch = ? AND round = ? AND attempt = ?",
+                   "WHERE dispatch = ? AND round = ? AND attempt = ?" + UNFINISHED_ROUND,
                    (state, state, time.time(), dispatch_id, current["current_round"], current["current_attempt"]))
     db.execute("COMMIT")
 
@@ -1953,7 +1970,7 @@ def cmd_interrupt(args):
 
 
 def cmd_close(args):
-    """Close only this router-owned session and record a durable cancellation audit."""
+    """Close only this router-owned session and audit the cleanup independently of the task outcome."""
     db = connect()
     with input_lock(args.dispatch):
         row, current = _current_attempt(db, args.dispatch)
@@ -1962,6 +1979,16 @@ def cmd_close(args):
         require_no_unresolved_lifecycle(db, args.dispatch)
         backend = backend_for(row, db)
         inspection = backend.inspect(args.dispatch)
+        # Record a failure observed before cleanup. A launch exit receipt written by
+        # the close itself must not turn cancellation into failure, even at reconcile.
+        if current["state"] not in ("completed", "cancelled", "failed"):
+            last = db.execute("SELECT * FROM message WHERE dispatch = ? ORDER BY id DESC LIMIT 1",
+                              (args.dispatch,)).fetchone()
+            status, _ = canonical_status(db, row, dispatch_state(db, args.dispatch), last,
+                                         inspection.get("alive", False), None)
+            if status == "failed":
+                db.execute("UPDATE dispatch_round SET state = 'failed' WHERE dispatch = ? AND round = ? AND attempt = ?"
+                           + UNFINISHED_ROUND, (args.dispatch, current["round"], current["attempt"]))
         if inspection["result"] != "accepted":
             diagnostic = inspection.get("diagnostic") or f"backend inspect returned {inspection['result']}"
             event = lifecycle_event(db, args.dispatch, "close", round=current["round"], attempt=current["attempt"],
@@ -1987,8 +2014,8 @@ def cmd_close(args):
                                         from_host=row["host"], to_host=row["host"])
                 post(db, args.dispatch, "worker", "closed", {"round": current["round"],
                      "attempt": current["attempt"], "result": "pending"})
-                db.execute("UPDATE dispatch_round SET state = 'unknown', completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?",
-                           (time.time(), args.dispatch, current["round"], current["attempt"]))
+                db.execute("UPDATE dispatch_round SET state = 'unknown' WHERE dispatch = ? AND round = ? AND attempt = ?"
+                           + UNFINISHED_ROUND, (args.dispatch, current["round"], current["attempt"]))
                 db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
                 db.execute("COMMIT")
                 outcome = backend.close(args.dispatch)
@@ -2000,7 +2027,8 @@ def cmd_close(args):
                                     diagnostic="session was already gone")
             post(db, args.dispatch, "worker", "closed", {"round": current["round"],
                  "attempt": current["attempt"], "result": "completed"})
-            db.execute("UPDATE dispatch_round SET state = 'cancelled', completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?",
+            db.execute("UPDATE dispatch_round SET state = 'cancelled', completed = ? "
+                       "WHERE dispatch = ? AND round = ? AND attempt = ?" + UNFINISHED_ROUND,
                        (time.time(), args.dispatch, current["round"], current["attempt"]))
             db.execute("COMMIT")
             result, diagnostic = "completed", "session was already gone"
@@ -2059,8 +2087,8 @@ def cmd_reconcile(args):
         if args.result == "accepted" and event["operation"] in ("create", "handoff", "resume"):
             db.execute("DELETE FROM fault_event WHERE dispatch = ? AND operation IN ('create', 'launch') "
                        "AND category = 'unknown'", (args.dispatch,))
-        db.execute("UPDATE dispatch_round SET state = ?, completed = CASE WHEN ? = 'unknown' THEN ? ELSE completed END "
-                   "WHERE dispatch = ? AND round = ? AND attempt = ?",
+        db.execute("UPDATE dispatch_round SET state = ?, completed = CASE WHEN ? IN ('unknown', 'cancelled') THEN ? ELSE completed END "
+                   "WHERE dispatch = ? AND round = ? AND attempt = ?" + UNFINISHED_ROUND,
                    (state, state, time.time(), args.dispatch, event["round"], expected_attempt))
         db.execute("COMMIT")
     emit({"dispatch": args.dispatch, "operation": "reconcile", "result": args.result,
@@ -2146,8 +2174,8 @@ def cmd_handoff(args):
         post(db, args.dispatch, "worker", "handoff", {"round": next_round, "attempt": attempt,
              "fromAttempt": current["attempt"], "fromHost": row["host"], "toHost": args.host, "result": "pending"})
         if not args.task:
-            db.execute("UPDATE dispatch_round SET state = 'unknown', completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?",
-                       (time.time(), args.dispatch, current["round"], current["attempt"]))
+            db.execute("UPDATE dispatch_round SET state = 'unknown', completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?"
+                       + UNFINISHED_ROUND, (time.time(), args.dispatch, current["round"], current["attempt"]))
         db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, state, created) VALUES (?, ?, ?, ?, ?, 'unknown', ?)",
                    (args.dispatch, next_round, attempt, str(task), str(report), time.time()))
         db.execute("UPDATE dispatch SET host = ?, host_session = ?, model = ?, task = ?, report = ?, current_round = ?, current_attempt = ? WHERE id = ?",
@@ -2228,6 +2256,10 @@ def fault_category(kind, message=""):
 
 def canonical_status(db, row, legacy_state, last, alive, watch):
     """Return the multi-signal status contract while retaining legacy ``state``."""
+    # Cleanup messages are still visible as the last event, but say nothing about the task.
+    if last and last["type"] == "closed":
+        last = db.execute("SELECT * FROM message WHERE dispatch = ? AND type != 'closed' ORDER BY id DESC LIMIT 1",
+                          (row["id"],)).fetchone()
     latest_type = last["type"] if last else None
     body = json.loads(last["body"]) if last else {}
     current = db.execute("SELECT current_round, current_attempt FROM dispatch WHERE id = ?", (row["id"],)).fetchone()
@@ -2239,9 +2271,11 @@ def canonical_status(db, row, legacy_state, last, alive, watch):
                                  (row["id"],)).fetchone()
     if legacy_state == "reclaimed" or latest_type == "reclaimed":
         status = "reclaimed"
+    elif current_round_state in ("completed", "failed"):
+        status = current_round_state
     elif current_round_state in ("unknown", "interrupted") or legacy_state == "unknown":
         status = "unknown"
-    elif latest_type in ("closed", "cancelled") or legacy_state == "cancelled" or current_round_state == "cancelled":
+    elif latest_type == "cancelled" or legacy_state == "cancelled" or current_round_state == "cancelled":
         status = "cancelled"
     elif (current_message and latest_type == "done") or legacy_state == "done":
         status = "completed"
@@ -2265,7 +2299,8 @@ def canonical_status(db, row, legacy_state, last, alive, watch):
         fault = {"category": persisted_fault["category"], "kind": persisted_fault["outcome"],
                  "diagnostic": persisted_fault["diagnostic"], "operation": persisted_fault["operation"],
                  "requiresDecision": True}
-        status = "failed" if persisted_fault["category"] in ("executable_missing", "runtime_missing", "permission_denied", "process_exited") else "unknown"
+        if current_round_state not in ("completed", "cancelled", "failed"):
+            status = "failed" if persisted_fault["category"] in ("executable_missing", "runtime_missing", "permission_denied", "process_exited") else "unknown"
     if latest_type in ("blocked", "stalled", "unknown", "exited", "failed", "fault"):
         stored_fault = body.get("fault") if isinstance(body.get("fault"), dict) else None
         kind = body.get("kind") or latest_type
@@ -2277,10 +2312,19 @@ def canonical_status(db, row, legacy_state, last, alive, watch):
         "SELECT 1 FROM lifecycle_event WHERE dispatch = ? AND to_attempt = ? "
         "AND operation IN ('create', 'resume', 'handoff') AND result = 'accepted' AND resolved_at IS NOT NULL",
         (row["id"], current["current_attempt"])).fetchone())
-    if launch and launch["category"] != "started" and not reconciled_launch and status not in ("completed", "cancelled", "reclaimed"):
+    # The pending event proves this attempt reached the external close step. Keep
+    # its exit receipt as resource evidence even if the audit is resolved as unknown.
+    close_started = bool(launch and launch["category"] == "process_exited" and current_round_state == "unknown"
+                         and db.execute("SELECT 1 FROM message WHERE dispatch = ? AND type = 'closed' "
+                                        "AND json_extract(body, '$.attempt') = ? "
+                                        "AND json_extract(body, '$.result') = 'pending' LIMIT 1",
+                                        (row["id"], current["current_attempt"])).fetchone())
+    if (launch and launch["category"] != "started" and not reconciled_launch and not close_started
+            and status not in ("completed", "cancelled", "reclaimed")):
         fault = {"category": launch["category"], "kind": "host_launch", "diagnostic": launch["diagnostic"],
                  "operation": "launch", "requiresDecision": True}
-        status = "unknown" if launch["category"] == "unknown" else "failed"
+        if current_round_state != "failed":
+            status = "unknown" if launch["category"] == "unknown" else "failed"
     host_active = bool(alive and status in ("online", "waiting-human") and not idle)
     activity = "active" if host_active else ("idle" if alive else "unknown")
     return status, {"processOnline": bool(alive), "online": bool(alive), "hostActive": host_active,
@@ -2325,7 +2369,7 @@ def cmd_status(args):
     for row in rows:
         state = dispatch_state(db, row["id"])
         closed = reclaimed(db, row["id"])
-        if args.active and state == "done":
+        if args.active and state == "done" and not unresolved_close(db, row["id"]):
             if not closed and backend_for(row).inspect(row["id"]).get("alive", False):
                 reclaimable.append({"dispatch": row["id"], "label": row["label"], "tmux": session_name(row["id"])})
             continue
@@ -2477,8 +2521,8 @@ def resume_reconcile_required(db, row, inspection, token):
                             attempt=current["current_attempt"], from_attempt=current["current_attempt"],
                             to_attempt=current["current_attempt"], from_host=row["host"], to_host=row["host"],
                             result=inspection["result"], diagnostic=diagnostic)
-    db.execute("UPDATE dispatch_round SET state = 'unknown', completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?",
-               (time.time(), row["id"], current["current_round"], current["current_attempt"]))
+    db.execute("UPDATE dispatch_round SET state = 'unknown', completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?"
+               + UNFINISHED_ROUND, (time.time(), row["id"], current["current_round"], current["current_attempt"]))
     db.execute("COMMIT")
     raise SystemExit(json.dumps({"error": "lifecycle_reconcile_required", "dispatch": row["id"],
                                  "audit": event, "operation": "resume", "result": inspection["result"],
@@ -2599,8 +2643,8 @@ def cmd_resume(args):
                                        from_attempt=identity["current_attempt"], to_attempt=attempt,
                                        from_host=row["host"], to_host=row["host"])
         if not args.task:
-            db.execute("UPDATE dispatch_round SET state = 'unknown', completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?",
-                       (time.time(), args.dispatch, identity["current_round"], identity["current_attempt"]))
+            db.execute("UPDATE dispatch_round SET state = 'unknown', completed = ? WHERE dispatch = ? AND round = ? AND attempt = ?"
+                       + UNFINISHED_ROUND, (time.time(), args.dispatch, identity["current_round"], identity["current_attempt"]))
         post(db, args.dispatch, "worker", "resumed", {"session": host_session, "scope": identity["scope"],
              "role": identity["role"], "round": next_round, "attempt": attempt})
         if args.task:
@@ -2658,6 +2702,7 @@ def reclaim_targets(db, named):
         return rows
     return [row for row in db.execute("SELECT * FROM dispatch WHERE started IS NOT NULL ORDER BY created")
             if done_current_task(db, row["id"]) and not reclaimed(db, row["id"])
+            and not unresolved_close(db, row["id"])
             and backend_for(row).inspect(row["id"]).get("alive", False)]
 
 
@@ -2683,6 +2728,14 @@ def cmd_reclaim(args):
         state = dispatch_state(db, dispatch_id)
         item = {"dispatch": dispatch_id, "label": row["label"], "tmux": session, "state": state,
                 "reclaimable": state == "done" and not reclaimed(db, dispatch_id)}
+        close = unresolved_close(db, dispatch_id)
+        if close:
+            why = f"close audit {close['id']} for {dispatch_id} requires reconcile"
+            item.update(reclaimable=False, result="failed", error=why)
+            sessions.append(item)
+            if args.yes:
+                errors.append(why)
+            continue
         if not item["reclaimable"]:
             item["note"] = (f"not in reclaimable ({'already reclaimed' if reclaimed(db, dispatch_id) else 'its task is not done'}); "
                             f"closed only when named and with --yes")
@@ -2725,6 +2778,10 @@ def reclaim_session(db, row, named, token=None):
         db.execute("BEGIN IMMEDIATE")
         try:
             require_owner(db, row["scope"], token, "reclaim")
+            close = unresolved_close(db, dispatch_id)
+            if close:
+                db.execute("ROLLBACK")
+                return {"result": "failed", "error": f"close audit {close['id']} for {dispatch_id} requires reconcile"}
             if not named and (not done_current_task(db, dispatch_id) or reclaimed(db, dispatch_id)):
                 db.execute("ROLLBACK")
                 return {"result": "changed", "note": f"dispatch {dispatch_id} is no longer done and unreclaimed "

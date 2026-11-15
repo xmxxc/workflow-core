@@ -77,3 +77,11 @@ Paseo/Codeg 的运行服务可作为后续替代候选，但依赖与生命周�
 2. 看[来源固定清单](research-source-pins-20261113.json)与[验证状态](research-validation-20261113.md)，区分源码观察、旧探针和本轮真实执行。
 3. 回读 [router.py](../router.py)、[当前测试](../tests/test_router.py)、[历史决策](decision-log.md)，确认期间是否已有修复，按原因重新评估每个建议。
 4. 从顺序 1 中选一个可贯穿的最小实现：一次输入、一次回报及它们的重复/崩溃路径；先写明确契约，再实施与独立审查。用户当前授权是方向整理、研究和文档留存，功能实现与正式发布另按具体任务推进。
+
+### 关闭执行资源与任务结果
+
+`wfc close <dispatch>` 只处理该 dispatch 自己的执行资源。资源已关闭或确认已退出时，命令返回 `result: completed`，并写入对应轮次和 attempt 的 `close` 审计。重复关闭仍记录本次检查，不改写先前的任务状态、结果、完成时间或消息回执。
+
+确认关闭后，尚未完成且无已确认失败的任务标记为 `cancelled`。观察到已退出的失败任务时保留失败结论。`status` 的 `last` 可以是 `closed`；任务结果看 `rounds` / `status`，资源观察看 `backendAlive` / `backendResult`，最近清理结果看 `audit`。
+
+如果关闭结果不明确，审计记录 `uncertain`。未完成的 attempt 在尝试关闭前被隔离，已完成任务的 `completed` 和 processed 回执保持原样。恢复、续派或再次清理前先显式 `reconcile`，不会因关闭结果未知而重放操作；确认清理也不改写已有任务终态。对已完成任务执行 `resume` 时仍需提供下一轮任务和新的报告路径。

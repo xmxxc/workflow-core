@@ -260,6 +260,9 @@ for line in sys.stdin:
         self.assertEqual(second['backendHandle']['service'], first['backendHandle']['service'])
         # Same live terminal serves another round; its handle ownership still names its creating attempt.
         self.assertEqual(self.cli('close', dispatch)['result'], 'completed')
+        cleaned = self.cli('status', '--dispatch', dispatch)['dispatches'][0]
+        self.assertEqual(cleaned['rounds'], second['rounds'])
+        self.assertEqual((cleaned['status'], cleaned['backendAlive']), ('completed', False))
 
     def test_closing_own_unit_leaves_shared_pane_running(self):
         dispatch = self.dispatch()
