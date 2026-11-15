@@ -1,0 +1,18 @@
+{
+  "dispatch": "d-37371ace",
+  "round": 2,
+  "attempt": "a-7423fe6d3bee",
+  "retained_upstream_files_hashed": 1378,
+  "retained_manifest_unchanged_from_r1": true,
+  "python_hashes_unchanged": true,
+  "scratch_authored_source_and_lock_match": true,
+  "binary_sha256": "ead8b312c079324d28ecb6cb4586b3548cfd378e42a6120c97d7496e27fabe3c",
+  "source_sha256": "6c8b0a2910575734a034ada255e3a91391ea714238757552e7f15eb7f21268c9",
+  "runtime_probe_records": 22,
+  "known_containment_gaps_preserved": true,
+  "controlled_callback_round_state": "completed",
+  "all_test_owned_controlled_processes_terminated": true,
+  "actual_tui_closed_and_pid_terminated": true,
+  "source_checkout_clean": true,
+  "repo_pycache_present": false
+}

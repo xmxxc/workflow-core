@@ -1,0 +1,17 @@
+{
+  "scratch": "/tmp/wfc-herdr-kernel-prototype-r1",
+  "commit": "ee5bfb5041bb3e4a49d591c72308aae3c81ecdde",
+  "files": 1378,
+  "bytes": 20553673,
+  "copied": [
+    "crates/ghostty-vt",
+    "vendor/portable-pty",
+    "vendor/libghostty-vt",
+    "vendor/portable-pty.patches.md",
+    "vendor/patches/portable-pty",
+    "vendor/libghostty-vt.vendor.json",
+    "vendor/libghostty-vt.patches.md",
+    "vendor/patches/libghostty-vt",
+    "LICENSE"
+  ]
+}

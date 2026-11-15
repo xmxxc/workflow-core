@@ -1,0 +1,16 @@
+[
+  {
+    "command": [
+      "cargo",
+      "+1.96.1",
+      "build",
+      "--release",
+      "--locked",
+      "--manifest-path",
+      "/tmp/wfc-herdr-kernel-prototype-r1/Cargo.toml"
+    ],
+    "exit": 0,
+    "seconds": 6.038817660999484,
+    "log": "/tmp/wfc-herdr-kernel-prototype-r1/build-probe-1.log"
+  }
+]

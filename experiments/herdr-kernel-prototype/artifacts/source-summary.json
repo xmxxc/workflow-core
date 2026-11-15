@@ -1,0 +1,9 @@
+{
+  "full_herdr_main_rust": {
+    "files": 402,
+    "bytes": 10465617,
+    "physical_lines": 291081,
+    "nonblank_lines": 269910
+  },
+  "source_commit": "ee5bfb5041bb3e4a49d591c72308aae3c81ecdde"
+}
