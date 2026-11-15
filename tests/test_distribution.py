@@ -29,8 +29,10 @@ class WindowsDistribution(unittest.TestCase):
             if os.name == 'nt':
                 # Pin python on PATH to the interpreter used to build this test artifact.
                 env['PATH'] = str(Path(sys.executable).parent) + os.pathsep + env['PATH']
-                cmd = subprocess.run([os.environ['COMSPEC'], '/d', '/s', '/c',
-                                      '""' + str(directory / 'wfc.cmd') + '" status --scope "范围 with spaces""'],
+                # cmd /c consumes its own command language, not CRT argv quoting.
+                command_line = ('"' + os.environ['COMSPEC'] + '" /d /s /c ""'
+                                + str(directory / 'wfc.cmd') + '" status --scope "范围 with spaces""')
+                cmd = subprocess.run(command_line, executable=os.environ['COMSPEC'],
                                      env=env, capture_output=True, text=True, encoding='utf-8', timeout=20)
                 self.assertEqual(cmd.returncode, 0, cmd.stderr)
                 self.assertEqual(json.loads(cmd.stdout)['dispatches'], [])
