@@ -1,0 +1,6 @@
+{
+  "exit": 0,
+  "seconds": 0.06478120099927764,
+  "note": "warm cached reproducibility check",
+  "command": "cargo +1.96.1 build --release --locked --offline --manifest-path /tmp/wfc-herdr-kernel-prototype-r1/Cargo.toml"
+}

@@ -1,0 +1,23 @@
+{
+  "dirty_selected": {
+    "command": [
+      "python3",
+      "experiments/herdr-kernel-prototype/prepare.py",
+      "--source",
+      "/tmp/wfc-kernel-pin-negative",
+      "--scratch",
+      "/tmp/wfc-kernel-rejected-extraction"
+    ],
+    "exit": 1,
+    "diagnostic": "dirty selected source paths:  M LICENSE"
+  },
+  "wrong_expected_pin_fixture": {
+    "exit": 1,
+    "diagnostic": "source commit differs from fixed Herdr pin",
+    "method": "copied prepare.py with expected PIN=zero; original script/source unchanged"
+  },
+  "shallow_fixture_parent_checkout": {
+    "exit": 128,
+    "diagnostic": "HEAD^ unavailable in shallow fixed-source clone; no source changes"
+  }
+}

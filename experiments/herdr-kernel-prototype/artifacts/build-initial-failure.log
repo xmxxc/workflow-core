@@ -1,0 +1,96 @@
+    Updating crates.io index
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded bitflags v2.11.0
+  Downloaded tracing-attributes v0.1.31
+  Downloaded zmij v1.0.21
+  Downloaded unicode-ident v1.0.24
+  Downloaded tracing-core v0.1.36
+  Downloaded uuid v1.22.0
+  Downloaded proc-macro2 v1.0.106
+  Downloaded miniz_oxide v0.8.9
+  Downloaded png v0.17.16
+  Downloaded base64 v0.22.1
+  Downloaded serde_json v1.0.151
+  Downloaded memchr v2.8.0
+  Downloaded flate2 v1.1.9
+  Downloaded log v0.4.29
+  Downloaded nix v0.28.0
+  Downloaded serde_core v1.0.229
+  Downloaded crc32fast v1.5.0
+  Downloaded syn v2.0.117
+  Downloaded anyhow v1.0.102
+  Downloaded thiserror-impl v1.0.69
+  Downloaded thiserror v1.0.69
+  Downloaded simd-adler32 v0.3.9
+  Downloaded serial2 v0.2.34
+  Downloaded filedescriptor v0.8.3
+  Downloaded bitflags v1.3.2
+  Downloaded shell-words v1.1.1
+  Downloaded quote v1.0.45
+  Downloaded tracing v0.1.44
+  Downloaded itoa v1.0.18
+  Downloaded getrandom v0.4.2
+  Downloaded downcast-rs v1.2.1
+  Downloaded cfg_aliases v0.1.1
+  Downloaded cfg-if v1.0.4
+  Downloaded pin-project-lite v0.2.17
+  Downloaded once_cell v1.21.4
+  Downloaded fdeflate v0.3.7
+  Downloaded adler2 v2.0.1
+  Downloaded libc v0.2.190
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.45
+   Compiling libc v0.2.190
+   Compiling cfg-if v1.0.4
+   Compiling simd-adler32 v0.3.9
+   Compiling crc32fast v1.5.0
+   Compiling thiserror v1.0.69
+   Compiling adler2 v2.0.1
+   Compiling cfg_aliases v0.1.1
+   Compiling nix v0.28.0
+   Compiling miniz_oxide v0.8.9
+   Compiling getrandom v0.4.2
+   Compiling syn v2.0.117
+   Compiling serde_core v1.0.229
+   Compiling anyhow v1.0.102
+   Compiling once_cell v1.21.4
+   Compiling zmij v1.0.21
+   Compiling tracing-core v0.1.36
+   Compiling flate2 v1.1.9
+   Compiling fdeflate v0.3.7
+   Compiling bitflags v2.11.0
+   Compiling bitflags v1.3.2
+   Compiling pin-project-lite v0.2.17
+   Compiling ghostty-vt v0.0.0 (/tmp/wfc-herdr-kernel-prototype-r1/crates/ghostty-vt)
+   Compiling serde_json v1.0.151
+   Compiling png v0.17.16
+error: failed to run custom build command for `ghostty-vt v0.0.0 (/tmp/wfc-herdr-kernel-prototype-r1/crates/ghostty-vt)`
+
+Caused by:
+  process didn't exit successfully: `/tmp/wfc-herdr-kernel-prototype-r1/target/release/build/ghostty-vt-18abe93c7c91fdc1/build-script-build` (exit status: 101)
+  --- stdout
+  cargo:rerun-if-changed=build.rs
+  cargo:rerun-if-changed=/tmp/wfc-herdr-kernel-prototype-r1/crates/ghostty-vt/../../vendor/libghostty-vt.vendor.json
+  cargo:rerun-if-changed=/tmp/wfc-herdr-kernel-prototype-r1/crates/ghostty-vt/../../vendor/libghostty-vt/build.zig
+  cargo:rerun-if-changed=/tmp/wfc-herdr-kernel-prototype-r1/crates/ghostty-vt/../../vendor/libghostty-vt/build.zig.zon
+  cargo:rerun-if-changed=/tmp/wfc-herdr-kernel-prototype-r1/crates/ghostty-vt/../../vendor/libghostty-vt/include
+  cargo:rerun-if-changed=/tmp/wfc-herdr-kernel-prototype-r1/crates/ghostty-vt/../../vendor/libghostty-vt/pkg
+  cargo:rerun-if-changed=/tmp/wfc-herdr-kernel-prototype-r1/crates/ghostty-vt/../../vendor/libghostty-vt/src
+  cargo:rerun-if-changed=/tmp/wfc-herdr-kernel-prototype-r1/crates/ghostty-vt/../../vendor/libghostty-vt/VERSION
+  cargo:rerun-if-env-changed=LIBGHOSTTY_VT_OPTIMIZE
+  cargo:rerun-if-env-changed=LIBGHOSTTY_VT_SIMD
+  cargo:rerun-if-env-changed=LIBGHOSTTY_VT_ZIG_SYSTEM_DIR
+  cargo:rerun-if-env-changed=ZIG
+  cargo:rerun-if-env-changed=LIBGHOSTTY_VT_WINDOWS_LIBC
+
+  --- stderr
+  /tmp/wfc-herdr-kernel-prototype-r1/vendor/libghostty-vt/build.zig.zon:51:20: error: bad HTTP response code: '400 Bad Request'
+              .url = "https://deps.files.ghostty.org/uucode-2826a37a4562284fdacd8fa029d49509cc9bffcd.tar.gz",
+                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+  thread 'main' (437) panicked at crates/ghostty-vt/build.rs:111:5:
+  zig build for vendored libghostty-vt failed: exit status: 1. Building Herdr requires Zig 0.16.0; check `zig version` or set ZIG to the path of a Zig 0.16.0 binary, then retry
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+warning: build failed, waiting for other jobs to finish...
