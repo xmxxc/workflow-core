@@ -10,6 +10,8 @@ import sys
 import threading
 import time
 
+import wfc_platform
+
 DIAGNOSTIC_LIMIT = 4096
 _SECRET_NAME = re.compile(r'token|secret|password|passwd|credential|api.?key|authorization|cookie', re.I)
 
@@ -199,13 +201,22 @@ def write_private(path, value):
     """Atomically publish JSON without ever creating a world-readable intermediate."""
     path = Path(path)
     tmp = path.with_name(path.name + f'.{os.getpid()}.tmp')
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    fd = wfc_platform.open_private(tmp)
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as out:
             json.dump(value, out, ensure_ascii=False)
             out.flush()
             os.fsync(out.fileno())
-        os.replace(tmp, path)
+        deadline = time.monotonic() + 1
+        while True:
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if not wfc_platform.WINDOWS or time.monotonic() >= deadline:
+                    raise
+                time.sleep(.01)  # Windows readers can briefly deny replacement.
+
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -234,7 +245,7 @@ def supervise(spec_path):
                     'executable_missing' if isinstance(err, FileNotFoundError) else 'unknown')
         write_private(receipt, {**evidence, 'category': category, 'diagnostic': sanitize(err, env)})
         return 126
-    write_private(receipt, {**evidence, 'category': 'started', 'diagnostic': 'host process started', 'pid': child.pid})
+    write_private(receipt, {**evidence, 'category': 'started', 'diagnostic': 'host process started', 'pid': child.pid, 'processStart': wfc_platform.process_identity(child.pid)})
     chunks = bytearray()
 
     def drain():

@@ -13,6 +13,7 @@ import calendar
 import wfc_platform
 import hashlib
 import host_launch
+import herdr_backend
 import json
 import os
 import re
@@ -87,7 +88,7 @@ ADDED_COLUMNS = {
     "dispatch": {"backend": "TEXT", "started": "REAL", "report_dir": "TEXT", "report": "TEXT", "model": "TEXT", "host_session": "TEXT",
                  "effort": "TEXT", "network": "INTEGER", "label": "TEXT", "git": "INTEGER",
                  "scope": "TEXT", "role": "TEXT", "current_round": "INTEGER", "current_attempt": "TEXT",
-                 "launch_config": "TEXT", "launch_receipt": "TEXT"},
+                 "launch_config": "TEXT", "launch_receipt": "TEXT", "backend_handle": "TEXT"},
     "message": {"message_uid": "TEXT", "request_key": "TEXT", "body_hash": "TEXT",
                 "state": "TEXT", "status_version": "INTEGER", "resolver_actor": "TEXT",
                 "resolution_source": "TEXT", "resolution_reason": "TEXT", "resolution_evidence": "TEXT",
@@ -677,7 +678,7 @@ def cmd_dispatch(args):
     label = clean_label(args.label or "") or default_label(cwd, report)
     role = clean_label(args.role or "") or readable(report.parent.name).rpartition("-")[2] or "worker"
     attempt = "a-" + uuid.uuid4().hex[:12]
-    backend = backend_for(args.backend)
+    backend = backend_for(args.backend, db)
     command, extra_env = LAUNCHERS[args.host](worker_brief(dispatch_id, task, report, attempt=attempt,
                                                            owner=bool(controller)),
                                               [state_dir(), report.parent], cwd, args.model, host_session,
@@ -698,7 +699,28 @@ def cmd_dispatch(args):
     db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, created) VALUES (?, ?, ?, ?, ?, ?)",
                (dispatch_id, 1, attempt, str(task), str(report), created))
     db.execute("UPDATE dispatch SET launch_config = ? WHERE id = ?", (config, dispatch_id))
-    created_result = backend.create(dispatch_id, cwd, command, extra_env, label)
+    create_audit = None
+    if args.backend == "herdr":
+        endpoint = getattr(args, "herdr_endpoint", None) or os.environ.get("WFC_HERDR_ENDPOINT")
+        db.execute("UPDATE dispatch SET backend_handle = ?, started = ? WHERE id = ?",
+                   (json.dumps({"endpoint": endpoint}), time.time(), dispatch_id))
+        create_audit = lifecycle_event(db, dispatch_id, "create", round=1, attempt=attempt, to_attempt=attempt,
+                                       to_host=args.host, result="pending", diagnostic="Herdr create pending")
+        # The attempt exists durably before Herdr can start an external writer.
+        db.execute("COMMIT")
+        try:
+            created_result = backend.create(dispatch_id, cwd, command, extra_env, label)
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+            created_result = backend_result(UNCERTAIN, "Herdr create requires explicit reconciliation", category="unknown")
+        db.execute("BEGIN IMMEDIATE")
+        require_owner(db, scope, owner_token(args), "dispatch")
+        finish_lifecycle_event(db, create_audit, created_result["result"], created_result.get("diagnostic"))
+        if created_result["result"] == DEFINITELY_NOT_SENT:
+            handle = json.loads(db.execute("SELECT backend_handle FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()[0])
+            handle["state"] = "not-started"
+            db.execute("UPDATE dispatch SET backend_handle = ? WHERE id = ?", (json.dumps(handle), dispatch_id))
+    else:
+        created_result = backend.create(dispatch_id, cwd, command, extra_env, label)
     db.execute("UPDATE dispatch SET launch_receipt = ? WHERE id = ?", (created_result.get("receipt"), dispatch_id))
     if created_result["result"] != "accepted":
         diagnostic = created_result.get("diagnostic") or f"backend create returned {created_result['result']}"
@@ -712,13 +734,13 @@ def cmd_dispatch(args):
         db.execute("UPDATE dispatch_round SET state = 'unknown', result = ? WHERE dispatch = ? AND round = 1 AND attempt = ?",
                    (json.dumps({"backend": args.backend, "result": created_result["result"],
                                 "diagnostic": diagnostic}, ensure_ascii=False), dispatch_id, attempt))
-        if created_result["result"] == UNCERTAIN:
+        if created_result["result"] == UNCERTAIN and args.backend != "herdr":
             db.execute("UPDATE dispatch_round SET state = 'running' WHERE dispatch = ? AND round = 1 AND attempt = ?",
                        (dispatch_id, attempt))
         db.execute("INSERT OR REPLACE INTO fault_event (dispatch, operation, outcome, category, diagnostic, created) "
                    "VALUES (?, 'create', ?, ?, ?, ?)",
                    (dispatch_id, created_result["result"], created_result.get("category", "backend_create"), diagnostic, time.time()))
-        if created_result.get("category") == "unknown" and created_result["result"] == UNCERTAIN:
+        if create_audit is None and created_result.get("category") == "unknown" and created_result["result"] == UNCERTAIN:
             lifecycle_event(db, dispatch_id, "create", round=1, attempt=attempt, to_attempt=attempt,
                             to_host=args.host, result=UNCERTAIN, diagnostic=diagnostic)
         db.execute("COMMIT")
@@ -1513,12 +1535,14 @@ class TmuxBackend(ExecutionBackend):
         return backend_result(UNCERTAIN, killed.stderr or killed.stdout or f"tmux exited {killed.returncode}")
 
 
-BACKENDS = {"tmux": TmuxBackend}
+BACKENDS = {"tmux": TmuxBackend, "herdr": herdr_backend.HerdrBackend}
 
 
-def backend_for(dispatch_or_name):
+def backend_for(dispatch_or_name, db=None):
     """Resolve a dispatch's recorded backend, defaulting pre-contract rows to tmux."""
     name = dispatch_or_name if isinstance(dispatch_or_name, str) else (dispatch_or_name["backend"] or "tmux")
+    if name == "herdr":
+        return herdr_backend.HerdrBackend(db, None if isinstance(dispatch_or_name, str) else dispatch_or_name)
     factory = BACKENDS.get(name)
     if factory is None:
         raise SystemExit(f"unknown execution backend {name!r}")
@@ -1865,7 +1889,7 @@ def cmd_close(args):
         db.execute("BEGIN IMMEDIATE")
         require_owner(db, row["scope"], owner_token(args), "close")
         require_no_unresolved_lifecycle(db, args.dispatch)
-        backend = backend_for(row)
+        backend = backend_for(row, db)
         inspection = backend.inspect(args.dispatch)
         if inspection["result"] != "accepted":
             diagnostic = inspection.get("diagnostic") or f"backend inspect returned {inspection['result']}"
@@ -2003,7 +2027,7 @@ def cmd_handoff(args):
             db.execute("BEGIN IMMEDIATE")
             refuse_used_report(db, args.dispatch, report)
             db.execute("ROLLBACK")
-        backend = backend_for(row)
+        backend = backend_for(row, db)
         session = session_name(args.dispatch)
         inspected = backend.inspect(args.dispatch)
         if inspected["result"] != "accepted":
@@ -2254,7 +2278,8 @@ def cmd_status(args):
                 "canonicalStates": ["running", "online", "waiting-human", "blocked", "unknown",
                                     "completed", "failed", "cancelled", "reclaimed"], "signals": signals,
                 "launch": host_launch.read_receipt(row["launch_receipt"]),
-                "backendResult": inspection["result"],
+                "backendResult": inspection["result"], "backendAlive": alive,
+                "backendHandle": json.loads(row["backend_handle"] or "null"),
                 "tmux": session_name(row["id"]), "tmuxAlive": alive,
                 "cwd": row["cwd"], "task": row["task"], "report": row["report"], "started": local_time(row["started"]),
                 "last": message_view(last) if last else None,
@@ -2324,20 +2349,7 @@ def process_start(pid):
     process from one of an earlier boot with the same pid and starttime. When it cannot be read the
     part is left empty, and such a row only names a pid and starttime: across a reboot it may be taken
     for a later process with both the same."""
-    if wfc_platform.WINDOWS:
-        return wfc_platform.windows_process(pid)["identity"]
-    if not Path("/proc/self/stat").exists():
-        return process_lstart(pid)
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
-    except OSError:
-        return None
-    try:
-        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-    except OSError:
-        boot = ""
-    # Field 2 (the command) is in parentheses and may hold spaces; field 3 follows the last `)`.
-    return f"linux:{boot}:{stat[stat.rindex(')') + 2:].split()[19]}"
+    return wfc_platform.process_identity(pid)
 
 
 def process_lstart(pid):
@@ -2412,7 +2424,7 @@ def cmd_resume(args):
     current_owner = require_owner(db, row["scope"], owner_token(args), "resume")
     owner_generation = current_owner["generation"] if current_owner else None
     require_no_unresolved_lifecycle(db, args.dispatch)
-    backend = backend_for(row)
+    backend = backend_for(row, db)
     mark = round_mark(db, args.dispatch)
     generation = lifecycle_generation(db, args.dispatch)
     initial_round = db.execute("SELECT state FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
@@ -2646,7 +2658,7 @@ def reclaim_session(db, row, named, token=None):
                 db.execute("ROLLBACK")
                 return {"result": "changed", "note": f"dispatch {dispatch_id} is no longer done and unreclaimed "
                                                      f"(a continue, resume or reclaim came meanwhile); left running"}
-            backend = backend_for(row)
+            backend = backend_for(row, db)
             inspected = backend.inspect(dispatch_id)
             if inspected["result"] != "accepted":
                 db.execute("ROLLBACK")
@@ -2778,7 +2790,7 @@ def check_workers(db, stall_after, scope=None, token=None):
         dispatch_id = row["id"]
         if not watched(db, dispatch_id) or reclaimed(db, dispatch_id):
             continue
-        backend = backend_for(row)
+        backend = backend_for(row, db)
         inspected = backend.inspect(dispatch_id)
         alive = inspected["result"] == "accepted" and inspected.get("alive", False)
         read_view = backend.read(dispatch_id) if alive else None
@@ -3100,6 +3112,74 @@ def cmd_relay(args):
     return 0
 
 
+def cmd_herdr_reconcile(args):
+    """Bind only an explicitly inspected owned unit; no input is sent or replayed."""
+    if not args.actor.strip() or not args.evidence.strip():
+        raise SystemExit("herdr-reconcile requires nonempty actor and evidence")
+    db = connect()
+    with input_lock(args.dispatch):
+        row, current = _current_attempt(db, args.dispatch)
+        require_owner(db, row["scope"], owner_token(args), "herdr-reconcile")
+        if row["backend"] != "herdr":
+            raise SystemExit("herdr-reconcile requires a Herdr dispatch")
+        handle = json.loads(row["backend_handle"] or "{}")
+        if not handle.get("nonce"):
+            raise SystemExit("this dispatch has no durable Herdr ownership nonce")
+        guard = {**handle, "workspace": args.workspace or handle.get("workspace"),
+                 "pane": args.pane, "terminal": args.terminal}
+        observed = herdr_backend.rpc(PROGRAM, {"endpoint": handle["endpoint"], "method": "pane.process_info",
+                                     "params": {"pane_id": args.pane}, "guard": guard})
+        if observed["result"] != "accepted":
+            raise SystemExit(json.dumps(observed, ensure_ascii=False))
+        changed_service = handle.get("service") != observed["service"]
+        if changed_service and not args.old_writer_evidence:
+            raise SystemExit("changed Herdr service requires --old-writer-evidence before binding")
+        info = observed["data"].get("process_info", {})
+        pids = {p["pid"] for p in info.get("foreground_processes", [])}
+        if info.get("shell_pid"):
+            pids.add(info["shell_pid"])
+        identities = [{"pid": pid, "creation": wfc_platform.process_identity(pid)} for pid in pids]
+        binding = {**guard, "service": observed["service"], "state": "active", "writerProcesses": identities}
+        binding.pop("writerStoppedEvidence", None)
+        if identities and any(not process["creation"] for process in identities):
+            raise SystemExit("partial writer identity observation; keep unknown until all writers can be inspected")
+        if not identities:
+            if not (args.old_writer_evidence or "").strip():
+                raise SystemExit("writer identity is not observable; provide external stop evidence or keep unknown")
+            binding.update(state="not-started", writerProcesses=[], writerStoppedEvidence=args.old_writer_evidence)
+        if changed_service:
+            binding["receipt"] = None
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            require_owner(db, row["scope"], owner_token(args), "herdr-reconcile")
+            latest, _ = _current_attempt(db, args.dispatch)
+            if latest["current_attempt"] != current["attempt"]:
+                raise SystemExit("dispatch attempt changed while reconciling")
+            backend_for(latest, db)._save(args.dispatch, binding)
+            evidence = json.dumps({"mapping": args.evidence, "oldWriter": args.old_writer_evidence,
+                                   "service": observed["service"], "pane": args.pane, "terminal": args.terminal}, ensure_ascii=False)
+            event = lifecycle_event(db, args.dispatch, "backend_reconcile", round=current["round"],
+                                    attempt=current["attempt"], result="accepted", diagnostic="explicit Herdr unit binding")
+            finish_lifecycle_event(db, event, "accepted", actor=args.actor, evidence=evidence)
+            db.execute("COMMIT")
+        except BaseException:
+            db.execute("ROLLBACK")
+            raise
+    emit({"dispatch": args.dispatch, "result": "accepted", "audit": event,
+          "attempt": current["attempt"], "inputReplayed": False})
+
+
+def cmd_herdr_call(args):
+    raw = sys.stdin.buffer.read(herdr_backend.LIMIT + 1)
+    if len(raw) > herdr_backend.LIMIT:
+        emit({"result": "refused", "diagnostic": "Herdr request exceeds size limit"})
+        return
+    try:
+        emit(herdr_backend.helper(json.loads(raw)))
+    except (ValueError, TypeError):
+        emit({"result": "refused", "diagnostic": "Invalid Herdr helper request"})
+
+
 def main(argv):
     if argv[:1] == ["_host-run"]:
         return host_launch.supervise(argv[1])
@@ -3108,10 +3188,23 @@ def main(argv):
     sub = parser.add_subparsers(dest="command", required=True)
     add_parser = sub.add_parser
     sub.add_parser = lambda *a, **kw: add_parser(*a, allow_abbrev=False, **kw)  # `--deta` must not mean --detach
+    p = sub.add_parser("herdr-reconcile", help="explicitly bind an inspected owned Herdr unit without replay")
+    p.add_argument("dispatch")
+    p.add_argument("--workspace")
+    p.add_argument("--pane", required=True)
+    p.add_argument("--terminal", required=True)
+    p.add_argument("--actor", required=True)
+    p.add_argument("--evidence", required=True)
+    p.add_argument("--old-writer-evidence")
+    p.add_argument("--owner-token")
+    p.set_defaults(func=cmd_herdr_reconcile)
+    p = sub.add_parser("_herdr-call", help=argparse.SUPPRESS)
+    p.set_defaults(func=cmd_herdr_call)
     p = sub.add_parser("dispatch")
     p.add_argument("--host", required=True, choices=sorted(LAUNCHERS))
     p.add_argument("--backend", choices=sorted(BACKENDS), default="tmux",
                    help="execution backend (stored with the dispatch; default: tmux)")
+    p.add_argument("--herdr-endpoint", help="explicit local Herdr JSON API endpoint (persisted per dispatch)")
     p.add_argument("--launch-config", help="JSON host argv/runtime/environment configuration (overrides WFC_LAUNCH_CONFIG)")
     p.add_argument("--task", required=True)
     p.add_argument("--cwd", required=True)

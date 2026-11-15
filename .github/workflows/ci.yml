@@ -53,3 +53,24 @@ jobs:
           python dist/wfc.pyz --version
           python dist/wfc.pyz --help
           python dist/wfc.pyz status
+
+  herdr-contract:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: "3.12"
+      - name: Fetch pinned test-only Herdr
+        shell: pwsh
+        run: |
+          $binary = python tools/fetch_test_herdr.py --out .herdr-test
+          "WFC_HERDR_TEST_BINARY=$binary" >> $env:GITHUB_ENV
+      - name: Real Herdr with controlled host
+        run: python -m unittest discover -s tests -p test_herdr.py -v

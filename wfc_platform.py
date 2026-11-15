@@ -112,3 +112,90 @@ def windows_process(pid):
                 'diagnostic': None}
     finally:
         kernel.CloseHandle(handle)
+
+
+def process_identity(pid):
+    if WINDOWS:
+        return windows_process(pid)['identity']
+    if Path('/proc/self/stat').exists():
+        try:
+            value = Path(f'/proc/{pid}/stat').read_text()
+        except OSError:
+            return None
+        try:
+            boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        except OSError:
+            boot = ''
+        return f"linux:{boot}:{value[value.rindex(')') + 2:].split()[19]}"
+    try:
+        result = subprocess.run(['ps', '-o', 'lstart=', '-p', str(pid)], capture_output=True, text=True,
+                                env={**os.environ, 'LC_ALL': 'C', 'TZ': 'UTC'})
+        return result.stdout.strip() or None
+    except OSError:
+        return None
+
+
+def open_private(path):
+    """Create a new private file; Windows DACL is present from creation time."""
+    if not WINDOWS:
+        return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    class SecurityAttributes(ctypes.Structure):
+        _fields_ = [('length', wintypes.DWORD), ('descriptor', wintypes.LPVOID), ('inherit', wintypes.BOOL)]
+
+    advapi = ctypes.WinDLL('advapi32', use_last_error=True)
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    convert = advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW
+    convert.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(wintypes.LPVOID), ctypes.POINTER(wintypes.ULONG)]
+    convert.restype = wintypes.BOOL
+    kernel.LocalFree.argtypes = [wintypes.LPVOID]
+    kernel.LocalFree.restype = wintypes.LPVOID
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                  ctypes.POINTER(SecurityAttributes), wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    descriptor = wintypes.LPVOID()
+    # Same protected SYSTEM/owner-rights DACL used by Herdr's native private pipe.
+    if not convert('D:P(A;;GA;;;SY)(A;;GA;;;OW)', 1, ctypes.byref(descriptor), None):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        attributes = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
+        handle = kernel.CreateFileW(str(path), 0x40000000, 0, ctypes.byref(attributes), 1, 0x80, None)
+        if handle == wintypes.HANDLE(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            return msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
+        except BaseException:
+            kernel.CloseHandle(handle)
+            raise
+    finally:
+        kernel.LocalFree(descriptor)
+
+
+def process_probe(pid):
+    """Local read-only observation; inaccessible identity remains unknown."""
+    if WINDOWS:
+        return windows_process(pid)
+    if Path('/proc/self/stat').exists():
+        try:
+            value = Path(f'/proc/{pid}/stat').read_text()
+            if value[value.rindex(')') + 2:].split()[0] in ('Z', 'X'):
+                return {'state': 'exited', 'identity': None}
+        except FileNotFoundError:
+            return {'state': 'exited', 'identity': None}
+        except OSError:
+            return {'state': 'unknown', 'identity': None}
+    identity = process_identity(pid)
+    if identity:
+        return {'state': 'alive', 'identity': identity}
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return {'state': 'exited', 'identity': None}
+    except PermissionError:
+        pass
+    return {'state': 'unknown', 'identity': None}
