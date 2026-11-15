@@ -145,10 +145,6 @@ for line in sys.stdin:
         second = self.cli('status', '--dispatch', dispatch)['dispatches'][0]
         self.assertEqual(second['round'], 2)
         self.assertNotEqual(first['attempt'], second['attempt'])
-        import sqlite3
-        with sqlite3.connect(self.root / 'wfc-state' / 'router.db') as db:
-            questions = [json.loads(row[0]) for row in db.execute("SELECT body FROM message WHERE dispatch=? AND type='question'", (dispatch,))]
-        self.assertIn(second['attempt'], [question['attempt'] for question in questions])
         self.assertEqual(second['backendHandle']['service'], first['backendHandle']['service'])
         # Same live terminal serves another round; its handle ownership still names its creating attempt.
         self.assertEqual(self.cli('close', dispatch)['result'], 'completed')
@@ -294,6 +290,8 @@ for line in sys.stdin:
         second = self.cli('status', '--dispatch', dispatch)['dispatches'][0]
         self.assertNotEqual(first['attempt'], second['attempt'])
         self.assertNotEqual(first['backendHandle']['terminal'], second['backendHandle']['terminal'])
+        questions = [message for message in second['messages'] if message['type'] == 'question']
+        self.assertIn(second['attempt'], [question['attempt'] for question in questions])
         late = subprocess.run([sys.executable, str(ROOT / 'wfc.py'), 'ask', 'late question',
                                '--attempt', first['attempt']],
                               env={**self.env, 'WFC_DISPATCH': dispatch}, capture_output=True,
