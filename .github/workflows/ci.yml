@@ -47,6 +47,7 @@ jobs:
         run: |
           python -m unittest discover -s tests -p test_platform.py -v
           python -m unittest discover -s tests -p test_backend.py -v
+          python -m unittest discover -s tests -p test_distribution.py -v
       - name: Build and inspect native zipapp
         run: |
           python build.py --out dist/wfc.pyz
@@ -73,4 +74,10 @@ jobs:
           $binary = python tools/fetch_test_herdr.py --out .herdr-test
           "WFC_HERDR_TEST_BINARY=$binary" >> $env:GITHUB_ENV
       - name: Real Herdr with controlled host
+        run: python -m unittest discover -s tests -p test_herdr.py -v
+      - name: Build portable payload
+        run: python build.py --windows-dir "dist/portable with spaces"
+      - name: Real Herdr through packaged payload
+        env:
+          WFC_TEST_PROGRAM: dist/portable with spaces/wfc.pyz
         run: python -m unittest discover -s tests -p test_herdr.py -v

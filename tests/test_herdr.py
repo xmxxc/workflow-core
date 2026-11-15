@@ -11,6 +11,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parent.parent
 BINARY = os.environ.get('WFC_HERDR_TEST_BINARY')
+PROGRAM = Path(os.environ.get('WFC_TEST_PROGRAM', ROOT / 'wfc.py')).resolve()
 
 
 @unittest.skipUnless(BINARY, 'set WFC_HERDR_TEST_BINARY to the pinned Herdr 0.9.5 binary')
@@ -66,7 +67,7 @@ class HerdrContract(unittest.TestCase):
             self.server.wait(timeout=10)
 
     def cli(self, *args):
-        result = subprocess.run([sys.executable, str(ROOT / 'wfc.py'), *args], env=self.env,
+        result = subprocess.run([sys.executable, str(PROGRAM), *args], env=self.env,
                                 capture_output=True, text=True, encoding='utf-8', timeout=25)
         self.assertIn(result.returncode, (0, 3), result.stderr)
         return json.loads(result.stdout)
@@ -77,7 +78,7 @@ class HerdrContract(unittest.TestCase):
                         '--report', str(self.report), '--launch-config', str(self.launch), *extra)['dispatch']
 
     def api(self, method, params=None):
-        result = subprocess.run([sys.executable, str(ROOT / 'wfc.py'), '_herdr-call'],
+        result = subprocess.run([sys.executable, str(PROGRAM), '_herdr-call'],
                                 input=json.dumps({'endpoint': self.endpoint, 'method': method, 'params': params or {}}),
                                 env=self.env, capture_output=True, text=True, encoding='utf-8', timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -98,7 +99,7 @@ class HerdrContract(unittest.TestCase):
         self.assertEqual(closed['result'], 'completed')
 
     def interactive_host(self):
-        program = str(ROOT / 'wfc.py')
+        program = str(PROGRAM)
         self.host.write_text(r'''import json,os,sqlite3,subprocess,sys,time,uuid
 from pathlib import Path
 state=Path(os.environ['WFC_STATE']); dispatch=os.environ['WFC_DISPATCH']
@@ -175,7 +176,7 @@ for line in sys.stdin:
         self.assertEqual(after['backendResult'], 'uncertain')
         self.assertEqual(after['attempt'], before['attempt'])
         self.assertEqual(after['backendHandle'], before['backendHandle'])
-        result = subprocess.run([sys.executable, str(ROOT / 'wfc.py'), 'nudge', dispatch, '--text', 'must not replay'],
+        result = subprocess.run([sys.executable, str(PROGRAM), 'nudge', dispatch, '--text', 'must not replay'],
                                 env=self.env, capture_output=True, text=True, encoding='utf-8', timeout=15)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('identity changed', result.stderr)
@@ -185,7 +186,7 @@ for line in sys.stdin:
         snapshot = self.api('session.snapshot')['snapshot']
         workspace = next((w for w in snapshot['workspaces'] if w['workspace_id'] == handle['workspace']), None)
         matches = workspace is not None and workspace.get('tokens', {}).get('wfc_owner') == handle['nonce']
-        rebound = subprocess.run([sys.executable, str(ROOT / 'wfc.py'), 'herdr-reconcile', dispatch,
+        rebound = subprocess.run([sys.executable, str(PROGRAM), 'herdr-reconcile', dispatch,
                                   '--pane', handle['pane'], '--terminal', handle['terminal'], '--actor', 'operator',
                                   '--evidence', 'inspected restarted service', '--old-writer-evidence', 'old service reaped'],
                                  env=self.env, capture_output=True, text=True, encoding='utf-8', timeout=15)
@@ -200,7 +201,7 @@ for line in sys.stdin:
     def test_read_only_host_refuses_input(self):
         self.host.write_text('import time\nprint("This conversation is unavailable. Its cached transcript and draft remain here; input is paused.",flush=True)\ntime.sleep(60)\n', encoding='utf-8')
         dispatch = self.dispatch()
-        result = subprocess.run([sys.executable, str(ROOT / 'wfc.py'), 'nudge', dispatch, '--text', 'never submit'],
+        result = subprocess.run([sys.executable, str(PROGRAM), 'nudge', dispatch, '--text', 'never submit'],
                                 env=self.env, capture_output=True, text=True, encoding='utf-8', timeout=15)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('refused', result.stderr)
@@ -260,7 +261,7 @@ for line in sys.stdin:
             dispatch = self.dispatch()
             before = self.cli('status', '--dispatch', dispatch)['dispatches'][0]
             self.env['WFC_HERDR_TIMEOUT'] = '1'
-            result = subprocess.run([sys.executable, str(ROOT / 'wfc.py'), 'nudge', dispatch, '--text', 'one intent'],
+            result = subprocess.run([sys.executable, str(PROGRAM), 'nudge', dispatch, '--text', 'one intent'],
                                     env=self.env, capture_output=True, text=True, encoding='utf-8', timeout=20)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('uncertain', result.stderr)
@@ -292,7 +293,7 @@ for line in sys.stdin:
         self.assertNotEqual(first['backendHandle']['terminal'], second['backendHandle']['terminal'])
         questions = [message for message in second['messages'] if message['type'] == 'question']
         self.assertIn(second['attempt'], [question['attempt'] for question in questions])
-        late = subprocess.run([sys.executable, str(ROOT / 'wfc.py'), 'ask', 'late question',
+        late = subprocess.run([sys.executable, str(PROGRAM), 'ask', 'late question',
                                '--attempt', first['attempt']],
                               env={**self.env, 'WFC_DISPATCH': dispatch}, capture_output=True,
                               text=True, encoding='utf-8', timeout=15)
@@ -311,7 +312,7 @@ for line in sys.stdin:
         self.assertFalse(bound['inputReplayed'])
         self.assertEqual(bound['attempt'], first['attempt'])
         next_owner = self.cli('owner', 'takeover', '--scope', scope, '--owner', 'second')
-        refused = subprocess.run([sys.executable, str(ROOT / 'wfc.py'), 'herdr-reconcile', dispatch,
+        refused = subprocess.run([sys.executable, str(PROGRAM), 'herdr-reconcile', dispatch,
                                   '--pane', handle['pane'], '--terminal', handle['terminal'], '--actor', 'old owner',
                                   '--evidence', 'stale', '--owner-token', owner['token']], env=self.env,
                                  capture_output=True, text=True, encoding='utf-8', timeout=15)
