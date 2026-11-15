@@ -2033,6 +2033,133 @@ class HostErrors(unittest.TestCase):
         # Neither reported again nor followed by a stall on the same screen.
         self.assertTrue(self.wait(timeout="2.5", stall_after="0.3")["timedOut"])
 
+    def test_quota_and_timeout_remain_bounded_across_watchdog_restarts(self):
+        dispatch = self.env.dispatch("codex")
+        self.codex_rollout(dispatch, [self.codex_quota()])
+        self.still["WFC_MAX_TURN_SECONDS"] = "0.001"
+        messages = []
+        # Every wait starts a fresh router process against the same durable state.
+        for _ in range(6):
+            messages.extend(self.wait(timeout="0", stall_after="60")["messages"])
+        self.assertEqual([m["type"] for m in messages], ["blocked", "unknown"])
+        self.assertEqual(len({m["id"] for m in messages}), 2)
+
+    def test_parallel_watchdogs_do_not_duplicate_quota_or_timeout(self):
+        dispatch = self.env.dispatch("codex")
+        self.codex_rollout(dispatch, [self.codex_quota()])
+        self.still["WFC_MAX_TURN_SECONDS"] = "0.001"
+        processes = [subprocess.Popen(
+            [sys.executable, str(ROUTER), "wait", "--timeout", "0", "--stall-after", "60"],
+            env=self.env.router_env(env=self.still), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True) for _ in range(6)]
+        messages = []
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=15)
+            self.assertIn(process.returncode, (0, 3), stderr)
+            messages.extend(json.loads(stdout)["messages"])
+        self.assertCountEqual([m["type"] for m in messages], ["blocked", "unknown"])
+        self.assertEqual(len({m["id"] for m in messages}), 2)
+        self.assertTrue(self.wait(timeout="0")["timedOut"])
+
+    def test_new_host_turn_and_changed_error_are_visible_after_timeout(self):
+        dispatch = self.env.dispatch("codex")
+        self.codex_rollout(dispatch, [self.codex_quota()])
+        self.still["WFC_MAX_TURN_SECONDS"] = "0.001"
+        self.assertEqual([m["type"] for m in self.wait(timeout="0")["messages"]], ["blocked"])
+        self.assertEqual([m["type"] for m in self.wait(timeout="0")["messages"]], ["unknown"])
+        self.codex_rollout(dispatch, [self.codex_quota("t-2")])
+        self.assertEqual([m["type"] for m in self.wait(timeout="0")["messages"]], ["blocked"])
+        changed = self.codex_quota("t-2")
+        changed["error"] = {"message": "Authentication expired", "codex_error_info": "authentication"}
+        self.codex_rollout(dispatch, [changed])
+        [message] = self.wait(timeout="0")["messages"]
+        self.assertEqual(message["message"], "Authentication expired")
+        self.assertTrue(self.wait(timeout="0")["timedOut"])
+        self.codex_rollout(dispatch, [{"type": "task_started", "turn_id": "t-3"}])
+        self.assertTrue(self.wait(timeout="0")["timedOut"])
+        self.codex_rollout(dispatch, [self.codex_quota("t-3")])
+        self.assertEqual([m["type"] for m in self.wait(timeout="0")["messages"]], ["blocked"])
+
+    def test_new_attempt_reports_timeout_without_replaying_old_host_fault(self):
+        dispatch = self.env.dispatch("codex")
+        self.codex_rollout(dispatch, [self.codex_quota()])
+        self.still["WFC_MAX_TURN_SECONDS"] = "0.001"
+        self.wait(timeout="0")
+        self.wait(timeout="0")
+        self.env.end_session(dispatch)
+        self.env.json("resume", dispatch)
+        messages = self.wait(timeout="0")["messages"]
+        self.assertEqual([m["type"] for m in messages], ["unknown"])
+        self.codex_rollout(dispatch, [self.codex_quota()])
+        self.assertEqual([m["type"] for m in self.wait(timeout="0")["messages"]], ["blocked"])
+        self.assertTrue(self.wait(timeout="0")["timedOut"])
+
+    def test_new_round_can_report_the_same_host_turn_and_its_own_timeout(self):
+        dispatch = self.env.dispatch("codex")
+        self.codex_rollout(dispatch, [self.codex_quota()])
+        self.still["WFC_MAX_TURN_SECONDS"] = "0.001"
+        self.wait(timeout="0")
+        self.wait(timeout="0")
+        self.env.report.write_text("# round one\n")
+        self.env.json("done", "--report", str(self.env.report), dispatch=dispatch)
+        self.wait(timeout="0")
+        report = self.env.report.with_name("round-two.md")
+        self.env.json("continue", dispatch, "--task", str(self.env.task), "--report", str(report))
+        self.codex_rollout(dispatch, [self.codex_quota()])
+        messages = []
+        for _ in range(4):
+            messages.extend(self.wait(timeout="0")["messages"])
+        self.assertEqual([m["type"] for m in messages], ["blocked", "unknown"])
+
+    def test_relay_restart_does_not_requeue_persistent_quota_and_timeout(self):
+        dispatch = self.env.dispatch("codex")
+        self.codex_rollout(dispatch, [self.codex_quota()])
+        self.env.codex_controller(CodexRelay.THREAD)
+        self.still["WFC_MAX_TURN_SECONDS"] = "0.001"
+        for _ in range(2):
+            result = self.env.run("relay", "--codex-thread", CodexRelay.THREAD,
+                                  "--for", "1.5", "--stall-after", "60", env=self.still)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        messages = []
+        for call in self.env.host_calls():
+            if call[:2] == ["codex", "queue"]:
+                messages.extend(json.loads(call[call.index("--message") + 1].split(": ", 1)[1])["messages"])
+        self.assertEqual([m["type"] for m in messages], ["blocked", "unknown"])
+        self.assertEqual(len({m["messageId"] for m in messages}), 2)
+        self.assertTrue(all(m["state"] == "unknown" for m in messages))
+        self.assertTrue(self.wait(timeout="0")["timedOut"])
+
+    def test_watchdog_discards_a_fault_sampled_before_new_input(self):
+        dispatch = self.env.dispatch("codex")
+        self.codex_rollout(dispatch, [self.codex_quota()])
+        gate = self.env.bin.parent / "capture-gate"
+        tmux = self.env.bin / "tmux"
+        tmux.write_text(tmux.read_text().replace(
+            "    screen = os.environ.get('FAKE_SCREEN')",
+            "    gate = os.environ.get('CAPTURE_GATE')\n"
+            "    if gate:\n"
+            "        open(gate + '.ready', 'w').close()\n"
+            "        while not os.path.exists(gate + '.release'): time.sleep(0.01)\n"
+            "    screen = os.environ.get('FAKE_SCREEN')"))
+        process = subprocess.Popen([sys.executable, str(ROUTER), "wait", "--timeout", "0"],
+                                   env=self.env.router_env(env={**self.still, "CAPTURE_GATE": str(gate),
+                                                               "WFC_MAX_TURN_SECONDS": "0.001"}),
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not gate.with_suffix(".ready").exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(gate.with_suffix(".ready").exists())
+            self.env.json("nudge", dispatch, "--text", "new input")
+            gate.with_suffix(".release").touch()
+            stdout, stderr = process.communicate(timeout=10)
+            self.assertEqual(process.returncode, 3, stderr)
+            self.assertEqual(json.loads(stdout)["messages"], [])
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
     def test_claude_rate_limit_is_reported_as_blocked(self):
         dispatch = self.env.dispatch("claude")
         [launch] = [c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]]

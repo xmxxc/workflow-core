@@ -67,6 +67,7 @@ TABLES = {
                           "reason TEXT, evidence TEXT, body_hash TEXT, from_state TEXT, to_state TEXT, created REAL",
     "screen_watch": "dispatch TEXT PRIMARY KEY, screen TEXT, since REAL, reported_screen TEXT",
     "host_error": "dispatch TEXT PRIMARY KEY, turn TEXT",
+    "watchdog_fault": "dispatch TEXT, round INTEGER, attempt TEXT, kind TEXT, fingerprint TEXT, PRIMARY KEY (dispatch, round, attempt, kind, fingerprint)",
     "fault_event": "dispatch TEXT PRIMARY KEY, operation TEXT, outcome TEXT, category TEXT, diagnostic TEXT, created REAL",
     # Durable lifecycle operations are separate from worker/controller messages.  An
     # operation can cross a tmux boundary after the router has committed its fencing
@@ -2662,6 +2663,7 @@ def check_workers(db, stall_after, scope=None, token=None):
         dispatch_id = row["id"]
         if not watched(db, dispatch_id) or reclaimed(db, dispatch_id):
             continue
+        sampled_start = round_started(db, dispatch_id)
         backend = backend_for(row)
         inspected = backend.inspect(dispatch_id)
         alive = inspected["result"] == "accepted" and inspected.get("alive", False)
@@ -2678,16 +2680,18 @@ def check_workers(db, stall_after, scope=None, token=None):
                                              (dispatch_id,)).fetchone()[0])
         turn_end = TURN_WATCHES.setdefault(watch_key, TurnWatch()).latest(row, now) if alive and not backend_fault else None
         notice = read_only_notice(captured.stdout) if alive and captured is not None and captured.returncode == 0 else None
-        timeout_marker = f"timeout:{row['current_round']}:{row['current_attempt']}"
-        prior_timeout = db.execute("SELECT turn FROM host_error WHERE dispatch = ?", (dispatch_id,)).fetchone()
-        timeout_seen = bool(prior_timeout and prior_timeout["turn"] == timeout_marker)
         recheck = backend.inspect(dispatch_id) if not alive and not backend_fault else None
         # Decide and post under one write lock, re-checking state a worker's `done` may have changed.
         db.execute("BEGIN IMMEDIATE")
         try:
             if scope:
                 require_owner(db, scope, token, "watchdog")
-            if not watched(db, dispatch_id) or reclaimed(db, dispatch_id):
+            current = db.execute("SELECT * FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
+            if (current["current_round"], current["current_attempt"], current["started"]) != (
+                    row["current_round"], row["current_attempt"], row["started"]) \
+                    or round_started(db, dispatch_id) != sampled_start:
+                pass  # external observations belong to an input/attempt that has moved on
+            elif not watched(db, dispatch_id) or reclaimed(db, dispatch_id):
                 pass
             elif backend_fault:
                 prior_fault = db.execute("SELECT outcome, diagnostic FROM fault_event WHERE dispatch = ? AND operation = 'backend'",
@@ -2727,24 +2731,21 @@ def check_workers(db, stall_after, scope=None, token=None):
                                "VALUES (?, ?, ?, ?)", (dispatch_id, captured.stdout, now, captured.stdout))
             elif awaiting_answer(db, dispatch_id):
                 db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (dispatch_id,))
-            elif max_turn and now - round_started(db, dispatch_id) >= max_turn and not timeout_seen \
+            elif max_turn and now - round_started(db, dispatch_id) >= max_turn and not watchdog_fault_seen(db, row, "timeout", "deadline") \
                     and not blocked_turn(db, dispatch_id, turn_end):
-                marker = timeout_marker
                 post(db, dispatch_id, "controller", "unknown", {
                      "kind": "turn_timeout", "message": f"turn exceeded {int(max_turn)} seconds",
                      "idleSeconds": int(now - round_started(db, dispatch_id)),
                      "fault": {"category": "timeout", "kind": "turn_timeout",
                                "diagnostic": f"turn exceeded {int(max_turn)} seconds",
                                "requiresDecision": True}})
-                db.execute("INSERT OR REPLACE INTO host_error (dispatch, turn) VALUES (?, ?)",
-                           (dispatch_id, marker))
+                remember_watchdog_fault(db, row, "timeout", "deadline")
             elif blocked_turn(db, dispatch_id, turn_end):
                 error = turn_end["error"]
                 post(db, dispatch_id, "controller", "blocked", {"host": row["host"], **error,
                      "fault": {"category": fault_category(error.get("kind"), error.get("message")),
                                "requiresDecision": True}})
-                db.execute("INSERT OR REPLACE INTO host_error (dispatch, turn) VALUES (?, ?)",
-                           (dispatch_id, turn_end["turn"]))
+                remember_watchdog_fault(db, row, "host", host_fault_fingerprint(turn_end))
                 if captured and captured.returncode == 0:  # the stall that follows on this screen is the same news
                     db.execute("INSERT OR REPLACE INTO screen_watch (dispatch, screen, since, reported_screen) "
                                "VALUES (?, ?, ?, ?)", (dispatch_id, captured.stdout, now, captured.stdout))
@@ -2759,13 +2760,28 @@ def check_workers(db, stall_after, scope=None, token=None):
 TURN_WATCHES = {}
 
 
+def watchdog_fault_seen(db, row, kind, fingerprint):
+    return db.execute("SELECT 1 FROM watchdog_fault WHERE dispatch = ? AND round = ? AND attempt = ? "
+                      "AND kind = ? AND fingerprint = ?",
+                      (row["id"], row["current_round"], row["current_attempt"], kind, fingerprint)).fetchone() is not None
+
+
+def remember_watchdog_fault(db, row, kind, fingerprint):
+    # Called with the message insert under the same BEGIN IMMEDIATE transaction.
+    db.execute("INSERT INTO watchdog_fault (dispatch, round, attempt, kind, fingerprint) VALUES (?, ?, ?, ?, ?)",
+               (row["id"], row["current_round"], row["current_attempt"], kind, fingerprint))
+
+
+def host_fault_fingerprint(turn_end):
+    return hashlib.sha256(json.dumps([turn_end["turn"], turn_end["error"]], sort_keys=True).encode()).hexdigest()
+
+
 def blocked_turn(db, dispatch_id, turn_end):
-    """The worker's latest turn ended on a host error (quota, overload, policy) in its current
-    round, not yet reported."""
-    if not turn_end or not turn_end["error"]:
+    """A current host turn/error that has not been reported in this round/attempt."""
+    if not turn_end or not turn_end["error"] or turn_end["at"] <= round_started(db, dispatch_id):
         return False
-    reported = db.execute("SELECT turn FROM host_error WHERE dispatch = ?", (dispatch_id,)).fetchone()
-    return (reported is None or reported["turn"] != turn_end["turn"]) and turn_end["at"] > round_started(db, dispatch_id)
+    row = db.execute("SELECT * FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
+    return not watchdog_fault_seen(db, row, "host", host_fault_fingerprint(turn_end))
 
 
 def round_started(db, dispatch_id):
