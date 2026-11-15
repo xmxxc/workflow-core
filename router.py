@@ -10,7 +10,7 @@ SQLite database under $WFC_STATE (default ~/.local/state/workflow-core).
 import argparse
 import collections
 import calendar
-import fcntl
+import wfc_platform
 import hashlib
 import host_launch
 import json
@@ -34,7 +34,7 @@ TIMED_OUT = 3
 
 
 def state_dir():
-    return Path(os.environ.get("WFC_STATE") or Path.home() / ".local/state/workflow-core").expanduser().resolve()
+    return Path(os.environ.get("WFC_STATE") or wfc_platform.default_state_dir()).expanduser().resolve()
 
 
 def tmux(*args):
@@ -302,6 +302,19 @@ FIRST_BRIEF = "You are a worker dispatched by the controller"
 
 
 def worker_brief(dispatch_id, task, report, opening=FIRST_BRIEF, attempt=None, owner=False):
+    if wfc_platform.WINDOWS:
+        base = [sys.executable, str(PROGRAM)]
+        identity = ["--attempt", attempt] if attempt else []
+        done = wfc_platform.callback_command([*base, "done", "--report", str(report), *identity,
+                                              *(["--message-id", f"done:{dispatch_id}:{attempt}"] if attempt else [])])
+        ask = wfc_platform.callback_command([*base, "ask", "<question text>", *identity])
+        return (f"{opening} (dispatch {dispatch_id}). Read and do the task in {task}. "
+                f"Stop any server or background process you started before you report. "
+                f"When finished, write your report and run in PowerShell: {done}; "
+                f'If you need a decision, replace <question text> inside its double quotes, escape any double quotes with backslashes, '
+                f'and double single quotes inside the PowerShell literal; run in PowerShell: {ask}; '
+                f"then end your turn; the answer arrives as your next message. "
+                f"Never ask questions in plain text or with an interactive question tool; nobody watches this window.")
     router = f"{shlex.quote(sys.executable)} {shlex.quote(str(PROGRAM))}"
     owner_arg = ' --owner-token "$WFC_OWNER_TOKEN"' if owner else ""
     attempt_arg = " --attempt " + shlex.quote(attempt) if attempt else ""
@@ -555,7 +568,7 @@ def codex_rollout_opens_with(rollout, opening):
     """The rollout's session id if it is a top-level conversation with a user message that begins
     with `opening`, else None. Reads only up to that message."""
     try:
-        with open(rollout, errors="replace") as lines:
+        with open(rollout, encoding="utf-8", errors="replace") as lines:
             meta = codex_rollout_meta(lines)
             if codex_subagent(meta):
                 return None
@@ -582,6 +595,10 @@ def trust_claude_worktree(cwd):
 
     A running Claude Code session rewrites this file from memory, so the new entry can be lost
     to a concurrent save; the worker then stops on the trust prompt and is reported `stalled`."""
+    if wfc_platform.WINDOWS:
+        # Unix modes do not establish Windows ACLs; leave host trust to the user.
+        print("router: Windows host trust must be confirmed in the host", file=sys.stderr)
+        return None
     path = claude_config().resolve()  # write through a symlinked config to its real file
     if not path.exists():
         return None
@@ -592,15 +609,18 @@ def trust_claude_worktree(cwd):
         print(f"router: not pre-trusting {cwd}: cannot lock {path}: {err}", file=sys.stderr)
         return None
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        wfc_platform.acquire_lock(lock)
         return _trust_locked(path, cwd)
+    except OSError as err:
+        print(f"router: not pre-trusting {cwd}: config lock failed: {err}", file=sys.stderr)
+        return None
     finally:
         os.close(lock)
 
 
 def _trust_locked(path, cwd):
     try:
-        config = json.loads(path.read_text())
+        config = json.loads(path.read_text(encoding="utf-8"))
         projects = config.setdefault("projects", {})
         if not isinstance(projects, dict):
             raise ValueError("projects is not an object")
@@ -622,7 +642,7 @@ def _trust_locked(path, cwd):
     try:
         # Created with the config's own mode (fchmod undoes the umask) before any content is written.
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
-        with os.fdopen(fd, "w") as out:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
             os.fchmod(out.fileno(), mode)
             out.write(json.dumps(config, indent=2, ensure_ascii=False))
             out.flush()
@@ -1571,7 +1591,13 @@ class input_lock:
 
     def __enter__(self):
         self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
-        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        try:
+            wfc_platform.acquire_lock(self.fd)
+        except BaseException as err:
+            os.close(self.fd)
+            if isinstance(err, TimeoutError):
+                raise SystemExit(json.dumps({"error": "input_lock_timeout", "requiresDecision": True}))
+            raise
 
     def __exit__(self, *exc):
         os.close(self.fd)
@@ -2246,8 +2272,18 @@ def cmd_status(args):
     undelivered = db.execute("SELECT * FROM message WHERE recipient = 'controller' AND delivered = 0 "
                              + ("AND dispatch = ? " if args.dispatch else "") + "ORDER BY id",
                              (args.dispatch,) if args.dispatch else ()).fetchall()
-    waiters = [{"pid": w["pid"], "kind": w["kind"], "since": local_time(w["since"])}
-               for w in db.execute("SELECT * FROM waiter ORDER BY since") if waiter_alive(w)]
+    waiters = []
+    for waiter in db.execute("SELECT * FROM waiter ORDER BY since"):
+        if wfc_platform.WINDOWS:
+            probe = wfc_platform.windows_process(waiter["pid"])
+            if probe["state"] == "exited" or (probe["state"] == "alive" and waiter["process_start"]
+                                               and probe["identity"] != waiter["process_start"]):
+                continue
+            waiters.append({"pid": waiter["pid"], "kind": waiter["kind"], "since": local_time(waiter["since"]),
+                            "processStart": waiter["process_start"], "liveness": probe["state"],
+                            "diagnostic": probe["diagnostic"]})
+        elif waiter_alive(waiter):
+            waiters.append({"pid": waiter["pid"], "kind": waiter["kind"], "since": local_time(waiter["since"])})
     emit({"state": str(state_dir()), "dispatches": dispatches, **({"reclaimable": reclaimable} if args.active else {}),
           "undelivered": [message_view(m) for m in undelivered], "waiters": waiters,
           **({"schema": "router.db is older than this wfc and is shown as far as it goes; "
@@ -2267,6 +2303,9 @@ def waiter_alive(row):
     registered = row["process_start"]
     if not registered:
         return process_alive(row["pid"])
+    if wfc_platform.WINDOWS:
+        probe = wfc_platform.windows_process(row["pid"])
+        return probe["state"] == "unknown" or (probe["state"] == "alive" and probe["identity"] == registered)
     if registered.startswith("linux:"):
         return process_start(row["pid"]) == registered
     now = process_lstart(row["pid"])
@@ -2285,6 +2324,8 @@ def process_start(pid):
     process from one of an earlier boot with the same pid and starttime. When it cannot be read the
     part is left empty, and such a row only names a pid and starttime: across a reboot it may be taken
     for a later process with both the same."""
+    if wfc_platform.WINDOWS:
+        return wfc_platform.windows_process(pid)["identity"]
     if not Path("/proc/self/stat").exists():
         return process_lstart(pid)
     try:
@@ -2317,6 +2358,8 @@ def lstart_epoch(text):
 
 
 def process_alive(pid):
+    if wfc_platform.WINDOWS:
+        return wfc_platform.windows_process(pid)["state"] != "exited"
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -2963,7 +3006,7 @@ def checked_codex_thread(thread):
                          f"(a thread name cannot be checked) or run `relay --codex` inside the controller")
     for rollout in codex_rollouts(f"rollout-*-{thread}.jsonl"):
         try:
-            with open(rollout, errors="replace") as lines:
+            with open(rollout, encoding="utf-8", errors="replace") as lines:
                 meta = codex_rollout_meta(lines)
         except (OSError, ValueError, KeyError, TypeError, StopIteration):
             continue
@@ -3015,9 +3058,9 @@ def cmd_relay(args):
         argv = ["relay", *target_args, "--stall-after", str(args.stall_after),
                 *( ["--scope", args.scope, "--owner-token", owner_token(args)] if args.scope else []),
                 *(["--for", str(args.for_seconds)] if args.for_seconds else [])]
-        with open(log, "a") as out:
+        with open(log, "a", encoding="utf-8") as out:
             child = subprocess.Popen([sys.executable, str(PROGRAM), *argv], stdin=subprocess.DEVNULL,
-                                     stdout=out, stderr=out, start_new_session=True)
+                                     stdout=out, stderr=out, **wfc_platform.detached_options())
         emit({"pid": child.pid, "log": str(log)})
         return 0
     db = connect()
@@ -3060,6 +3103,7 @@ def cmd_relay(args):
 def main(argv):
     if argv[:1] == ["_host-run"]:
         return host_launch.supervise(argv[1])
+    wfc_platform.configure_stdio()
     parser = argparse.ArgumentParser(prog="router.py", allow_abbrev=False)
     sub = parser.add_subparsers(dest="command", required=True)
     add_parser = sub.add_parser
