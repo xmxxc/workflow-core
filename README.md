@@ -1,5 +1,7 @@
 # workflow-core
 
+> Development candidate: native Windows core, optional Herdr backend and portable entrypoints are documented in [Windows distribution and acceptance](docs/windows-distribution.md). Real Windows Codex acceptance is pending; the released tmux support scope below remains the baseline.
+
 ![wfc · workflow-core: one controller terminal dispatching to three worker terminals, with messages flowing back](docs/assets/banner.png)
 
 [![CI](https://github.com/xmxxc/workflow-core/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/xmxxc/workflow-core/actions/workflows/ci.yml)

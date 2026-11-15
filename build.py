@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Build the single-file `wfc` command: a Python zip application with router.py and wfc.py.
-It needs only python3 (3.9+) and, at run time, tmux.
+Requires Python 3.9+ and the selected external terminal backend at run time.
 
   python3 build.py [--out dist/wfc]
 """
@@ -28,7 +28,21 @@ def build(out):
     return out
 
 
+def build_windows(directory):
+    """Same Python payload, with a native cmd entrypoint; no global installation."""
+    directory = directory.resolve()
+    directory.mkdir(parents=True, exist_ok=False)
+    build(directory / "wfc.pyz")
+    (directory / "wfc.cmd").write_bytes(
+        b'@echo off\r\npython "%~dp0wfc.pyz" %*\r\nexit /b %errorlevel%\r\n')
+    shutil.copy2(ROOT / "LICENSE", directory / "LICENSE")
+    return directory
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(allow_abbrev=False)
-    parser.add_argument("--out", type=Path, default=ROOT / "dist" / "wfc")
-    print(build(parser.parse_args().out.resolve()))
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument("--out", type=Path, default=ROOT / "dist" / "wfc")
+    target.add_argument("--windows-dir", type=Path, help="create a new portable directory with wfc.pyz and wfc.cmd")
+    args = parser.parse_args()
+    print(build_windows(args.windows_dir) if args.windows_dir else build(args.out.resolve()))
