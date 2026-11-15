@@ -100,6 +100,43 @@ for _ in range(15):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(output.read_text(encoding='utf-8')), values)
 
+    def test_brief_callback_overrides_stale_host_shell_context(self):
+        import router
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "工具 space'quoted"
+            root.mkdir()
+            output = root / 'captured.json'
+            capture = root / 'capture.py'
+            capture.write_text("import json,os,sys;from pathlib import Path;"
+                               "Path(" + repr(str(output)) + ").write_text(json.dumps({"
+                               "'dispatch':os.environ.get('WFC_DISPATCH'),"
+                               "'state':os.environ.get('WFC_STATE'),'argv':sys.argv[1:]},"
+                               "ensure_ascii=False),encoding='utf-8')", encoding='utf-8')
+            state = root / 'correct state'
+            with patch.object(router, 'PROGRAM', capture), patch.dict(os.environ, {'WFC_STATE': str(state)}):
+                brief = router.worker_brief('d-current', root / 'task.md', root / 'report.md', attempt='a-current')
+            if os.name == 'nt':
+                done = brief.split('run in PowerShell: ')[1].split('; If you need a decision,')[0]
+                ask = brief.split('run in PowerShell: ')[2].split('; then end your turn;')[0]
+                ask = ask.replace('<question text>', 'May I finish?')
+                shell = ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command']
+            else:
+                done = brief.split('and run: ')[1].split('; If you need a decision,')[0]
+                ask = brief.split('run: ')[2].split('; then end your turn;')[0]
+                ask = ask.replace('<question>', 'May I finish?').replace(' [--options a,b]', '')
+                shell = ['sh', '-c']
+            for kind, command in (('done', done), ('ask', ask)):
+                with self.subTest(callback=kind):
+                    result = subprocess.run([*shell, command], env={**os.environ, 'WFC_DISPATCH': 'd-old',
+                                            'WFC_STATE': str(root / 'old state')}, capture_output=True, timeout=15)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    observed = json.loads(output.read_text(encoding='utf-8'))
+                    self.assertEqual(observed['dispatch'], 'd-current')
+                    self.assertEqual(observed['state'], str(state.resolve()))
+                    self.assertEqual(observed['argv'][0], kind)
+                    self.assertIn('a-current', observed['argv'])
+
     @unittest.skipUnless(os.name == 'nt', 'requires native Windows process handles')
     def test_windows_creation_identity_and_exit_use_read_only_queries(self):
         import wfc_platform
@@ -146,7 +183,9 @@ for _ in range(15):
         import router
         with tempfile.TemporaryDirectory() as tmp:
             report = Path(tmp) / 'report.md'
-            brief = router.worker_brief('d-demo', Path(tmp) / 'task.md', report, attempt='a-demo')
+            from unittest.mock import patch
+            with patch.dict(os.environ, {'WFC_STATE': str(Path(tmp) / 'state')}):
+                brief = router.worker_brief('d-demo', Path(tmp) / 'task.md', report, attempt='a-demo')
             ask = brief.split('run in PowerShell: ')[2].split('; then end your turn;')[0]
             ask = ask.replace('<question text>', 'May I retry?')
             # Core reaches dispatch validation rather than argparse extra-argument rejection.
