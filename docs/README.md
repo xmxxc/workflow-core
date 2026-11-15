@@ -3,6 +3,7 @@
 新会话从这里恢复产品方向与研究，不依赖旧聊天或临时文件。
 
 - [Router 定位与补齐顺序](router-foundation.md)：2026-11-13 用户确认的小型通用基础层定位；实现次序、核心/外壳职责、下一步验收条件。
+- [watchdog 通知循环与安全恢复](watchdog-recovery.md)：故障去重、证据保留与积压队列恢复。
 - [核心规格](specs/router-core-foundation-20261113.md)：已确认的任务派发、唤醒、宿主故障和恢复契约。
 - [9 张工作票](tickets/router-core/)：按依赖顺序拆分的实现票据；GitHub Issues #2–#10 为公开入口。
 - [外部实现比较](router-sources-20261113.md)：Agent Autoloop、LobeHub、Herdr、Octopus，以及 Orca、Paseo、Codeg、Tern.build、Pachat 的证据与采用方式。
