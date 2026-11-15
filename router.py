@@ -411,10 +411,19 @@ def find_host_session(row):
         try:
             db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
             try:
-                found = db.execute(
-                    "SELECT s.id FROM session s WHERE s.parent_id IS NULL AND EXISTS "
-                    "(SELECT 1 FROM part p WHERE p.session_id = s.id AND substr(json_extract(p.data, '$.text'), 1, ?) = ?) "
-                    "ORDER BY s.time_created LIMIT 1", (len(opening), opening)).fetchone()
+                tables = opencode_tables(db)
+                found = None
+                for sessions, messages, user_filter in (("session_v2", "session_message", "p.type = 'user' AND "),
+                                                         ("session", "part", "")):
+                    if not {sessions, messages} <= tables:
+                        continue
+                    found = db.execute(
+                        f"SELECT s.id FROM {sessions} s WHERE s.parent_id IS NULL AND EXISTS "
+                        f"(SELECT 1 FROM {messages} p WHERE p.session_id = s.id AND {user_filter}"
+                        "json_valid(p.data) AND substr(json_extract(p.data, '$.text'), 1, ?) = ?) "
+                        "ORDER BY s.time_created LIMIT 1", (len(opening), opening)).fetchone()
+                    if found:
+                        break
             finally:
                 db.close()
         except sqlite3.Error as err:
@@ -440,6 +449,10 @@ def codex_rollout_meta(lines):
 
 def codex_subagent(meta):
     return isinstance(meta.get("source"), dict) and "subagent" in meta["source"]
+
+
+def opencode_tables(db):
+    return {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
 
 
 def opencode_db():
@@ -553,6 +566,30 @@ def conversation_source(row):
 def opencode_turn_end(session):
     db = sqlite3.connect(f"file:{opencode_db()}?mode=ro", uri=True)
     try:
+        tables = opencode_tables(db)
+        if "session_message" in tables:
+            latest = db.execute("SELECT id, time_created, seq, type, data FROM session_message WHERE session_id = ? "
+                                "AND type IN ('user', 'synthetic', 'assistant', 'idle') ORDER BY seq DESC LIMIT 1",
+                                (session,)).fetchone()
+            if latest:
+                if latest[3] != "idle":
+                    return None  # user input or a streaming/retrying assistant is not a terminal turn
+                idle = json.loads(latest[4])
+                if idle.get("outcome") not in ("succeeded", "failed", "interrupted"):
+                    return None
+                error = None
+                if idle.get("outcome") == "failed":
+                    assistant = db.execute(
+                        "SELECT data FROM session_message WHERE session_id = ? AND type = 'assistant' AND seq < ? "
+                        "AND seq > COALESCE((SELECT MAX(seq) FROM session_message WHERE session_id = ? AND seq < ? "
+                        "AND type IN ('user', 'synthetic', 'idle')), -1) ORDER BY seq DESC LIMIT 1",
+                        (session, latest[2], session, latest[2])).fetchone()
+                    detail = json.loads(assistant[0]).get("error") if assistant else None
+                    error = ({"kind": detail.get("type"), "message": detail.get("message")} if detail
+                             else {"kind": "opencode_failed", "message": "OpenCode reported a failed turn without error details"})
+                return {"turn": latest[0], "at": latest[1] / 1000, "error": error}
+        if "message" not in tables:
+            return None
         found = db.execute("SELECT id, time_created, data FROM message WHERE session_id = ? "
                            "ORDER BY time_created DESC, id DESC LIMIT 1", (session,)).fetchone()
     finally:
@@ -711,7 +748,8 @@ def cmd_dispatch(args):
         # The attempt exists durably before Herdr can start an external writer.
         db.execute("COMMIT")
         try:
-            created_result = backend.create(dispatch_id, cwd, command, extra_env, label)
+            with input_lock(dispatch_id):
+                created_result = backend.create(dispatch_id, cwd, command, extra_env, label)
         except (OSError, ValueError, TypeError, KeyError, RuntimeError):
             created_result = backend_result(UNCERTAIN, "Herdr create requires explicit reconciliation", category="unknown")
         db.execute("BEGIN IMMEDIATE")
@@ -1229,8 +1267,8 @@ def new_notice(session, before, seconds):
 
 # Where a host's input box is on its screen. A long text can still be arriving when its Enter
 # does, and the TUI then drops the Enter: the text stays in the box, unsent (#18). Only the box
-# tells: Codex repeats each submitted message in the transcript after the same `›`. Claude Code and
-# OpenCode have no reader yet (see the README), so they get one Enter, as before.
+# tells: Codex repeats each submitted message in the transcript after the same `›`.
+# OpenCode argv prefill is checked separately by Herdr; ordinary OpenCode/Claude input gets one Enter.
 ENTER_RETRIES = 2
 _BOX_SCROLL = re.compile(r"\s*[↑↓]$")
 # What a reader saw in an input box: its text, and whether lines above it are scrolled out of
@@ -1279,6 +1317,29 @@ def codex_input_box(screen):
     if "".join(text.split()) in _PLACEHOLDERS["codex"]:
         return EMPTY_BOX
     return InputBox(text, any(line.endswith("↑") for line in box))
+
+
+def opencode_input_box(screen):
+    """OpenCode 2.0.12's final left-bordered composer, separated from its model footer.
+
+    The textarea can scroll without a marker, so the visible text may be a suffix.
+    Only this composer frame, never transcript text, authorizes an extra Enter.
+    """
+    lines = screen.splitlines()
+    bottoms = [i for i, line in enumerate(lines) if re.fullmatch(r"\s*╹▀+\s*", line)]
+    if not bottoms:
+        return None
+    end = bottoms[-1]
+    start = end
+    while start and re.match(r"^\s*┃", lines[start - 1]):
+        start -= 1
+    content = [re.sub(r"^\s*┃\s?", "", line).strip() for line in lines[start:end]]
+    while content and not content[-1]:
+        content.pop()
+    if not content or " · " not in content[-1]:
+        return None
+    content.pop()  # agent/model footer belongs to the frame, not the typed text
+    return InputBox(" ".join(content).strip(), True)
 
 
 INPUT_BOXES = {"codex": codex_input_box}

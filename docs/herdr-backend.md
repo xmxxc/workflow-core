@@ -42,3 +42,11 @@ python3 wfc.py herdr-reconcile d-... --pane p-... --terminal t-... \
 ## 宿主 shell 的回调上下文
 
 Codex 0.169.0 的 Linux 实测中，主进程已收到正确 WFC 环境，但其生成的 shell snapshot 带有上一个 dispatch/state，回调因 attempt 不匹配而被拒绝。WFC brief 的 ask/done 命令现在显式设置当前 `WFC_DISPATCH` 和绝对 `WFC_STATE`；Unix 以引用后的 `env` 参数传入，Windows 以 PowerShell literal 设置后启动 Python。不依赖宿主 shell snapshot 的这两个环境值，不改变宿主全局配置。owner token 仍从继承环境读取并校验；失效凭据拒绝，不在 brief 中嵌入凭据或绕过 owner fencing。
+
+## OpenCode 2.0.12 首次 prompt
+
+Herdr 首次启动 OpenCode 后，WFC 使用 5 秒观察窗口读取其 composer（单次 RPC 另受现有超时限制）。仅当两次相隔 300ms 的画面都能识别同一个输入框，且可见文本是本次 argv brief 的完整内容或末尾，且包含本次 attempt时，补发一次 Enter；不重打文本。已提交、显示其他内容、无法识别或出现只读/blocked 提示时不补键。补键仍使用原 service/nonce/pane fencing，发送结果未知时保留 uncertain。创建过程持有 dispatch input lock，使 nudge/reply 与初始提交串行。
+
+OpenCode 2.0.12 的会话存储使用 `session_v2` / `session_message`。WFC 按实际表结构读取，兼容旧 `session` / `part` / `message`，只从顶层会话的 user brief 找到归属。新版错误需由终止 turn 的 failed idle 与同一轮 assistant error 共同确认；新用户输入、流式重试和成功恢复不重报旧错误。WFC 不修改 OpenCode 数据库或执行其迁移。
+
+Windows 用户已回传 OpenCode worker 与 Codex controller 的实际消息闭环，见 [实测记录](verification/windows-opencode-20261115.md)。该包首派曾需人工补 Enter；上述修复需在新的候选包上另做 Windows 复测。此适配不构成对 OpenCode 2.x 所有 CLI 参数和宿主版本的普遍支持声明。

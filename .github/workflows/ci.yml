@@ -81,3 +81,22 @@ jobs:
         env:
           WFC_TEST_PROGRAM: dist/portable with spaces/wfc.pyz
         run: python -m unittest discover -s tests -p test_herdr.py -v
+      - name: Prepare Windows candidate for manual testing
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Copy-Item docs/verification/windows-opencode-candidate.md 'dist/portable with spaces/README-candidate.md'
+          Copy-Item docs/herdr-backend.md,docs/host-launch.md 'dist/portable with spaces/'
+          git rev-parse HEAD | Set-Content -Encoding ascii 'dist/portable with spaces/COMMIT.txt'
+          Compress-Archive -Path 'dist/portable with spaces/*' -DestinationPath dist/wfc-opencode2-windows.zip
+          $hash = (Get-FileHash dist/wfc-opencode2-windows.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  wfc-opencode2-windows.zip" | Set-Content -Encoding ascii dist/SHA256SUMS
+      - name: Upload Windows candidate
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: windows-candidate-${{ github.sha }}
+          path: |
+            dist/wfc-opencode2-windows.zip
+            dist/SHA256SUMS
+          retention-days: 14
