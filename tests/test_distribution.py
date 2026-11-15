@@ -25,7 +25,8 @@ class WindowsDistribution(unittest.TestCase):
             env = {**os.environ, 'WFC_STATE': str(Path(tmp) / 'state'), 'PYTHONUTF8': '1'}
             native = subprocess.run([sys.executable, str(app), '--version'], env=env, capture_output=True)
             self.assertEqual(native.returncode, 0, native.stderr)
-            self.assertIn(b'0.4.6', native.stdout)
+            source_version = subprocess.check_output([sys.executable, str(ROOT / 'wfc.py'), '--version'])
+            self.assertEqual(native.stdout, source_version)
             if os.name == 'nt':
                 # Pin python on PATH to the interpreter used to build this test artifact.
                 env['PATH'] = str(Path(sys.executable).parent) + os.pathsep + env['PATH']

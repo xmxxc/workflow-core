@@ -25,8 +25,31 @@ jobs:
         run: |
           python build.py --out dist/wfc
           dist/wfc --version
-          (cd dist && sha256sum wfc > wfc.sha256)
+          python build.py --windows-dir dist/windows
+          cp dist/windows/wfc.pyz dist/wfc.pyz
+          cp docs/windows-distribution.md dist/windows/README-Windows.md
+          cp docs/herdr-backend.md docs/host-launch.md docs/windows-core.md dist/windows/
+          python - <<'PYZIP'
+          import os, zipfile
+          from pathlib import Path
+          root = Path("dist/windows")
+          target = Path("dist") / ("wfc-" + os.environ["GITHUB_REF_NAME"] + "-windows-x64.zip")
+          with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+              for path in sorted(root.iterdir()):
+                  archive.write(path, "wfc/" + path.name)
+          PYZIP
+          python dist/wfc.pyz --version
+          (cd dist && sha256sum wfc > wfc.sha256 && sha256sum wfc wfc.pyz "wfc-${GITHUB_REF_NAME}-windows-x64.zip" > SHA256SUMS)
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" dist/wfc dist/wfc.sha256 --title "wfc ${GITHUB_REF_NAME}" --generate-notes
+        run: |
+          flags=(--title "wfc ${GITHUB_REF_NAME}")
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            flags+=(--prerelease --latest=false)
+          fi
+          notes=(--generate-notes)
+          if [[ -f "docs/releases/${GITHUB_REF_NAME}.md" ]]; then
+            notes=(--notes-file "docs/releases/${GITHUB_REF_NAME}.md")
+          fi
+          gh release create "${GITHUB_REF_NAME}" dist/wfc dist/wfc.pyz dist/wfc.sha256 dist/SHA256SUMS "dist/wfc-${GITHUB_REF_NAME}-windows-x64.zip" "${flags[@]}" "${notes[@]}"
