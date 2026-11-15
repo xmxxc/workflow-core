@@ -16,6 +16,7 @@ VERSION = "0.4.6"
 
 
 def main(argv=None):
+    router.wfc_platform.configure_stdio()
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] in (["--version"], ["-V"]):
         print(f"wfc {VERSION}")

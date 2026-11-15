@@ -1,5 +1,7 @@
 # workflow-core
 
+> 开发候选已包含 Windows 核心层、可选 Herdr 后端和便携启动入口，参见 [Windows 分发与验收](docs/windows-distribution.md)。真实 Windows Codex 验收仍待完成；下文发布版 tmux 支持范围仍为基线。
+
 ![wfc · workflow-core：一个总控终端向三个 worker 终端派发任务，消息沿箭头传回](docs/assets/banner.png)
 
 [![CI](https://github.com/xmxxc/workflow-core/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/xmxxc/workflow-core/actions/workflows/ci.yml)
@@ -127,6 +129,8 @@ tmux attach -t wfc-d-1a2b3c4d   # 按 Ctrl-b d 离开
 ```
 
 命令的结果以 JSON 输出；例如 `dispatch` 会输出 dispatch id、标签和 tmux 会话名。
+
+宿主命令路径、runtime argv、环境优先级与启动诊断见 [宿主启动配置](docs/host-launch.md)。桌面、后台 shell 或既有 tmux server 的 PATH 不同时，可使用 `dispatch --launch-config launch.json` 或 `WFC_LAUNCH_CONFIG`。
 
 ## 支持的宿主
 

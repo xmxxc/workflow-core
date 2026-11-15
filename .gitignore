@@ -1,3 +1,5 @@
 .probe/
 __pycache__/
 dist/
+
+/.herdr-test/

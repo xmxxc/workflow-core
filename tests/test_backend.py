@@ -1,6 +1,7 @@
 """Backend contract tests using a non-terminal controlled execution backend."""
 
 import argparse
+import gc
 import json
 import os
 import sqlite3
@@ -70,6 +71,10 @@ class BackendContract(unittest.TestCase):
             os.environ.pop("WFC_STATE", None)
         else:
             os.environ["WFC_STATE"] = self.previous_state
+        # CLI handlers close their connections at process exit. These in-process
+        # contract calls can leave SQLite reference cycles; release them before
+        # removing the fixture, as Windows forbids deleting an open database.
+        gc.collect()
         self.tmp.cleanup()
 
     def test_submit_refused_and_uncertain_stay_generic(self):

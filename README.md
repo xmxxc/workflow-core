@@ -1,5 +1,7 @@
 # workflow-core
 
+> Development candidate: native Windows core, optional Herdr backend and portable entrypoints are documented in [Windows distribution and acceptance](docs/windows-distribution.md). Real Windows Codex acceptance is pending; the released tmux support scope below remains the baseline.
+
 ![wfc · workflow-core: one controller terminal dispatching to three worker terminals, with messages flowing back](docs/assets/banner.png)
 
 [![CI](https://github.com/xmxxc/workflow-core/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/xmxxc/workflow-core/actions/workflows/ci.yml)
@@ -145,6 +147,8 @@ Commands print their result as JSON; `dispatch`, for one, prints the dispatch id
 | **Dropped Enter pressed again** | Yes, at most twice | No, one Enter | No, one Enter |
 
 Pin `--model` for OpenCode: its default model can be a rate-limited free one.
+
+Host executable paths, explicit runtime argv, environment precedence and launch diagnostics are documented in [Host launch configuration](docs/host-launch.md). Use `dispatch --launch-config launch.json` or `WFC_LAUNCH_CONFIG` when a desktop/background shell or an existing tmux server has a different PATH.
 
 ## Command reference
 
