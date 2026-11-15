@@ -1,5 +1,7 @@
 # workflow-core
 
+> 开发候选已包含 Windows 核心层、可选 Herdr 后端和便携启动入口，参见 [Windows 分发与验收](docs/windows-distribution.md)。真实 Windows Codex 验收仍待完成；下文发布版 tmux 支持范围仍为基线。
+
 ![wfc · workflow-core：一个总控终端向三个 worker 终端派发任务，消息沿箭头传回](docs/assets/banner.png)
 
 [![CI](https://github.com/xmxxc/workflow-core/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/xmxxc/workflow-core/actions/workflows/ci.yml)
