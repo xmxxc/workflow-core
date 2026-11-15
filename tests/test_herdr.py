@@ -25,6 +25,7 @@ class HerdrContract(unittest.TestCase):
         config.write_text('[terminal]\ndefault_shell = ' + json.dumps('cmd.exe' if os.name == 'nt' else '/bin/sh') + '\n', encoding='utf-8')
         self.env = {**os.environ, 'HERDR_SOCKET_PATH': self.endpoint, 'HERDR_CONFIG_PATH': str(config),
                     'XDG_CONFIG_HOME': str(self.root / 'config'), 'XDG_STATE_HOME': str(self.root / 'herdr-state'),
+                    'XDG_DATA_HOME': str(self.root / 'data'), 'XDG_CACHE_HOME': str(self.root / 'cache'),
                     'WFC_STATE': str(self.root / 'wfc-state'), 'CODEX_HOME': str(self.root / 'codex'),
                     'WFC_CLAUDE_CONFIG': str(self.root / 'no-claude.json'), 'WFC_MAX_TURN_SECONDS': '0',
                     'PYTHONUTF8': '1', 'TERM': 'xterm-256color'}
@@ -32,6 +33,7 @@ class HerdrContract(unittest.TestCase):
         self.env.pop('WFC_OWNER_TOKEN', None)
         self.env.pop('WFC_CONTROLLER_TOKEN', None)
         self.env.pop('CODEX_THREAD_ID', None)
+        self.env.pop('WFC_OPENCODE_DB', None)
         self.log = (self.root / 'server.log').open('w', encoding='utf-8')
         self.addCleanup(self.log.close)
         self.server = subprocess.Popen([BINARY, 'server'], env=self.env, stdout=self.log, stderr=self.log)
@@ -85,6 +87,115 @@ class HerdrContract(unittest.TestCase):
         value = json.loads(result.stdout)
         self.assertEqual(value['result'], 'accepted', value)
         return value['data']
+
+    def test_opencode_initial_prefill_is_submitted_without_retyping(self):
+        self.host.write_text(r'''import os,subprocess,sys,textwrap,time
+text=sys.argv[sys.argv.index('--prompt')+1]
+print('┃',flush=True)
+for line in textwrap.wrap(text,64):print('┃  '+line,flush=True)
+print('┃\n┃  Build · controlled OpenCode\n╹'+'▀'*70,flush=True)
+line=sys.stdin.readline()
+if line.strip():raise RuntimeError('initial prompt was typed twice')
+subprocess.run([sys.executable,PROGRAM,'ask','INITIAL_PROMPT_SUBMITTED',
+                '--attempt',text.split('--attempt ')[1].split()[0]],check=True)
+time.sleep(60)
+'''.replace('PROGRAM',repr(str(PROGRAM))),encoding='utf-8')
+        self.launch.write_text(json.dumps({'hosts':{'opencode':{'command':[str(self.host)],
+                                      'runtime':[sys.executable,'-u']}}}),encoding='utf-8')
+        dispatch = self.cli('dispatch','--backend','herdr','--herdr-endpoint',self.endpoint,
+                            '--host','opencode','--task',str(self.task),'--cwd',str(self.root),
+                            '--report',str(self.report),'--launch-config',str(self.launch))['dispatch']
+        messages = self.cli('wait','--timeout','1')['messages']
+        self.assertTrue(any(m.get('question')=='INITIAL_PROMPT_SUBMITTED' for m in messages),messages)
+        self.assertEqual(self.cli('close',dispatch)['result'],'completed')
+
+    def test_initial_prefill_does_not_submit_empty_or_other_drafts(self):
+        for index, draft in enumerate(("", "unrelated user draft", "controller")):
+            with self.subTest(draft=draft):
+                touched = self.root / f"unexpected-enter-{index}"
+                self.host.write_text(r'''import sys,threading,time
+from pathlib import Path
+print('┃  '+DRAFT+'\n┃\n┃  Build · controlled OpenCode\n╹'+'▀'*70,flush=True)
+def read():
+    line=sys.stdin.readline()
+    if line:Path(TOUCHED).write_text(line,encoding='utf-8')
+threading.Thread(target=read,daemon=True).start()
+time.sleep(60)
+'''.replace('DRAFT',repr(draft)).replace('TOUCHED',repr(str(touched))),encoding='utf-8')
+                self.launch.write_text(json.dumps({'hosts':{'opencode':{'command':[str(self.host)],
+                                              'runtime':[sys.executable,'-u']}}}),encoding='utf-8')
+                dispatch=self.cli('dispatch','--backend','herdr','--herdr-endpoint',self.endpoint,
+                                  '--host','opencode','--task',str(self.task),'--cwd',str(self.root),
+                                  '--report',str(self.report),'--launch-config',str(self.launch))['dispatch']
+                self.assertFalse(touched.exists())
+                self.assertEqual(self.cli('close',dispatch)['result'],'completed')
+
+    def test_blocked_host_rejects_enter_but_allows_interrupt(self):
+        from unittest.mock import patch
+        import herdr_backend
+        dispatch = self.dispatch()
+        handle = self.cli('status','--dispatch',dispatch)['dispatches'][0]['backendHandle']
+        original = herdr_backend._snapshot_guard
+        def blocked(snapshot, guard):
+            pane = original(snapshot, guard)
+            return {**pane, 'agent_status': 'blocked'}
+        payload = {'endpoint':self.endpoint,'service':handle['service'],'guard':handle,
+                   'method':'pane.send_keys','params':{'pane_id':handle['pane'],'keys':['Enter']}}
+        with patch.object(herdr_backend, '_snapshot_guard', side_effect=blocked):
+            result = herdr_backend.helper(payload)
+            self.assertEqual((result['result'],result.get('category')),('refused','permission_required'))
+            payload['params']['keys'] = ['C-c']
+            self.assertEqual(herdr_backend.helper(payload)['result'],'accepted')
+        self.assertEqual(self.cli('close',dispatch)['result'],'completed')
+
+    def test_initial_prefill_and_concurrent_nudge_do_not_mix(self):
+        gate = self.root / 'draw-composer'
+        self.host.write_text(r'''import os,subprocess,sys,textwrap,time
+from pathlib import Path
+deadline=time.monotonic()+8
+while not Path(GATE).exists() and time.monotonic()<deadline:time.sleep(.01)
+if not Path(GATE).exists():raise TimeoutError('composer gate was not released')
+text=sys.argv[sys.argv.index('--prompt')+1]
+for line in textwrap.wrap(text,64):print('┃  '+line,flush=True)
+print('┃\n┃  Build · controlled OpenCode\n╹'+'▀'*70,flush=True)
+line=sys.stdin.readline()
+if line.strip():raise RuntimeError('nudge mixed into initial prompt')
+subprocess.run([sys.executable,PROGRAM,'ask','INITIAL_PROMPT_SUBMITTED',
+                '--attempt',text.split('--attempt ')[1].split()[0]],check=True)
+time.sleep(60)
+'''.replace('PROGRAM',repr(str(PROGRAM))).replace('GATE',repr(str(gate))),encoding='utf-8')
+        self.launch.write_text(json.dumps({'hosts':{'opencode':{'command':[str(self.host)],
+                                      'runtime':[sys.executable,'-u']}}}),encoding='utf-8')
+        child = subprocess.Popen([sys.executable,str(PROGRAM),'dispatch','--backend','herdr',
+                                  '--herdr-endpoint',self.endpoint,'--host','opencode','--task',str(self.task),
+                                  '--cwd',str(self.root),'--report',str(self.report),'--launch-config',str(self.launch)],
+                                 env=self.env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding='utf-8')
+        nudge = None
+        try:
+            deadline = time.monotonic()+5
+            while time.monotonic()<deadline:
+                rows = self.cli('status')['dispatches']
+                if rows and rows[0].get('backendHandle',{}).get('state')=='active':break
+                time.sleep(.02)
+            self.assertTrue(rows)
+            self.assertEqual(rows[0].get('backendHandle',{}).get('state'),'active')
+            dispatch = rows[0]['dispatch']
+            nudge = subprocess.Popen([sys.executable,str(PROGRAM),'nudge',dispatch,'--text','concurrent input'],
+                                     env=self.env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding='utf-8')
+            time.sleep(.4)
+            gate.touch()
+            out,err=child.communicate(timeout=15)
+            self.assertEqual(child.returncode,0,err)
+            _,err=nudge.communicate(timeout=15)
+            self.assertEqual(nudge.returncode,0,err)
+            messages=self.cli('wait','--timeout','1')['messages']
+            self.assertTrue(any(m.get('question')=='INITIAL_PROMPT_SUBMITTED' for m in messages),messages)
+            self.assertEqual(self.cli('close',dispatch)['result'],'completed')
+        finally:
+            for process in (child,nudge):
+                if process is not None and process.poll() is None:
+                    process.kill()
+                    process.communicate()
 
     def test_create_read_and_close_use_owned_persistent_unit(self):
         dispatch = self.dispatch()

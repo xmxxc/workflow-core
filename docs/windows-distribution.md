@@ -1,6 +1,6 @@
 # Windows 便携分发与验收
 
-这是 #10 的 Windows 预发布测试版，版本为 0.4.7-rc.1，包含 #8、#9、#17、#19 的合并改动。原生 Windows 的真实 Codex 闭环尚未获得实机证据，不标记 live-verified。默认后端仍为 tmux；Windows 派发显式选择 `--backend herdr`。
+这是 #10 的 Windows 预发布测试版，版本为 0.4.7-rc.1，包含 #8、#9、#17、#19 的合并改动。原生 Windows 的 Codex worker 闭环仍待实机验证。用户已回传 OpenCode worker + Codex Desktop controller 的同聊天唤醒与 ack 闭环，见 [实测记录](verification/windows-opencode-20261115.md)；该次首派曾需人工 Enter。OpenCode 2.x 修复的 [候选包复测](verification/windows-opencode-candidate.md) 另行记录。默认后端仍为 tmux；Windows 派发显式选择 `--backend herdr`。
 
 ## 下载
 

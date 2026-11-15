@@ -145,7 +145,7 @@ def helper(payload):
             pane = _snapshot_guard(snapshot, guard)
             if pane is None:
                 return {'result': 'accepted', 'service': service, 'absent': True, 'data': {'snapshot': snapshot}}
-            if method == 'pane.send_input' and pane.get('agent_status') == 'blocked':
+            if (method == 'pane.send_input' or (method == 'pane.send_keys' and params.get('keys') == ['Enter'])) and pane.get('agent_status') == 'blocked':
                 return {'result': 'refused', 'category': 'permission_required',
                         'diagnostic': 'Herdr reports a blocked host; inspect and resolve its prompt'}
         data = request(method, params)
@@ -295,9 +295,39 @@ class HerdrBackend:
             time.sleep(.02)
             evidence = host_launch.read_receipt(receipt)
         if evidence and evidence['category'] == 'started':
+            if row['host'] == 'opencode' and len(command) > 1 and command[-2] == '--prompt':
+                return {**self._activate_initial_prompt(dispatch_id, command[-1]), 'receipt': str(receipt)}
             return {'result': 'accepted', 'receipt': str(receipt)}
         return {'result': 'uncertain', 'category': 'unknown', 'receipt': str(receipt),
                 'diagnostic': (evidence or {}).get('diagnostic', 'host startup not confirmed')}
+
+    def _activate_initial_prompt(self, dispatch_id, text):
+        """Confirm the argv prefill in two stable composer snapshots; send only Enter once."""
+        import router
+        previous = None
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            observed = self.read(dispatch_id)
+            if observed['result'] != 'accepted':
+                return observed
+            screen = observed.get('screen', '')
+            notice = router.read_only_notice(screen)
+            if notice:
+                return {'result': 'refused', 'category': 'permission_required', 'diagnostic': notice}
+            box = router.opencode_input_box(screen)
+            if box is not None and box == previous:
+                shown = ''.join(box.text.split())
+                attempt = self._load(dispatch_id)['current_attempt']
+                if not shown or attempt not in shown or not ''.join(text.split()).endswith(shown):
+                    return {'result': 'accepted'}  # already submitted or another input; do not touch it
+                handle = self._handle(dispatch_id)
+                result = self._call(handle, 'pane.send_keys', {'pane_id': handle['pane'], 'keys': ['Enter']}, guard=True)
+                if result.get('absent'):
+                    return {'result': 'uncertain', 'diagnostic': 'Herdr unit disappeared before initial Enter'}
+                return result
+            previous = box
+            time.sleep(.3)
+        return {'result': 'accepted'}  # process launch was confirmed; unreadable UI authorizes no extra key
 
     def _writer_stopped(self, handle):
         evidence = host_launch.read_receipt(handle.get('receipt'))

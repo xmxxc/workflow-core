@@ -1284,6 +1284,31 @@ class Resume(unittest.TestCase):
         typed = [c for c in self.env.host_calls() if c[:2] == ["tmux", "send-keys"] and "-l" in c]
         self.assertIn(str(self.env.report), typed[-1][-1])
 
+    def test_opencode_v2_session_is_discovered_for_resume(self):
+        self.env.screen.write_text("> ready\n")
+        dispatch = self.env.dispatch("opencode")
+        # OpenCode v2.0.12 tag 2670273: session/sql.ts + schema/session-message.ts.
+        with sqlite3.connect(self.env.bin.parent / "opencode.db") as db:
+            db.executescript("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT, time_created INTEGER);"
+                             "CREATE TABLE session_message (id TEXT, session_id TEXT, type TEXT, seq INTEGER, "
+                             "time_created INTEGER, data TEXT);")
+            db.execute("INSERT INTO session_v2 VALUES ('ses_v2-main', NULL, 2)")
+            brief = f"You are a worker dispatched by the controller (dispatch {dispatch}). Read ..."
+            db.execute("INSERT INTO session_message VALUES ('msg_user', 'ses_v2-main', 'user', 1, 2, ?)",
+                       (json.dumps({"text": brief, "files": [], "agents": [], "skills": []}),))
+            for name, parent, kind, text in (("ses_child", "ses_v2-main", "user", brief),
+                                              ("ses_controller", None, "user", "[router] quoted " + brief),
+                                              ("ses_assistant", None, "assistant", brief),
+                                              ("ses_synthetic", None, "synthetic", brief)):
+                db.execute("INSERT INTO session_v2 VALUES (?, ?, 1)", (name, parent))
+                db.execute("INSERT INTO session_message VALUES (?, ?, ?, 1, 1, ?)",
+                           ("msg_" + name, name, kind, json.dumps({"text": text})))
+        self.env.end_session(dispatch)
+        self.env.json("resume", dispatch, env={"FAKE_SCREEN": str(self.env.screen)}, timeout=20)
+        [_, again] = self.launch(dispatch)
+        opencode = again[again.index("opencode"):]
+        self.assertEqual(opencode[opencode.index("-s") + 1], "ses_v2-main")
+
     def test_a_resumed_worker_is_watched_again(self):
         dispatch = self.env.dispatch("claude")
         self.env.end_session(dispatch)
@@ -2182,6 +2207,38 @@ class HostErrors(unittest.TestCase):
         [message] = self.wait()["messages"]
         self.assertEqual((message["type"], message["kind"], message["message"]),
                          ("blocked", "rate_limit", "You've hit your 5-hour limit · resets 3am"))
+
+    def test_opencode_v2_failed_idle_reports_structured_error(self):
+        dispatch = self.env.dispatch("opencode")
+        now = int(time.time() * 1000)
+        with sqlite3.connect(self.env.bin.parent / "opencode.db") as db:
+            db.executescript("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT, time_created INTEGER);"
+                             "CREATE TABLE session_message (id TEXT, session_id TEXT, type TEXT, seq INTEGER, "
+                             "time_created INTEGER, data TEXT);")
+            db.execute("INSERT INTO session_v2 VALUES ('ses_v2', NULL, ?)", (now,))
+            brief = f"You are a worker dispatched by the controller (dispatch {dispatch}). Read"
+            for seq, kind, data in ((1, "user", {"text": brief}),
+                                    (2, "assistant", {"error": {"type": "APIError", "message": "Budget exhausted"}}),
+                                    (3, "idle", {"outcome": "failed"})):
+                db.execute("INSERT INTO session_message VALUES (?, 'ses_v2', ?, ?, ?, ?)",
+                           (f"msg_{seq}", kind, seq, now + seq, json.dumps(data)))
+        [message] = self.wait(timeout="1")["messages"]
+        self.assertEqual((message["type"], message["kind"], message["message"]),
+                         ("blocked", "APIError", "Budget exhausted"))
+        with sqlite3.connect(self.env.bin.parent / "opencode.db") as db:
+            # A recovered turn and a newer in-flight assistant must not replay that error.
+            for seq, kind, data in ((4, "user", {"text": "retry"}),
+                                    (5, "assistant", {"error": {"type": "APIError", "message": "transient"}}),
+                                    (6, "idle", {"outcome": "succeeded"})):
+                db.execute("INSERT INTO session_message VALUES (?, 'ses_v2', ?, ?, ?, ?)",
+                           (f"msg_{seq}", kind, seq, now + seq, json.dumps(data)))
+        self.assertTrue(self.wait(timeout=".5")["timedOut"])
+        with sqlite3.connect(self.env.bin.parent / "opencode.db") as db:
+            for seq, kind, data in ((7, "user", {"text": "next turn"}),
+                                    (8, "assistant", {"error": {"type": "APIError", "message": "still retrying"}})):
+                db.execute("INSERT INTO session_message VALUES (?, 'ses_v2', ?, ?, ?, ?)",
+                           (f"msg_{seq}", kind, seq, now + seq, json.dumps(data)))
+        self.assertTrue(self.wait(timeout=".5")["timedOut"])
 
     def test_opencode_error_is_reported_as_blocked(self):
         dispatch = self.env.dispatch("opencode")

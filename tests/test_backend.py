@@ -2,6 +2,9 @@
 
 import argparse
 import gc
+import io
+from contextlib import redirect_stdout
+from unittest.mock import patch
 import json
 import os
 import sqlite3
@@ -76,6 +79,35 @@ class BackendContract(unittest.TestCase):
         # removing the fixture, as Windows forbids deleting an open database.
         gc.collect()
         self.tmp.cleanup()
+
+    def test_opencode_v2_records_reach_public_wait_on_native_platform(self):
+        task = self.cwd / "task.md"
+        task.write_text("task", encoding="utf-8")
+        report = self.cwd / "report.md"
+        host_db = self.cwd / "opencode.db"
+        with patch.dict(os.environ, {"WFC_OPENCODE_DB": str(host_db)}):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                router.main(["dispatch", "--host", "opencode", "--backend", "fake", "--task", str(task),
+                             "--cwd", str(self.cwd), "--report", str(report)])
+            dispatch = json.loads(output.getvalue())["dispatch"]
+            now = int(time.time() * 1000)
+            with sqlite3.connect(host_db) as db:
+                db.executescript("CREATE TABLE session_v2 (id TEXT, parent_id TEXT, time_created INTEGER);"
+                                 "CREATE TABLE session_message (id TEXT, session_id TEXT, type TEXT, seq INTEGER, "
+                                 "time_created INTEGER, data TEXT);")
+                db.execute("INSERT INTO session_v2 VALUES ('ses_native', NULL, ?)", (now,))
+                for seq, kind, data in ((1, "user", {"text": f"You are a worker dispatched by the controller (dispatch {dispatch}). Read"}),
+                                        (2, "assistant", {"error": {"type": "APIError", "message": "native v2 error"}}),
+                                        (3, "idle", {"outcome": "failed"})):
+                    db.execute("INSERT INTO session_message VALUES (?, 'ses_native', ?, ?, ?, ?)",
+                               (f"msg_{seq}", kind, seq, now + seq, json.dumps(data)))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                router.main(["wait", "--timeout", "0"])
+            [message] = json.loads(output.getvalue())["messages"]
+            self.assertEqual((message["type"], message["kind"], message["message"]),
+                             ("blocked", "APIError", "native v2 error"))
 
     def test_submit_refused_and_uncertain_stay_generic(self):
         row = {"id": "d-fake", "backend": "fake", "host": "structured"}
