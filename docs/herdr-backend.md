@@ -19,7 +19,7 @@ Windows 使用 `python wfc.py` 或 `python wfc.pyz`。`--herdr-endpoint` 为 Her
 
 创建前先提交 pending lifecycle 与私有启动收据；分阶段保存 Herdr service PID/creation identity、workspace、pane、terminal、ownership nonce 和 WFC attempt。服务在每次 API 请求之间重新校验身份。每次单元操作读取完整 session snapshot，核对 workspace nonce 与 pane/terminal；不存在事件订阅游标，因此断连后不用缺失事件推断成功。read 返回 revision 和截断标志，终端文本不是消息确认依据。
 
-`submit` 成功仅表示 Herdr 接受输入。任务完成仍需 worker 的 `done`。超时、断连和不完整响应保留 `uncertain`，不会自动重放；只读或 blocked 宿主拒绝发送。interrupt 的 accepted 不表示 writer 已停止。close 仅关闭该 dispatch 的 pane，不关闭共享 sibling；必须用启动收据或 PID/creation identity 确认旧 writer 停止后才返回 completed。恢复创建新 attempt 前再次核对旧 writer；旧 attempt 的回调继续被核心拒绝。
+`submit` 成功仅表示 Herdr 接受输入。任务完成仍需 worker 的 `done`。超时、断连和不完整响应保留 `uncertain`，不会自动重放；只读或 blocked 宿主拒绝发送。interrupt 的 accepted 不表示 writer 已停止。close 仅关闭该 dispatch 的 pane，不关闭共享 sibling；必须用启动收据或 PID/creation identity 确认旧 writer 停止后才返回 completed。恢复创建新 attempt 前再次核对旧 writer；新 worker 在 pending resume/handoff 期间可持久提交精确匹配该 attempt 的问题，但轮次保持 unknown，回答仍需等待启动确认；旧 attempt 的回调继续被核心拒绝。
 
 服务重启会保持 unknown，不能仅凭相同 pane 字符串接替。操作者先检查 Herdr snapshot 与进程，再显式绑定已有归属单元：
 

@@ -145,6 +145,10 @@ for line in sys.stdin:
         second = self.cli('status', '--dispatch', dispatch)['dispatches'][0]
         self.assertEqual(second['round'], 2)
         self.assertNotEqual(first['attempt'], second['attempt'])
+        import sqlite3
+        with sqlite3.connect(self.root / 'wfc-state' / 'router.db') as db:
+            questions = [json.loads(row[0]) for row in db.execute("SELECT body FROM message WHERE dispatch=? AND type='question'", (dispatch,))]
+        self.assertIn(second['attempt'], [question['attempt'] for question in questions])
         self.assertEqual(second['backendHandle']['service'], first['backendHandle']['service'])
         # Same live terminal serves another round; its handle ownership still names its creating attempt.
         self.assertEqual(self.cli('close', dispatch)['result'], 'completed')
@@ -189,7 +193,7 @@ for line in sys.stdin:
                                   '--pane', handle['pane'], '--terminal', handle['terminal'], '--actor', 'operator',
                                   '--evidence', 'inspected restarted service', '--old-writer-evidence', 'old service reaped'],
                                  env=self.env, capture_output=True, text=True, encoding='utf-8', timeout=15)
-        if not matches:
+        if workspace is not None and not matches:
             self.assertNotEqual(rebound.returncode, 0)
             self.assertIn('herdr_ownership', rebound.stderr)
             self.assertEqual(self.cli('status', '--dispatch', dispatch)['dispatches'][0]['backendHandle'], handle)

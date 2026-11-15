@@ -1021,7 +1021,7 @@ def cmd_ask(args):
     dispatch_id = current_dispatch(db)
     db.execute("BEGIN IMMEDIATE")
     require_owner(db, owner_scope(db, dispatch_id), owner_token(args), "ask")
-    identity = db.execute("SELECT scope, role, current_round, current_attempt, report FROM dispatch WHERE id = ?",
+    identity = db.execute("SELECT scope, role, current_round, current_attempt, report, backend FROM dispatch WHERE id = ?",
                           (dispatch_id,)).fetchone()
     body = {"question": args.question, "options": options, "scope": identity["scope"],
             "role": identity["role"], "round": identity["current_round"],
@@ -1046,7 +1046,15 @@ def cmd_ask(args):
                              (dispatch_id, identity["report"])).fetchone()[0]
     current_round = db.execute("SELECT state FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
                                (dispatch_id, identity["current_round"], identity["current_attempt"])).fetchone()
-    if current_round is None or current_round["state"] != "running":
+    # A fast newly launched Herdr worker may ask before resume's external call
+    # returns. Record its exact-attempt question without promoting unknown state
+    # or authorizing reply/input until the pending launch has settled.
+    pending_launch = (identity["backend"] == "herdr" and current_round is not None
+                      and current_round["state"] == "unknown" and args.attempt == identity["current_attempt"]
+                      and db.execute("SELECT 1 FROM lifecycle_event WHERE dispatch = ? AND round = ? "
+                                     "AND to_attempt = ? AND operation IN ('resume', 'handoff') AND result = 'pending'",
+                                     (dispatch_id, identity["current_round"], args.attempt)).fetchone())
+    if (current_round is None or current_round["state"] != "running") and not pending_launch:
         db.execute("ROLLBACK")
         raise SystemExit(f"attempt {args.attempt or identity['current_attempt']} is no longer accepted for {dispatch_id}; "
                          f"its state is {current_round['state'] if current_round else 'unknown'}")
