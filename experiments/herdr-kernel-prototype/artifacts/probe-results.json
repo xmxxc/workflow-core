@@ -1,0 +1,307 @@
+[
+  {
+    "probe": "startup_unicode_spaces_isatty_cursor",
+    "identity": {
+      "nonce": "2d39dd80-01b3-4419-a0da-32287fa3a11a",
+      "pid": 6
+    },
+    "view": {
+      "cols": 100,
+      "eof": false,
+      "exit": null,
+      "read_error": null,
+      "rows": 30,
+      "screen": "Primary",
+      "text": "START {\"argv\": [\"space argument 中文\", \"emoji 🐈\"], \"isatty\": [true, true, true], \"pid\": 6}\nRIGHT"
+    }
+  },
+  {
+    "probe": "literal_input",
+    "view": {
+      "cols": 100,
+      "eof": false,
+      "exit": null,
+      "read_error": null,
+      "rows": 30,
+      "screen": "Primary",
+      "text": "START {\"argv\": [\"space argument 中文\", \"emoji 🐈\"], \"isatty\": [true, true, true], \"pid\": 6}\nRIGHT\nliteral ; $(touch /tmp/SHOULD_NOT_EXIST) \" 中文 🐈\nECHO \"literal ; $(touch /tmp/SHOULD_NOT_EXIST) \\\" 中文 🐈\""
+    }
+  },
+  {
+    "probe": "wrong_identity_input",
+    "response": {
+      "error": "wrong_nonce",
+      "generation": "44d39141-efae-455b-a13b-8604a687b366",
+      "id": 7,
+      "ok": false
+    }
+  },
+  {
+    "probe": "wrong_identity_resize",
+    "response": {
+      "error": "wrong_nonce",
+      "generation": "44d39141-efae-455b-a13b-8604a687b366",
+      "id": 8,
+      "ok": false
+    }
+  },
+  {
+    "probe": "wrong_identity_close",
+    "response": {
+      "error": "wrong_nonce",
+      "generation": "44d39141-efae-455b-a13b-8604a687b366",
+      "id": 9,
+      "ok": false
+    }
+  },
+  {
+    "probe": "rejected_actions_preserved_live_control",
+    "view": {
+      "cols": 100,
+      "eof": false,
+      "exit": null,
+      "read_error": null,
+      "rows": 30,
+      "screen": "Primary",
+      "text": "START {\"argv\": [\"space argument 中文\", \"emoji 🐈\"], \"isatty\": [true, true, true], \"pid\": 6}\nRIGHT\nliteral ; $(touch /tmp/SHOULD_NOT_EXIST) \" 中文 🐈\nECHO \"literal ; $(touch /tmp/SHOULD_NOT_EXIST) \\\" 中文 🐈\""
+    }
+  },
+  {
+    "probe": "alternate_screen",
+    "view": {
+      "cols": 100,
+      "eof": false,
+      "exit": null,
+      "read_error": null,
+      "rows": 30,
+      "screen": "Alternate",
+      "text": "ALT_SCREEN"
+    }
+  },
+  {
+    "probe": "primary_screen_restore",
+    "view": {
+      "cols": 100,
+      "eof": false,
+      "exit": null,
+      "read_error": null,
+      "rows": 30,
+      "screen": "Primary",
+      "text": "START {\"argv\": [\"space argument 中文\", \"emoji 🐈\"], \"isatty\": [true, true, true], \"pid\": 6}\nRIGHT\nliteral ; $(touch /tmp/SHOULD_NOT_EXIST) \" 中文 🐈\nECHO \"literal ; $(touch /tmp/SHOULD_NOT_EXIST) \\\" 中文 🐈\"\nalt\nMAIN_RESTORED"
+    }
+  },
+  {
+    "probe": "resize_kernel_and_parser",
+    "view": {
+      "cols": 120,
+      "eof": false,
+      "exit": null,
+      "read_error": null,
+      "rows": 35,
+      "screen": "Primary",
+      "text": "START {\"argv\": [\"space argument 中文\", \"emoji 🐈\"], \"isatty\": [true, true, true], \"pid\": 6}\nRIGHT\nliteral ; $(touch /tmp/SHOULD_NOT_EXIST) \" 中文 🐈\nECHO \"literal ; $(touch /tmp/SHOULD_NOT_EXIST) \\\" 中文 🐈\"\nalt\nMAIN_RESTORED\nsize\nSIZE os.terminal_size(columns=120, lines=35)"
+    }
+  },
+  {
+    "probe": "ctrl_c",
+    "view": {
+      "cols": 120,
+      "eof": false,
+      "exit": null,
+      "read_error": null,
+      "rows": 35,
+      "screen": "Primary",
+      "text": "START {\"argv\": [\"space argument 中文\", \"emoji 🐈\"], \"isatty\": [true, true, true], \"pid\": 6}\nRIGHT\nliteral ; $(touch /tmp/SHOULD_NOT_EXIST) \" 中文 🐈\nECHO \"literal ; $(touch /tmp/SHOULD_NOT_EXIST) \\\" 中文 🐈\"\nalt\nMAIN_RESTORED\nsize\nSIZE os.terminal_size(columns=120, lines=35)\n^CCTRL_C_HANDLED"
+    }
+  },
+  {
+    "probe": "natural_exit",
+    "view": {
+      "cols": 120,
+      "eof": true,
+      "exit": {
+        "code": 7,
+        "signal": null
+      },
+      "read_error": null,
+      "rows": 35,
+      "screen": "Primary",
+      "text": "START {\"argv\": [\"space argument 中文\", \"emoji 🐈\"], \"isatty\": [true, true, true], \"pid\": 6}\nRIGHT\nliteral ; $(touch /tmp/SHOULD_NOT_EXIST) \" 中文 🐈\nECHO \"literal ; $(touch /tmp/SHOULD_NOT_EXIST) \\\" 中文 🐈\"\nalt\nMAIN_RESTORED\nsize\nSIZE os.terminal_size(columns=120, lines=35)\n^CCTRL_C_HANDLED\nexit:7"
+    }
+  },
+  {
+    "probe": "reused_unit_name_nonce_fence",
+    "response": {
+      "error": "wrong_nonce",
+      "generation": "44d39141-efae-455b-a13b-8604a687b366",
+      "id": 26,
+      "ok": false
+    },
+    "current": {
+      "nonce": "b7e7d42b-9ef7-4e7f-9696-0f49aaf9f2c2",
+      "pid": 8
+    }
+  },
+  {
+    "probe": "close_child_grandchild_cleanup",
+    "pids": [
+      8,
+      10,
+      11
+    ],
+    "all_terminated": true
+  },
+  {
+    "probe": "escaped_process_group_cleanup_gap",
+    "parent": 12,
+    "escaped_pid": 14,
+    "escaped_descendant_survived_close": true,
+    "result": "unsupported containment; explicit test cleanup follows"
+  },
+  {
+    "probe": "natural_parent_exit_descendant_cleanup_gap",
+    "parent": 15,
+    "descendant": 17,
+    "descendant_survived_close": true,
+    "result": "poll reaped leader; close avoids signaling reusable group identity"
+  },
+  {
+    "probe": "stale_generation_close",
+    "response": {
+      "error": "stale_generation",
+      "generation": "5182a0b9-6887-48c9-9bd6-6def9808b81b",
+      "id": 3,
+      "ok": false
+    }
+  },
+  {
+    "probe": "stale_generation_resize",
+    "response": {
+      "error": "stale_generation",
+      "generation": "5182a0b9-6887-48c9-9bd6-6def9808b81b",
+      "id": 4,
+      "ok": false
+    }
+  },
+  {
+    "probe": "crash_restart_no_replay",
+    "old_generation": "44d39141-efae-455b-a13b-8604a687b366",
+    "new_generation": "5182a0b9-6887-48c9-9bd6-6def9808b81b",
+    "rejected": {
+      "error": "stale_generation",
+      "generation": "5182a0b9-6887-48c9-9bd6-6def9808b81b",
+      "id": 2,
+      "ok": false
+    },
+    "old_pid_terminated": true,
+    "view": {
+      "cols": 100,
+      "eof": false,
+      "exit": null,
+      "read_error": null,
+      "rows": 30,
+      "screen": "Primary",
+      "text": "START {\"argv\": [\"space argument 中文\", \"emoji 🐈\"], \"isatty\": [true, true, true], \"pid\": 22}\nRIGHT\npost_restart_control\nECHO \"post_restart_control\""
+    },
+    "lost_ack_marker": "/tmp/wfc-herdr-kernel-prototype-r1/unknown-input-1794745658237024148",
+    "marker_content": "APPLIED_ONCE\n",
+    "recovery": "lost; cannot restore prior PTY"
+  },
+  {
+    "probe": "crash_ignoring_hangup_containment_gap",
+    "pid": 24,
+    "survived_server_sigkill": true,
+    "result": "no crash-time process ownership guard; explicit test cleanup follows"
+  },
+  {
+    "probe": "controlled_cleanup",
+    "owned_pids": [
+      6,
+      8,
+      10,
+      11,
+      12,
+      14,
+      15,
+      17,
+      18,
+      22,
+      24
+    ],
+    "all_terminated": true
+  },
+  {
+    "probe": "wfc_execution_contract_and_real_done_callback",
+    "dispatch": {
+      "dispatch": "d-dcd9f390",
+      "scope": "s-7617d75e",
+      "role": "controlled",
+      "round": 1,
+      "attempt": "a-3a01bf9d4404",
+      "host": "codex",
+      "backend": "kernel-prototype",
+      "label": "kernel controlled",
+      "tmux": "wfc-d-dcd9f390"
+    },
+    "state": "/tmp/wfc-herdr-kernel-prototype-r1/controlled-wfc-1794745658903497774",
+    "receipt": {
+      "id": 1,
+      "type": "done",
+      "body": "{\"attempt\": \"a-3a01bf9d4404\", \"dirty\": null, \"head\": null, \"report\": \"/tmp/wfc-herdr-kernel-prototype-r1/controlled-wfc-1794745658903497774/report.md\", \"role\": \"controlled\", \"round\": 1, \"scope\": \"s-7617d75e\"}",
+      "request_key": "controlled:a-3a01bf9d4404"
+    },
+    "round_state": "completed",
+    "backend_close": "completed",
+    "view": {
+      "cols": 100,
+      "eof": false,
+      "exit": null,
+      "read_error": null,
+      "rows": 30,
+      "screen": "Primary",
+      "text": "START {\"argv\": [\"/tmp/wfc-herdr-kernel-prototype-r1/controlled-wfc-1794745658903497774/report.md\", \"/tmp/wfc-opencode2-candidate-local/wfc.pyz\"], \"isatty\": [true, true, true], \"pid\": 28}\nRIGHT\nWFC_LITERAL 中文\nECHO \"WFC_LITERAL 中文\"\n^CCTRL_C_HANDLED\ndone:a-3a01bf9d4404\nCALLBACK {\"exit\": 0, \"stdout\": \"{\\\"message\\\": 1, \\\"messageId\\\": \\\"m-7fdbb7ea105948d18b5896e62db3404d\\\", \\\"state\\\": \\\"unsent\\\", \\\"statusVersion\\\": 1, \\\"duplicate\\\": false}\\n\", \"stderr\": \"\"}"
+    },
+    "seam": "candidate real router.cmd_dispatch + test-only ExecutionBackend; real child wfc.pyz done"
+  },
+  {
+    "probe": "actual_opencode_tui",
+    "identity": {
+      "nonce": "e15bc1a1-ab92-4553-ab0b-bad11c65e092",
+      "pid": 34
+    },
+    "state": "/tmp/wfc-herdr-kernel-prototype-r1/actual-host-1794745659341944003",
+    "startup_seconds": 4.739663164997182,
+    "exercise_seconds": 5.201728171996365,
+    "startup": {
+      "cols": 100,
+      "eof": false,
+      "exit": null,
+      "read_error": null,
+      "rows": 30,
+      "screen": "Alternate",
+      "text": "\n\n\n\n\n\n\n                                                                ▄\n                               █▀▀█ █▀▀█ █▀▀█ █▀▀▄ █▀▀▀ █▀▀█ █▀▀█ █▀▀█\n                               █  █ █  █ █▀▀▀ █  █ █    █  █ █  █ █▀▀▀\n                               ▀▀▀▀ █▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀\n\n                                 /update to upgrade to OpenCode 2.0\n\n             ┃\n             ┃  Ask anything… \"Fix broken tests\"\n             ┃\n             ┃  Build · Big Pickle OpenCode\n             ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n                                                             tab agents  ctrl+p commands\n\n\n\n                      ● Tip Run /connect to add an AI provider and start coding\n\n\n\n\n  /tmp/wfc-herdr-kernel-prototype-r1/actual-host-1794745659341944003                        1.19.5\n"
+    },
+    "input_observed": true,
+    "input_view": {
+      "cols": 100,
+      "eof": false,
+      "exit": null,
+      "read_error": null,
+      "rows": 30,
+      "screen": "Alternate",
+      "text": "\n\n\n\n\n\n\n                                                                ▄\n                               █▀▀█ █▀▀█ █▀▀█ █▀▀▄ █▀▀▀ █▀▀█ █▀▀█ █▀▀█\n                               █  █ █  █ █▀▀▀ █  █ █    █  █ █  █ █▀▀▀\n                               ▀▀▀▀ █▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀\n\n                                 /update to upgrade to OpenCode 2.0\n\n             ┃\n             ┃  kernel isolated draft 中文\n             ┃\n             ┃  Build · Big Pickle OpenCode\n             ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n                                                             tab agents  ctrl+p commands\n\n\n\n                      ● Tip Run /connect to add an AI provider and start coding\n\n\n\n\n  /tmp/wfc-herdr-kernel-prototype-r1/actual-host-1794745659341944003                        1.19.5\n"
+    },
+    "interrupted": {
+      "cols": 100,
+      "eof": false,
+      "exit": null,
+      "read_error": null,
+      "rows": 30,
+      "screen": "Alternate",
+      "text": "\n\n\n\n\n\n\n                                                                ▄\n                               █▀▀█ █▀▀█ █▀▀█ █▀▀▄ █▀▀▀ █▀▀█ █▀▀█ █▀▀█\n                               █  █ █  █ █▀▀▀ █  █ █    █  █ █  █ █▀▀▀\n                               ▀▀▀▀ █▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀\n\n                                 /update to upgrade to OpenCode 2.0\n\n             ┃\n             ┃  Ask anything… \"Fix broken tests\"\n             ┃\n             ┃  Build · Big Pickle OpenCode\n             ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n                                                             tab agents  ctrl+p commands\n\n\n\n                      ● Tip Run /connect to add an AI provider and start coding\n\n\n\n\n  /tmp/wfc-herdr-kernel-prototype-r1/actual-host-1794745659341944003                        1.19.5\n"
+    },
+    "closed": true,
+    "host_pid_terminated": true,
+    "limitation": "isolated unsubmitted draft; no authenticated model turn or WFC callback from actual host"
+  }
+]

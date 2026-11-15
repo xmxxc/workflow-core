@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/tmp/wfc-kernel-tools/cargo/bin/cargo",
+    "+1.96.1",
+    "fmt",
+    "--manifest-path",
+    "/tmp/wfc-herdr-kernel-prototype-r1/Cargo.toml",
+    "--",
+    "--check"
+  ],
+  "exit": 1,
+  "stdout": "",
+  "stderr": "error: 'cargo-fmt' is not installed for the toolchain '1.96.1-x86_64-unknown-linux-gnu'.\nhelp: run `rustup component add rustfmt` to install it\n"
+}

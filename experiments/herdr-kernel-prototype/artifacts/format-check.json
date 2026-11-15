@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/tmp/wfc-kernel-tools/cargo/bin/rustfmt",
+    "+1.96.1",
+    "--edition",
+    "2021",
+    "--check",
+    "experiments/herdr-kernel-prototype/src/main.rs"
+  ],
+  "exit": 0,
+  "seconds": 0.019582376000471413,
+  "stdout": "",
+  "stderr": ""
+}

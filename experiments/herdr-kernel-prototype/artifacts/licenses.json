@@ -1,0 +1,22 @@
+[
+  {
+    "path": "LICENSE",
+    "bytes": 11357,
+    "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+  },
+  {
+    "path": "vendor/libghostty-vt/LICENSE",
+    "bytes": 1097,
+    "sha256": "386211873e5b7a02f663ae4d7adf96285999f91608f8f9f31fecfd0f4095e6f1"
+  },
+  {
+    "path": "vendor/libghostty-vt/pkg/afl++/LICENSE",
+    "bytes": 1132,
+    "sha256": "337a40d58de145036691382b3aec220ee28f507fe4f0db8970b6844f6dd60eb3"
+  },
+  {
+    "path": "vendor/portable-pty/LICENSE.md",
+    "bytes": 1068,
+    "sha256": "191c46fcf52061382b1c51a70311eb9081381cc158e5899f3739473a9432185b"
+  }
+]

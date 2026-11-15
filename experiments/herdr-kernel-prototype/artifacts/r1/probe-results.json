@@ -1,0 +1,307 @@
+[
+  {
+    "probe": "startup_unicode_spaces_isatty_cursor",
+    "identity": {
+      "nonce": "7ab1a01f-892c-473d-a03f-59f5d3762a26",
+      "pid": 7
+    },
+    "view": {
+      "cols": 100,
+      "eof": false,
+      "exit": null,
+      "read_error": null,
+      "rows": 30,
+      "screen": "Primary",
+      "text": "START {\"argv\": [\"space argument 中文\", \"emoji 🐈\"], \"isatty\": [true, true, true], \"pid\": 7}\nRIGHT"
+    }
+  },
+  {
+    "probe": "literal_input",
+    "view": {
+      "cols": 100,
+      "eof": false,
+      "exit": null,
+      "read_error": null,
+      "rows": 30,
+      "screen": "Primary",
+      "text": "START {\"argv\": [\"space argument 中文\", \"emoji 🐈\"], \"isatty\": [true, true, true], \"pid\": 7}\nRIGHT\nliteral ; $(touch /tmp/SHOULD_NOT_EXIST) \" 中文 🐈\nECHO \"literal ; $(touch /tmp/SHOULD_NOT_EXIST) \\\" 中文 🐈\""
+    }
+  },
+  {
+    "probe": "wrong_identity_input",
+    "response": {
+      "error": "wrong_nonce",
+      "generation": "5dc0a195-61b8-43e9-8a6c-f3ceb3ae732e",
+      "id": 7,
+      "ok": false
+    }
+  },
+  {
+    "probe": "wrong_identity_resize",
+    "response": {
+      "error": "wrong_nonce",
+      "generation": "5dc0a195-61b8-43e9-8a6c-f3ceb3ae732e",
+      "id": 8,
+      "ok": false
+    }
+  },
+  {
+    "probe": "wrong_identity_close",
+    "response": {
+      "error": "wrong_nonce",
+      "generation": "5dc0a195-61b8-43e9-8a6c-f3ceb3ae732e",
+      "id": 9,
+      "ok": false
+    }
+  },
+  {
+    "probe": "rejected_actions_preserved_live_control",
+    "view": {
+      "cols": 100,
+      "eof": false,
+      "exit": null,
+      "read_error": null,
+      "rows": 30,
+      "screen": "Primary",
+      "text": "START {\"argv\": [\"space argument 中文\", \"emoji 🐈\"], \"isatty\": [true, true, true], \"pid\": 7}\nRIGHT\nliteral ; $(touch /tmp/SHOULD_NOT_EXIST) \" 中文 🐈\nECHO \"literal ; $(touch /tmp/SHOULD_NOT_EXIST) \\\" 中文 🐈\""
+    }
+  },
+  {
+    "probe": "alternate_screen",
+    "view": {
+      "cols": 100,
+      "eof": false,
+      "exit": null,
+      "read_error": null,
+      "rows": 30,
+      "screen": "Alternate",
+      "text": "ALT_SCREEN"
+    }
+  },
+  {
+    "probe": "primary_screen_restore",
+    "view": {
+      "cols": 100,
+      "eof": false,
+      "exit": null,
+      "read_error": null,
+      "rows": 30,
+      "screen": "Primary",
+      "text": "START {\"argv\": [\"space argument 中文\", \"emoji 🐈\"], \"isatty\": [true, true, true], \"pid\": 7}\nRIGHT\nliteral ; $(touch /tmp/SHOULD_NOT_EXIST) \" 中文 🐈\nECHO \"literal ; $(touch /tmp/SHOULD_NOT_EXIST) \\\" 中文 🐈\"\nalt\nMAIN_RESTORED"
+    }
+  },
+  {
+    "probe": "resize_kernel_and_parser",
+    "view": {
+      "cols": 120,
+      "eof": false,
+      "exit": null,
+      "read_error": null,
+      "rows": 35,
+      "screen": "Primary",
+      "text": "START {\"argv\": [\"space argument 中文\", \"emoji 🐈\"], \"isatty\": [true, true, true], \"pid\": 7}\nRIGHT\nliteral ; $(touch /tmp/SHOULD_NOT_EXIST) \" 中文 🐈\nECHO \"literal ; $(touch /tmp/SHOULD_NOT_EXIST) \\\" 中文 🐈\"\nalt\nMAIN_RESTORED\nsize\nSIZE os.terminal_size(columns=120, lines=35)"
+    }
+  },
+  {
+    "probe": "ctrl_c",
+    "view": {
+      "cols": 120,
+      "eof": false,
+      "exit": null,
+      "read_error": null,
+      "rows": 35,
+      "screen": "Primary",
+      "text": "START {\"argv\": [\"space argument 中文\", \"emoji 🐈\"], \"isatty\": [true, true, true], \"pid\": 7}\nRIGHT\nliteral ; $(touch /tmp/SHOULD_NOT_EXIST) \" 中文 🐈\nECHO \"literal ; $(touch /tmp/SHOULD_NOT_EXIST) \\\" 中文 🐈\"\nalt\nMAIN_RESTORED\nsize\nSIZE os.terminal_size(columns=120, lines=35)\n^CCTRL_C_HANDLED"
+    }
+  },
+  {
+    "probe": "natural_exit",
+    "view": {
+      "cols": 120,
+      "eof": true,
+      "exit": {
+        "code": 7,
+        "signal": null
+      },
+      "read_error": null,
+      "rows": 35,
+      "screen": "Primary",
+      "text": "START {\"argv\": [\"space argument 中文\", \"emoji 🐈\"], \"isatty\": [true, true, true], \"pid\": 7}\nRIGHT\nliteral ; $(touch /tmp/SHOULD_NOT_EXIST) \" 中文 🐈\nECHO \"literal ; $(touch /tmp/SHOULD_NOT_EXIST) \\\" 中文 🐈\"\nalt\nMAIN_RESTORED\nsize\nSIZE os.terminal_size(columns=120, lines=35)\n^CCTRL_C_HANDLED\nexit:7"
+    }
+  },
+  {
+    "probe": "reused_unit_name_nonce_fence",
+    "response": {
+      "error": "wrong_nonce",
+      "generation": "5dc0a195-61b8-43e9-8a6c-f3ceb3ae732e",
+      "id": 28,
+      "ok": false
+    },
+    "current": {
+      "nonce": "86ebdd38-ee47-4437-be7d-83d5737e5a0b",
+      "pid": 9
+    }
+  },
+  {
+    "probe": "close_child_grandchild_cleanup",
+    "pids": [
+      9,
+      11,
+      12
+    ],
+    "all_terminated": true
+  },
+  {
+    "probe": "escaped_process_group_cleanup_gap",
+    "parent": 13,
+    "escaped_pid": 15,
+    "escaped_descendant_survived_close": true,
+    "result": "unsupported containment; explicit test cleanup follows"
+  },
+  {
+    "probe": "natural_parent_exit_descendant_cleanup_gap",
+    "parent": 16,
+    "descendant": 18,
+    "descendant_survived_close": true,
+    "result": "poll reaped leader; close avoids signaling reusable group identity"
+  },
+  {
+    "probe": "stale_generation_close",
+    "response": {
+      "error": "stale_generation",
+      "generation": "11591c85-ae3a-47b1-b6ec-cfebb4e48e64",
+      "id": 3,
+      "ok": false
+    }
+  },
+  {
+    "probe": "stale_generation_resize",
+    "response": {
+      "error": "stale_generation",
+      "generation": "11591c85-ae3a-47b1-b6ec-cfebb4e48e64",
+      "id": 4,
+      "ok": false
+    }
+  },
+  {
+    "probe": "crash_restart_no_replay",
+    "old_generation": "5dc0a195-61b8-43e9-8a6c-f3ceb3ae732e",
+    "new_generation": "11591c85-ae3a-47b1-b6ec-cfebb4e48e64",
+    "rejected": {
+      "error": "stale_generation",
+      "generation": "11591c85-ae3a-47b1-b6ec-cfebb4e48e64",
+      "id": 2,
+      "ok": false
+    },
+    "old_pid_terminated": true,
+    "view": {
+      "cols": 100,
+      "eof": false,
+      "exit": null,
+      "read_error": null,
+      "rows": 30,
+      "screen": "Primary",
+      "text": "START {\"argv\": [\"space argument 中文\", \"emoji 🐈\"], \"isatty\": [true, true, true], \"pid\": 23}\nRIGHT\npost_restart_control\nECHO \"post_restart_control\""
+    },
+    "lost_ack_marker": "/tmp/wfc-herdr-kernel-prototype-r1/unknown-input-1794744802652148492",
+    "marker_content": "APPLIED_ONCE\n",
+    "recovery": "lost; cannot restore prior PTY"
+  },
+  {
+    "probe": "crash_ignoring_hangup_containment_gap",
+    "pid": 25,
+    "survived_server_sigkill": true,
+    "result": "no crash-time process ownership guard; explicit test cleanup follows"
+  },
+  {
+    "probe": "controlled_cleanup",
+    "owned_pids": [
+      7,
+      9,
+      11,
+      12,
+      13,
+      15,
+      16,
+      18,
+      19,
+      23,
+      25
+    ],
+    "all_terminated": true
+  },
+  {
+    "probe": "wfc_execution_contract_and_real_done_callback",
+    "dispatch": {
+      "dispatch": "d-6c886a75",
+      "scope": "s-f5ddb2a2",
+      "role": "controlled",
+      "round": 1,
+      "attempt": "a-b63c599301e0",
+      "host": "codex",
+      "backend": "kernel-prototype",
+      "label": "kernel controlled",
+      "tmux": "wfc-d-6c886a75"
+    },
+    "state": "/tmp/wfc-herdr-kernel-prototype-r1/controlled-wfc-1794744803170559535",
+    "receipt": {
+      "id": 1,
+      "type": "done",
+      "body": "{\"attempt\": \"a-b63c599301e0\", \"dirty\": null, \"head\": null, \"report\": \"/tmp/wfc-herdr-kernel-prototype-r1/controlled-wfc-1794744803170559535/report.md\", \"role\": \"controlled\", \"round\": 1, \"scope\": \"s-f5ddb2a2\"}",
+      "request_key": "controlled:a-b63c599301e0"
+    },
+    "round_state": "completed",
+    "backend_close": "completed",
+    "view": {
+      "cols": 100,
+      "eof": false,
+      "exit": null,
+      "read_error": null,
+      "rows": 30,
+      "screen": "Primary",
+      "text": "START {\"argv\": [\"/tmp/wfc-herdr-kernel-prototype-r1/controlled-wfc-1794744803170559535/report.md\", \"/tmp/wfc-opencode2-candidate-local/wfc.pyz\"], \"isatty\": [true, true, true], \"pid\": 29}\nRIGHT\nWFC_LITERAL 中文\nECHO \"WFC_LITERAL 中文\"\n^CCTRL_C_HANDLED\ndone:a-b63c599301e0\nCALLBACK {\"exit\": 0, \"stdout\": \"{\\\"message\\\": 1, \\\"messageId\\\": \\\"m-4d209e05d3e244f68c2cc782f4a9dcee\\\", \\\"state\\\": \\\"unsent\\\", \\\"statusVersion\\\": 1, \\\"duplicate\\\": false}\\n\", \"stderr\": \"\"}"
+    },
+    "seam": "candidate real router.cmd_dispatch + test-only ExecutionBackend; real child wfc.pyz done"
+  },
+  {
+    "probe": "actual_opencode_tui",
+    "identity": {
+      "nonce": "2320a7d1-dd4b-4ce8-b9d9-ba216094f4c0",
+      "pid": 35
+    },
+    "state": "/tmp/wfc-herdr-kernel-prototype-r1/actual-host-1794744803559805807",
+    "startup_seconds": 4.657711602994823,
+    "exercise_seconds": 5.124791356996866,
+    "startup": {
+      "cols": 100,
+      "eof": false,
+      "exit": null,
+      "read_error": null,
+      "rows": 30,
+      "screen": "Alternate",
+      "text": "\n\n\n\n\n\n\n                                                                ▄\n                               █▀▀█ █▀▀█ █▀▀█ █▀▀▄ █▀▀▀ █▀▀█ █▀▀█ █▀▀█\n                               █  █ █  █ █▀▀▀ █  █ █    █  █ █  █ █▀▀▀\n                               ▀▀▀▀ █▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀\n\n                                                  /\n\n             ┃\n             ┃  Ask anything… \"What is the tech stack of this project?\"\n             ┃\n             ┃  Build · Big Pickle OpenCode\n             ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n                                                             tab agents  ctrl+p commands\n\n\n\n                      ● Tip Run /connect to add an AI provider and start coding\n\n\n\n\n  /tmp/wfc-herdr-kernel-prototype-r1/actual-host-1794744803559805807                        1.19.5\n"
+    },
+    "input_observed": true,
+    "input_view": {
+      "cols": 100,
+      "eof": false,
+      "exit": null,
+      "read_error": null,
+      "rows": 30,
+      "screen": "Alternate",
+      "text": "\n\n\n\n\n\n\n                                                                ▄\n                               █▀▀█ █▀▀█ █▀▀█ █▀▀▄ █▀▀▀ █▀▀█ █▀▀█ █▀▀█\n                               █  █ █  █ █▀▀▀ █  █ █    █  █ █  █ █▀▀▀\n                               ▀▀▀▀ █▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀\n\n                                 /update to upgrade to OpenCode 2.0\n\n             ┃\n             ┃  kernel isolated draft 中文\n             ┃\n             ┃  Build · Big Pickle OpenCode\n             ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n                                                             tab agents  ctrl+p commands\n\n\n\n                      ● Tip Run /connect to add an AI provider and start coding\n\n\n\n\n  /tmp/wfc-herdr-kernel-prototype-r1/actual-host-1794744803559805807                        1.19.5\n"
+    },
+    "interrupted": {
+      "cols": 100,
+      "eof": false,
+      "exit": null,
+      "read_error": null,
+      "rows": 30,
+      "screen": "Alternate",
+      "text": "\n\n\n\n\n\n\n                                                                ▄\n                               █▀▀█ █▀▀█ █▀▀█ █▀▀▄ █▀▀▀ █▀▀█ █▀▀█ █▀▀█\n                               █  █ █  █ █▀▀▀ █  █ █    █  █ █  █ █▀▀▀\n                               ▀▀▀▀ █▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀\n\n                                 /update to upgrade to OpenCode 2.0\n\n             ┃\n             ┃  Ask anything… \"What is the tech stack of this project?\"\n             ┃\n             ┃  Build · Big Pickle OpenCode\n             ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n                                                             tab agents  ctrl+p commands\n\n\n\n                      ● Tip Run /connect to add an AI provider and start coding\n\n\n\n\n  /tmp/wfc-herdr-kernel-prototype-r1/actual-host-1794744803559805807                        1.19.5\n"
+    },
+    "closed": true,
+    "host_pid_terminated": true,
+    "limitation": "isolated unsubmitted draft; no authenticated model turn or WFC callback from actual host"
+  }
+]
