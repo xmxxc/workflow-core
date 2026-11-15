@@ -38,3 +38,7 @@ python3 wfc.py herdr-reconcile d-... --pane p-... --terminal t-... \
 受控宿主结果不等于真实 Codex 验收。真实 Windows Codex 的登录、权限与交互闭环由 #10 保留独立验收记录；不能据此宣称 live-verified。Unix tmux 保持原支持范围。生产启用持续 watchdog 前还需合入 #19 的故障去重修复。
 
 已确认的上游边界：公开 CLI 没有 `layout.apply` argv 入口，因此选择公开 API；每个连接只处理一个请求，适配器逐请求建连。Herdr 0.9.5 重启恢复的单元可能不保留 metadata nonce；此时拒绝绑定，需人工确认并停止旧 writer 后另建显式 dispatch，不能仅以相同 ID 接替。API 没有原子“核对 nonce 并写入”操作，适配器在同一 service identity 内先 snapshot 后操作；拥有同一 OS 账户权限的外部操作者仍可并发更改单元，应在管理窗口避免并发手工修改。
+
+## 宿主 shell 的回调上下文
+
+Codex 0.169.0 的 Linux 实测中，主进程已收到正确 WFC 环境，但其生成的 shell snapshot 带有上一个 dispatch/state，回调因 attempt 不匹配而被拒绝。WFC brief 的 ask/done 命令现在显式设置当前 `WFC_DISPATCH` 和绝对 `WFC_STATE`；Unix 以引用后的 `env` 参数传入，Windows 以 PowerShell literal 设置后启动 Python。不依赖宿主 shell snapshot 的这两个环境值，不改变宿主全局配置。owner token 仍从继承环境读取并校验；失效凭据拒绝，不在 brief 中嵌入凭据或绕过 owner fencing。
