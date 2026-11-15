@@ -1,4 +1,4 @@
-"""Launch configuration and platform adapter contract."""
+"""Host launch behavior through CLI/status, plus a simulated Windows adapter boundary."""
 import json
 import os
 from pathlib import Path
@@ -9,23 +9,8 @@ import unittest
 import host_launch
 
 
-class LaunchConfiguration(unittest.TestCase):
-    def test_explicit_command_runtime_and_environment_precedence(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = Path(tmp) / '启动 config.json'
-            config.write_text(json.dumps({'env': {'PATH': '/global', 'MODE': 'global'},
-                                         'hosts': {'codex': {'command': ['/安装 路径/codex.js', '--fixed'],
-                                                             'runtime': [sys.executable, '-u'],
-                                                             'env': {'PATH': '/host', 'MODE': 'host'}}}}))
-            command, env = host_launch.configure('codex', ['codex', 'brief'], {'MODE': 'internal'},
-                                                 config, inherited={'PATH': '/inherited', 'KEEP': 'yes'})
-            self.assertEqual(command, [sys.executable, '-u', '/安装 路径/codex.js', '--fixed', 'brief'])
-            self.assertEqual(env, {'PATH': '/host', 'MODE': 'internal', 'KEEP': 'yes'})
-
-
-
-
-class ExecutableResolution(unittest.TestCase):
+class WindowsAdapter(unittest.TestCase):
+    """Pure Windows adapter simulation; this does not verify native Windows execution."""
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -37,27 +22,6 @@ class ExecutableResolution(unittest.TestCase):
         path.write_text(text)
         path.chmod(mode)
         return path
-
-    def test_missing_executable_runtime_and_permission_are_distinct(self):
-        for command, category in [(['absent'], 'executable_missing'),
-                                  ([str(self.script('env host', '#!/usr/bin/env absent-runtime\n'))], 'runtime_missing'),
-                                  ([str(self.script('denied', '#!/bin/sh\n', 0o644))], 'permission_denied')]:
-            with self.subTest(category=category), self.assertRaises(host_launch.LaunchError) as raised:
-                host_launch.prepare(command, self.env, self.root)
-            self.assertEqual(raised.exception.category, category)
-
-    def test_explicit_runtime_accepts_nonexecutable_script_with_unicode_path(self):
-        script = self.script('宿主 path.py', 'print(1)\n', 0o644)
-        config = self.root / 'config.json'
-        config.write_text(json.dumps({'hosts': {'codex': {'command': [str(script)], 'runtime': [sys.executable, '-u']}}}))
-        command, env = host_launch.configure('codex', ['codex', 'task'], {}, config, inherited=self.env)
-        self.assertEqual(host_launch.prepare(command, env, self.root), [os.path.abspath(sys.executable), '-u', str(script), 'task'])
-
-    def test_explicit_missing_runtime_is_runtime_missing(self):
-        command = host_launch.HostCommand(['missing-node', 'script.js'], runtime_count=1)
-        with self.assertRaises(host_launch.LaunchError) as raised:
-            host_launch.prepare(command, self.env, self.root)
-        self.assertEqual(raised.exception.category, 'runtime_missing')
 
     def test_windows_native_exe_ignores_unix_shebang(self):
         exe = self.script('工具.exe', '#!/not/a/windows/runtime\n')
@@ -71,29 +35,6 @@ class ExecutableResolution(unittest.TestCase):
             self.assertEqual(raised.exception.category, 'unknown')
             self.assertIn('native runtime', str(raised.exception))
 
-    def test_diagnostics_are_bounded_and_redacted_before_truncation(self):
-        raw = ('API_KEY=private-value Bearer some-auth https://name:pass@example.com\n'
-               'private-value password=hidden\x1b\x00\n' + 'x' * 12000)
-        diagnostic = host_launch.sanitize(raw, {'SERVICE_TOKEN': 'private-value'})
-        self.assertLessEqual(len(diagnostic), 4096)
-        for secret in ('private-value', 'some-auth', 'name:pass', 'hidden', '\x1b', '\x00'):
-            self.assertNotIn(secret, diagnostic)
-
-    def test_quoted_credentials_and_basic_auth_are_redacted(self):
-        raw = """password="alpha beta gamma" token='two words' {"api_key": "json secret"} Authorization: Basic abcdef"""
-        diagnostic = host_launch.sanitize(raw)
-        for value in ('alpha', 'beta', 'gamma', 'two', 'words', 'json secret', 'abcdef'):
-            self.assertNotIn(value, diagnostic)
-
-    def test_json_escaped_credential_quotes_do_not_leave_suffixes(self):
-        secret = 'alpha "tailsecret" suffix'
-        raw = json.dumps({'token': secret, 'error': secret})
-        diagnostic = host_launch.sanitize(raw, {'SERVICE_TOKEN': secret})
-        for value in ('alpha', 'tailsecret', 'suffix'):
-            self.assertNotIn(value, diagnostic)
-
-
-
 class ControlledLaunch(unittest.TestCase):
     """Real cross-process host launch, with a controlled terminal adapter instead of a real TUI."""
     def setUp(self):
@@ -103,7 +44,7 @@ class ControlledLaunch(unittest.TestCase):
         self.pids = self.env.bin.parent / 'pids'
         self.addCleanup(self.stop_children)
         (self.env.bin / 'tmux').write_text(f'''#!{sys.executable}
-import json, os, subprocess, sys
+import json, os, subprocess, sys, time
 from pathlib import Path
 sessions = Path({str(self.env.sessions)!r})
 if sys.argv[1] == 'new-session':
@@ -115,6 +56,15 @@ if sys.argv[1] == 'new-session':
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                  start_new_session=True)
         with open({str(self.pids)!r}, 'a') as out: out.write(str(child.pid) + '\\n')
+        # Coordinate the controlled adapter with its child instead of assuming a
+        # second Python interpreter is scheduled within the product's 400ms window.
+        spec = Path(sys.argv[i + 1])
+        receipt = spec.with_suffix('.json')
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if receipt.exists() and json.loads(receipt.read_text())['category'] != 'unknown':
+                break
+            time.sleep(0.01)
 elif sys.argv[1] == 'has-session':
     sys.exit(0 if (sessions / sys.argv[sys.argv.index('-t') + 1]).exists() else 1)
 elif sys.argv[1] == 'show-environment':
@@ -125,7 +75,7 @@ elif sys.argv[1] == 'show-environment':
         self.host = self.env.bin.parent / '安装 路径' / '宿主.py'
         self.host.parent.mkdir()
         self.host.write_text('import json, os, sys, time\n'
-                             f'open({str(self.output)!r}, "w").write(json.dumps({{"argv": sys.argv[1:], "path": os.environ["PATH"], "mode": os.environ.get("MODE"), "dispatch": os.environ["WFC_DISPATCH"]}}))\n'
+                             f'open({str(self.output)!r}, "w").write(json.dumps({{"argv": sys.argv[1:], "path": os.environ["PATH"], "mode": os.environ.get("MODE"), "dispatch": os.environ["WFC_DISPATCH"], "state": os.environ["WFC_STATE"], "keep": os.environ.get("KEEP"), "inherited": os.environ.get("ONLY_INHERITED"), "bytecodeDisabled": sys.dont_write_bytecode, "opencodeConfig": os.environ.get("OPENCODE_CONFIG_CONTENT")}}))\n'
                              'time.sleep(1)\n')
         self.host.chmod(0o644)
         self.config = self.env.bin.parent / '启动 配置.json'
@@ -190,6 +140,52 @@ elif sys.argv[1] == 'show-environment':
                 rows = self.env.json('status')['dispatches']
                 self.assertEqual(rows[-1]['signals']['fault']['category'], expected)
 
+    def test_config_precedence_and_runtime_flags_reach_the_actual_host(self):
+        self.config.write_text(json.dumps({
+            'env': {'PATH': '/global', 'MODE': 'global', 'KEEP': 'global'},
+            'hosts': {'opencode': {'command': [str(self.host), 'fixed space 中文'],
+                                   'runtime': [sys.executable, '-B'],
+                                   'env': {'PATH': '/host', 'MODE': 'host',
+                                           'WFC_DISPATCH': 'forged-dispatch', 'WFC_STATE': 'forged-state',
+                                           'OPENCODE_CONFIG_CONTENT': '{"permission": "deny"}'}}}}))
+        result = self.dispatch_result('opencode', env={'MODE': 'inherited', 'KEEP': 'inherited',
+                                                     'ONLY_INHERITED': 'retained'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        observed = json.loads(self.output.read_text())
+        self.assertEqual(observed['argv'][0], 'fixed space 中文')
+        self.assertTrue(observed['bytecodeDisabled'])
+        self.assertEqual(observed['path'], '/host')
+        self.assertEqual(observed['mode'], 'host')
+        self.assertEqual(observed['keep'], 'global')
+        self.assertEqual(observed['inherited'], 'retained')
+        self.assertEqual(observed['dispatch'], json.loads(result.stdout)['dispatch'])
+        self.assertEqual(observed['state'], str(self.env.state))
+        actual_config = json.loads(observed['opencodeConfig'])
+        self.assertEqual(actual_config['permission']['external_directory'], {'*': 'allow'})
+
+    def test_explicit_missing_runtime_is_durable_in_status(self):
+        self.configure(command=[str(self.host)], runtime=['/not-installed/runtime'])
+        result = self.dispatch_result()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.status()['signals']['fault']['category'], 'runtime_missing')
+
+    def test_quoted_encoded_and_header_credentials_are_redacted_in_status(self):
+        secret = 'alpha "tailsecret" suffix'
+        raw = ('API_KEY=private-value Bearer bearer-canary https://name:pass@example.com\n'
+               'password="alpha beta gamma" token=\'two words\' {"api_key": "json secret"}\n'
+               'Authorization: Basic basic-canary\n' + json.dumps({'token': secret, 'error': secret}) + '\n')
+        self.host.write_text('import os, sys\nsys.stderr.write(os.environ["HOST_DIAGNOSTIC"] + "\\x1b\\x00")\nsys.exit(23)\n')
+        self.configure(command=[str(self.host)], runtime=[sys.executable],
+                       env={'HOST_DIAGNOSTIC': raw, 'SERVICE_TOKEN': secret})
+        result = self.dispatch_result()
+        status = self.wait_for_exit()
+        diagnostic = status['launch']['diagnostic']
+        for value in ('private-value', 'bearer-canary', 'name:pass', 'alpha', 'beta', 'gamma',
+                      'two', 'words', 'json secret', 'basic-canary', 'tailsecret', 'suffix', '\x1b', '\x00'):
+            self.assertTrue(value not in diagnostic, 'credential/control form remained in status')
+            self.assertTrue(value not in result.stderr, 'credential/control form remained in CLI')
+        self.assertLessEqual(len(diagnostic), 4096)
+
     def test_fast_exit_retains_bounded_redacted_stderr_and_code(self):
         self.host.write_text('import os, sys\nsys.stderr.write("startup diagnostic " + os.environ["SERVICE_TOKEN"] + " password=also-secret " + "x" * 20000)\nsys.exit(23)\n')
         self.configure(command=[str(self.host)], runtime=[sys.executable], env={'SERVICE_TOKEN': 'sensitive-canary'})
@@ -210,6 +206,78 @@ elif sys.argv[1] == 'show-environment':
         self.assertEqual(status['status'], 'failed')
         for path in (self.env.state / 'launches').glob('*.json'):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def wait_for_exit(self):
+        import time
+        deadline = time.monotonic() + 5
+        status = self.env.json('status')['dispatches'][-1]
+        while status['launch']['category'] != 'process_exited' and time.monotonic() < deadline:
+            time.sleep(0.05)
+            status = self.env.json('status')['dispatches'][-1]
+        self.assertEqual(status['launch']['category'], 'process_exited')
+        self.assertEqual(status['launch']['exitCode'], 23)
+        return status
+
+    def test_truncated_credentials_never_reach_persistent_cli_diagnostics(self):
+        cases = [
+            ('unicode-context', '界' * 2700, 'Z' * 128, {}, 'Z'),
+            ('long-unicode', '', '密' * 5000, {}, '密'),
+            ('short-unicode-control', '', '密' * 50, {}, '密'),
+            ('long-ascii-control', '', 'Z' * 15000, {}, 'Z'),
+            ('two-byte-tail', '界' * 2730, 'Z' * 128, {}, 'Z'),
+            ('inside-utf8', '界' * 2730 + 'x', '密' * 50, {}, '密'),
+            ('after-earlier-redaction', 'Φ' * 2600 + '界' * 100, 'Z' * 128,
+             {'OTHER_SECRET': 'Φ' * 2600}, 'Z'),
+            ('overlapping-full-and-cut', '界' * 2700 + 'P' * 32, 'Z' * 128,
+             {'OTHER_SECRET': 'P' * 32 + 'Z' * 16}, 'Z'),
+        ]
+        for label, prefix, secret, extra, canary in cases:
+            with self.subTest(case=label):
+                # Dedicated canaries only. Assertions report counts, never credential contents.
+                self.host.write_text('import os, sys\nsys.stderr.write(os.environ["HOST_DIAGNOSTIC"])\nsys.exit(23)\n')
+                self.configure(command=[str(self.host)], runtime=[sys.executable],
+                               env={'HOST_DIAGNOSTIC': prefix + secret, 'SERVICE_TOKEN': secret, **extra})
+                result = self.dispatch_result()
+                status = self.wait_for_exit()
+                diagnostic = status['launch']['diagnostic']
+                self.assertEqual(diagnostic.count(canary), 0, label + ': credential characters persisted')
+                for extra_secret in extra.values():
+                    self.assertEqual(diagnostic.count(extra_secret[0]), 0, label + ': overlapping credential fragment persisted')
+                self.assertTrue('\ufffd' not in diagnostic, label + ': incomplete UTF-8 character persisted')
+                self.assertTrue('[REDACTED]' in diagnostic, label + ': missing redaction marker')
+                self.assertLessEqual(len(diagnostic), 4096)
+                self.assertEqual(status['status'], 'failed')
+                self.assertEqual(status['signals']['fault']['diagnostic'], diagnostic)
+                # Read status again through a fresh CLI process: this is durable evidence.
+                self.assertEqual(self.wait_for_exit()['launch']['diagnostic'], diagnostic)
+                self.assertEqual(result.stderr.count(canary), 0, label + ': CLI leaked credential characters')
+                for receipt_path in (self.env.state / 'launches').glob('*.json'):
+                    self.assertLessEqual(receipt_path.stat().st_size, 4096 * 4 + 1024)
+
+    def test_json_encoded_credential_cut_is_redacted_in_status(self):
+        secret = '密"\\' * 50
+        payload = '界' * 2700 + json.dumps(secret)[1:-1]
+        self.host.write_text('import os, sys\nsys.stderr.write(os.environ["HOST_DIAGNOSTIC"])\nsys.exit(23)\n')
+        self.configure(command=[str(self.host)], runtime=[sys.executable],
+                       env={'HOST_DIAGNOSTIC': payload, 'SERVICE_TOKEN': secret})
+        self.dispatch_result()
+        diagnostic = self.wait_for_exit()['launch']['diagnostic']
+        self.assertEqual(diagnostic.count('u5bc6'), 0)
+        self.assertTrue('[REDACTED]' in diagnostic)
+        self.assertLessEqual(len(diagnostic), 4096)
+
+    def test_large_stderr_keeps_persistent_diagnostics_bounded_after_redaction(self):
+        self.host.write_text('import os, sys\nsys.stderr.write(os.environ["SERVICE_TOKEN"] + "kept-context " + "x" * 3000000)\nsys.exit(23)\n')
+        self.configure(command=[str(self.host)], runtime=[sys.executable], env={'SERVICE_TOKEN': 'Z' * 128})
+        self.dispatch_result()
+        status = self.wait_for_exit()
+        diagnostic = status['launch']['diagnostic']
+        self.assertEqual(diagnostic.count('Z'), 0)
+        self.assertIn('kept-context', diagnostic)
+        self.assertEqual(len(diagnostic), 4096)
+        self.assertEqual(status['signals']['fault']['diagnostic'], diagnostic)
+        for path in (self.env.state / 'launches').glob('*.json'):
+            self.assertLessEqual(path.stat().st_size, 4096 * 4 + 1024)
 
     def test_missing_ack_is_unknown_and_resume_requires_reconcile(self):
         self.configure(command=[str(self.host)], runtime=[sys.executable])

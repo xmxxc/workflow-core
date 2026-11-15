@@ -93,8 +93,12 @@ receipt and remain visible to subsequent status calls.
 | `unknown` | No process acknowledgement, unsupported entrypoint, or another launch error. |
 
 Diagnostics keep at most 4096 characters. The supervisor drains stderr with a
-bounded memory buffer; it stores no raw stderr log and never dumps the environment
-or complete argv into status. Known credential environment values and common
+bounded 8192-byte capture; it stores no raw stderr log and never dumps the
+environment or complete argv into status. Before UTF-8 decoding, it masks full
+known credential values and any credential prefix at a capture cut, including
+cuts within a multibyte character. Overlapping masks are combined before replacing
+text, so earlier redaction cannot reveal a cut fragment. An incomplete stderr
+drain is treated conservatively as a capture cut. Known credential environment values and common
 password/token/API-key, bearer and URL credential forms are redacted before
 truncation. Normal host stderr still reaches the terminal; treat terminal
 scrollback as host output. Diagnostic redaction cannot identify arbitrary secrets

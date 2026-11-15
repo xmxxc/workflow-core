@@ -70,18 +70,18 @@ def configure(host, command, extra_env, config=None, inherited=None):
                        len(settings.get('runtime', []))), env
 
 
+def _credential_values(env):
+    for name, value in sorted((env or {}).items(), key=lambda item: len(item[1]), reverse=True):
+        if value and _SECRET_NAME.search(name):
+            yield from sorted({value, json.dumps(value, ensure_ascii=False)[1:-1], json.dumps(value)[1:-1]},
+                              key=len, reverse=True)
+
+
 def sanitize(text, env=None):
     """Bound diagnostics and redact known credential values and common credential syntax."""
     text = str(text)
-    for name, value in sorted((env or {}).items(), key=lambda item: len(item[1]), reverse=True):
-        if value and (_SECRET_NAME.search(name) or name.startswith('WFC_') and 'TOKEN' in name):
-            variants = {value, json.dumps(value, ensure_ascii=False)[1:-1], json.dumps(value)[1:-1]}
-            for variant in sorted(variants, key=len, reverse=True):
-                if len(variant) > DIAGNOSTIC_LIMIT:
-                    prefix_at = text.find(variant[:DIAGNOSTIC_LIMIT])
-                    if prefix_at >= 0:
-                        text = text[:prefix_at] + '[REDACTED]' + text[prefix_at + len(variant):]
-                text = text.replace(variant, '[REDACTED]')
+    for value in _credential_values(env):
+        text = text.replace(value, '[REDACTED]')
     text = re.sub(r'(?i)((?:bearer|basic)\s+)\S+', r'\1[REDACTED]', text)
     text = re.sub(r"""(?i)(?<![\w-])((?:[\w-]*(?:token|secret|password|passwd|credential|api[_-]?key|cookie)[\w-]*)[\s"']*[:=]\s*)(?:"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|[^\s,;]+)""",
                   r'\1[REDACTED]', text)
@@ -89,6 +89,41 @@ def sanitize(text, env=None):
     text = re.sub(r'(https?://)[^/\s:@]+:[^/\s@]+@', r'\1[REDACTED]@', text)
     text = ''.join(c for c in text if c in '\n\t' or ord(c) >= 32)
     return text[:DIAGNOSTIC_LIMIT]
+
+
+def _redact_capture(raw, env, truncated):
+    """Redact the bounded byte capture before decoding, including credentials cut at its end."""
+    hidden = bytearray(len(raw))
+    for value in _credential_values(env):
+        # Only a capture-sized prefix can match. Encoding has bounded temporary storage,
+        # even when a configured credential is much longer than the retained stderr.
+        pattern = value[:len(raw)].encode('utf-8', 'surrogateescape')[:len(raw)]
+        if not pattern:
+            continue
+        start = raw.find(pattern)
+        while start >= 0:
+            hidden[start:start + len(pattern)] = b'\x01' * len(pattern)
+            start = raw.find(pattern, start + 1)
+        if truncated:
+            start = raw.find(pattern[:1])
+            while start >= 0:
+                if pattern.startswith(raw[start:]):
+                    hidden[start:] = b'\x01' * (len(raw) - start)
+                    break
+                start = raw.find(pattern[:1], start + 1)
+    # Mask the union of original ranges: replacing one secret must not hide an
+    # overlapping match or move a cut credential fragment into the visible prefix.
+    redacted = bytearray()
+    cursor = 0
+    while cursor < len(raw):
+        if hidden[cursor]:
+            redacted.extend(b'[REDACTED]')
+            while cursor < len(raw) and hidden[cursor]:
+                cursor += 1
+        else:
+            redacted.append(raw[cursor])
+            cursor += 1
+    return redacted.decode('utf-8', 'replace')
 
 
 def _resolve(name, env, cwd, category='executable_missing', executable=True):
@@ -219,6 +254,15 @@ def supervise(spec_path):
     reader.start()
     code = child.wait()
     reader.join(timeout=0.2)  # A descendant holding stderr must not keep the supervisor alive.
+    # Read liveness before taking the snapshot: a reader still draining means the
+    # snapshot may cut a credential even below the byte cap. A finished reader no
+    # longer mutates chunks; reaching the cap is conservatively treated as a cut.
+    truncated = reader.is_alive() or len(chunks) >= DIAGNOSTIC_LIMIT * 2
+    raw = f'host process exited ({code})\n'.encode('utf-8') + bytes(chunks)
+    diagnostic = _redact_capture(raw, env, truncated)
+    # Known values are already masked, including matches across the fixed header.
+    # Apply syntax redaction and the final character bound once, without scanning
+    # replacement markers as though they were original credential-bearing data.
     write_private(receipt, {**evidence, 'category': 'process_exited', 'exitCode': code,
-                            'diagnostic': sanitize(f'host process exited ({code})\n' + chunks.decode('utf-8', 'replace'), env)})
+                            'diagnostic': sanitize(diagnostic)})
     return code if code >= 0 else 128 - code
