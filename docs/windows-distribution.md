@@ -1,6 +1,6 @@
 # Windows 便携分发与验收
 
-这是 #10 的 Windows 预发布测试版，版本为 0.4.7-rc.2，包含 #8、#9、#17、#19 的合并改动及 PR #25 的 OpenCode 2.x 修复。原生 Windows 的 Codex worker 闭环仍待实机验证。用户已回传 OpenCode worker + Codex Desktop controller 的同聊天唤醒与 ack 闭环，见 [实测记录](https://github.com/xmxxc/workflow-core/blob/v0.4.7-rc.2/docs/verification/windows-opencode-20261115.md)；该次首派曾需人工 Enter。OpenCode 2.x 修复待实机复测；ZIP 内附 `OPENCode-Windows.md`，详见 [复测说明](https://github.com/xmxxc/workflow-core/blob/v0.4.7-rc.2/docs/verification/windows-opencode-release.md)。默认后端仍为 tmux；Windows 派发显式选择 `--backend herdr`。
+这是 #10 的 Windows 预发布测试版，版本为 0.4.7-rc.2，包含 #8、#9、#17、#19 的合并改动及 PR #25 的 OpenCode 2.x 修复。用户已在原生 Windows 上验证 OpenCode worker 首派自动提交、问答、完成、同会话 resume、continue，以及 300.011 秒延时后由 Codex Desktop 总控实际收到消息并 ack，见 [rc.2 实测记录](https://github.com/xmxxc/workflow-core/blob/release/v0.4.6/docs/verification/windows-opencode-rc2-20261115.md)。该次同时发现 [#28](https://github.com/xmxxc/workflow-core/issues/28)；后续修复包和原生 Windows 的 Codex worker 闭环仍待实机验证。默认后端仍为 tmux；Windows 派发显式选择 `--backend herdr`。
 
 ## 下载
 

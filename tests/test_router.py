@@ -91,6 +91,8 @@ class Env:
                 f"    print(sys.argv[-1] + '=' + value)\n"
                 f"if {name!r} == 'tmux' and sys.argv[1] == 'kill-session':\n"
                 f"    target = sys.argv[sys.argv.index('-t') + 1]\n"
+                f"    if os.environ.get('FAKE_KILL_RECEIPT'):\n"
+                f"        json.dump({{'category':'process_exited','diagnostic':'exited during close','exitCode':143}}, open(os.environ['FAKE_KILL_RECEIPT'], 'w'))\n"
                 f"    if os.environ.get('FAKE_KILL_FAIL') == target or not os.path.exists(os.path.join(sessions, target)):\n"
                 f"        sys.exit(1)\n"
                 f"    os.unlink(os.path.join(sessions, target))\n"
@@ -3370,6 +3372,116 @@ class InterruptHandoff(unittest.TestCase):
         self.assertNotEqual(repeated.returncode, 0)
         self.assertIn("lifecycle_reconcile_required", repeated.stderr)
         self.assertEqual(reconciled["result"], "unknown")
+
+    def complete_and_ack(self, dispatch):
+        self.env.report.write_text("# report\n")
+        receipt = self.env.run("done", "--report", str(self.env.report),
+                               "--attempt", self.status(dispatch)["attempt"], dispatch=dispatch)
+        self.assertEqual(receipt.returncode, 0, receipt.stderr)
+        [done] = self.env.json("wait", "--timeout", "2")["messages"]
+        self.assertEqual(done["messageId"], json.loads(receipt.stdout)["messageId"])
+        self.assertEqual(self.env.json("ack", done["messageId"])["state"], "processed")
+        return self.status(dispatch)
+
+    def test_close_preserves_completed_round_and_receipt(self):
+        for alive in (True, False):
+            with self.subTest(alive=alive):
+                dispatch = self.env.dispatch("claude")
+                before = self.complete_and_ack(dispatch)
+                if not alive:
+                    self.env.end_session(dispatch)
+
+                for _ in range(2):
+                    self.assertEqual(self.env.json("close", dispatch)["result"], "completed")
+                    after = self.status(dispatch)
+                    self.assertEqual(after["rounds"], before["rounds"])
+                    self.assertEqual((after["state"], after["status"], after["backendAlive"]),
+                                     ("done", "completed", False))
+                    self.assertEqual(after["audit"][-1]["result"], "completed")
+                    self.assertEqual([m for m in after["messages"] if m["type"] == "done"],
+                                     [m for m in before["messages"] if m["type"] == "done"])
+
+                late = self.env.run("done", "--report", str(self.env.report), "--message-id", "late",
+                                    "--attempt", before["attempt"], dispatch=dispatch)
+                self.assertIn("no longer accepted", late.stderr)
+                stable = self.env.run("done", "--report", str(self.env.report),
+                                      "--attempt", before["attempt"], dispatch=dispatch)
+                self.assertTrue(json.loads(stable.stdout)["duplicate"])
+                self.assertEqual(self.status(dispatch)["rounds"], before["rounds"])
+                self.assertIn("already finished its task", self.env.run("resume", dispatch).stderr)
+
+    def test_uncertain_close_and_reconcile_keep_completed_round(self):
+        dispatch = self.env.dispatch("claude")
+        before = self.complete_and_ack(dispatch)
+        failure = {"FAKE_KILL_FAIL": f"wfc-{dispatch}"}
+        self.assertEqual(self.env.json("close", dispatch, env=failure)["result"], "uncertain")
+        after = self.status(dispatch)
+        self.assertEqual(after["rounds"], before["rounds"])
+        self.assertEqual((after["status"], after["backendAlive"]), ("completed", True))
+        audit = after["audit"][-1]
+        self.assertEqual((audit["operation"], audit["result"]), ("close", "uncertain"))
+        rejected = self.env.run("continue", dispatch, "--task", str(self.env.task),
+                                "--report", str(self.env.report.with_name("next.md")))
+        self.assertIn("lifecycle_reconcile_required", rejected.stderr)
+        self.assertIn("lifecycle_reconcile_required", self.env.run("close", dispatch).stderr)
+        self.assertEqual(self.env.json("reclaim", "--yes")["sessions"], [])
+        self.assertEqual(self.env.json("status", "--active")["dispatches"][0]["dispatch"], dispatch)
+        named = self.env.run("reclaim", "--dispatch", dispatch, "--yes")
+        self.assertIn("requires reconcile", named.stderr)
+        self.assertTrue(self.status(dispatch)["backendAlive"])
+
+        self.env.end_session(dispatch)
+        self.env.json("reconcile", dispatch, str(audit["id"]), "--result", "accepted",
+                      "--actor", "operator", "--evidence", "confirmed-absent")
+        after = self.status(dispatch)
+        self.assertEqual(after["rounds"], before["rounds"])
+        self.assertEqual((after["status"], after["backendAlive"]), ("completed", False))
+        self.assertEqual(after["audit"][-1]["resolution"]["evidence"], "confirmed-absent")
+
+    def test_close_preserves_recorded_worker_failure(self):
+        for source in ("watchdog", "launch_receipt"):
+            with self.subTest(source=source):
+                dispatch = self.env.dispatch("claude")
+                self.env.end_session(dispatch)
+                if source == "watchdog":
+                    [exited] = self.env.json("wait", "--timeout", "2")["messages"]
+                    self.assertEqual(exited["type"], "exited")
+                else:
+                    receipt = next((self.env.state / "launches").glob(f"*{dispatch}*.json"))
+                    receipt.write_text(json.dumps({"category": "process_exited", "diagnostic": "worker exited",
+                                                   "exitCode": 7}))
+                before = self.status(dispatch)
+                self.assertEqual(before["status"], "failed")
+
+                self.assertEqual(self.env.json("close", dispatch)["result"], "completed")
+                after = self.status(dispatch)
+                self.assertEqual((after["status"], after["rounds"][0]["state"]), ("failed", "failed"))
+                self.assertEqual(after["signals"]["fault"], before["signals"]["fault"])
+                self.assertEqual(after["last"]["type"], "closed")
+
+    def test_exit_during_close_does_not_become_task_failure(self):
+        for resolution in (None, "accepted", "unknown"):
+            with self.subTest(resolution=resolution):
+                dispatch = self.env.dispatch("claude")
+                receipt = next((self.env.state / "launches").glob(f"*{dispatch}*.json"))
+                env = {"FAKE_KILL_RECEIPT": str(receipt)}
+                if resolution:
+                    env["FAKE_KILL_FAIL"] = f"wfc-{dispatch}"
+                expected = "uncertain" if resolution else "completed"
+                self.assertEqual(self.env.json("close", dispatch, env=env)["result"], expected)
+                if resolution:
+                    view = self.status(dispatch)
+                    self.assertEqual((view["status"], view["rounds"][0]["state"]), ("unknown", "unknown"))
+                    self.env.end_session(dispatch)
+                    self.env.json("reconcile", dispatch, str(view["audit"][-1]["id"]),
+                                  "--result", resolution, "--actor", "operator", "--evidence", "checked terminal")
+                    if resolution == "unknown":
+                        view = self.status(dispatch)
+                        self.assertEqual((view["status"], view["rounds"][0]["state"]), ("unknown", "unknown"))
+                        self.assertEqual(self.env.json("close", dispatch)["result"], "completed")
+                after = self.status(dispatch)
+                self.assertEqual((after["status"], after["rounds"][0]["state"]), ("cancelled", "cancelled"))
+                self.assertEqual(after["launch"]["category"], "process_exited")
 
     def test_close_is_distinct_and_records_cancellation(self):
         dispatch = self.env.dispatch()
