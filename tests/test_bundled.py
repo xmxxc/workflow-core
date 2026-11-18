@@ -209,20 +209,38 @@ class BundledNative(unittest.TestCase):
         self.assertNotEqual(status['attempt'], value['attempt'])
         self.assertIn(str(task.resolve()), marker.read_text(encoding='utf-8'))
         self.assertIn(status['attempt'], marker.read_text(encoding='utf-8'))
+        # Compare every received character against the unchanged producer's full brief.
+        import hashlib
+        import router
+        import zipfile
+        from unittest.mock import patch
+        callback_program = self.program if zipfile.is_zipfile(self.program) else ROOT / 'router.py'
+        with patch.dict(os.environ, {'WFC_STATE': self.env['WFC_STATE']}), patch.object(router, 'PROGRAM', callback_program):
+            expected_brief = router.worker_brief(dispatch, task.resolve(), report.resolve(),
+                                                opening='[router] New task for you', attempt=status['attempt'])
+        received_brief = marker.read_text(encoding='utf-8')
+        self.assertEqual(received_brief, expected_brief)
+        brief_digest = hashlib.sha256(received_brief.encode('utf-8')).hexdigest()
+        self.assertEqual(brief_digest, hashlib.sha256(expected_brief.encode('utf-8')).hexdigest())
         second = self.handle(dispatch)
         self.assertEqual((second['generation'], second['service'], second['kernel']),
                          (handle['generation'], handle['service'], handle['kernel']))
         question = self.cli('ask', 'controlled next-round question', '--attempt', status['attempt'])
-        self.cli('reply', str(question['message']), '复验路径-中文-42 Ω😀')
+        long_reply = ('复验路径-中文-42 Ω😀 ' + 'xyz-123456789 ' * 140 +
+                      '\x1b[31mCSI-ORDER\x1b[0m ATTEMPT-TAIL:' + status['attempt'])
+        self.cli('reply', str(question['message']), long_reply)
         self.until(lambda: applied.read_text() == 'once\nonce\n')
         recorded = [json.loads(line) for line in Path(str(self.evidence) + '.input.jsonl').read_text(encoding='utf-8').splitlines()]
-        self.assertEqual(recorded[-1], f"[router] Answer to question {question['message']}: 复验路径-中文-42 Ω😀")
+        self.assertEqual(recorded[-1], f"[router] Answer to question {question['message']}: {long_reply}")
         import bundled_runtime
         self.until(lambda: 'UNICODE_RECEIVED:复验路径-中文-42 Ω😀' in
                    bundled_runtime.call(handle, 'read').get('data', {}).get('text', ''))
         print('UNICODE_ROUNDTRIP ' + json.dumps({'marker': '复验路径-中文-42 Ω😀',
               'utf8': '复验路径-中文-42 Ω😀'.encode('utf-8').hex(),
-              'canonicalTaskExact': True, 'receivedReplyExact': True, 'terminalOutputExact': True}), flush=True)
+              'canonicalTaskExact': True, 'receivedReplyExact': True, 'terminalOutputExact': True,
+              'completeBriefChars': len(received_brief), 'completeBriefSHA256': brief_digest, 'attemptExact': True,
+              'longReplyChars': len(long_reply), 'longReplySHA256': hashlib.sha256(long_reply.encode('utf-8')).hexdigest(),
+              'vtOrderingExact': True}), flush=True)
         replies = [m for m in self.status(dispatch)['messages'] if m['type'] == 'reply']
         self.assertEqual(len(replies), 2)
         self.assertEqual(self.cli('close', dispatch)['result'], 'completed')

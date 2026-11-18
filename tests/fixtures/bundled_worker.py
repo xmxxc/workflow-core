@@ -1,5 +1,7 @@
 """Account-free PTY worker for standalone WFC lifecycle acceptance."""
 import json
+from contextlib import nullcontext
+from bundled_input import read_utf8_lines, windows_vt_input
 import os
 from pathlib import Path
 import re
@@ -51,56 +53,52 @@ signal.signal(signal.SIGINT, lambda *_: print('CTRL_C_HANDLED', flush=True))
 if os.name != 'nt':
     import tty
     tty.setraw(0)
-print('READY ' + json.dumps({'pid': os.getpid(), 'tty': [os.isatty(0), os.isatty(1)]}), flush=True)
-print('wrong\rRIGHT\x1b[K', flush=True)
-if MODE == 'read-only':
-    print('This conversation is unavailable. Its cached transcript and draft remain here; input is paused.', flush=True)
-if MODE in ('tree', 'parent-exit'):
-    descendant()
-    if MODE == 'parent-exit':
-        raise SystemExit(0)
-question = callback('ask', 'controlled question', '--options', 'yes,no')
-print('QUESTION ' + json.dumps(question), flush=True)
-if MODE == 'pressure':
-    gate = Path(str(EVIDENCE) + '.pressure-gate')
-    deadline = time.monotonic() + 15
-    while not gate.exists() and time.monotonic() < deadline:
-        time.sleep(.01)
-    if not gate.exists():
-        raise TimeoutError('pressure gate not opened')
-    os.write(1, b'\x1b[6n')
-    chunk = b'PRESSURE' * 1024
-    for _ in range(2048):
-        os.write(1, chunk)
-    print('PRESSURE_FINISHED', flush=True)
-    Path(str(EVIDENCE) + '.pressure-written').write_text(str(len(chunk) * 2048))
-# Windows CRT fd reads can replace console Unicode with the active OEM codepage.
-# Python's console text stream uses the wide console API without changing that codepage.
-if os.name == 'nt':
-    lines = sys.stdin
-else:
-    from bundled_input import read_utf8_lines
-    lines = read_utf8_lines(lambda: os.read(0, 4096))
-for text in lines:
-    text = text.rstrip('\r\n').replace('\x1b[200~', '').replace('\x1b[201~', '')
-    if 'pressure-input:' in text:
-        import hashlib
-        payload = text.split('pressure-input:', 1)[1]
-        Path(str(EVIDENCE) + '.pressure-input').write_text(hashlib.sha256(payload.encode()).hexdigest())
-    elif 'Answer to question' in text:
-        print('ANSWER_RECEIVED', flush=True)
-        if '复验路径-中文-42 Ω😀' in text:
-            print('UNICODE_RECEIVED:复验路径-中文-42 Ω😀', flush=True)
-        # Marker proves that dropping a response never replays applied input.
-        with open(str(EVIDENCE) + '.applied', 'a', encoding='utf-8') as target:
-            target.write('once\n')
-        with open(str(EVIDENCE) + '.input.jsonl', 'a', encoding='utf-8') as target:
-            target.write(json.dumps(text) + '\n')
-        if MODE != 'record-only':
-            REPORT.write_text('controlled bundled worker completed\n', encoding='utf-8')
-            done = callback('done', '--report', str(REPORT), '--message-id', 'controlled:' + ATTEMPT)
-            print('DONE ' + json.dumps(done), flush=True)
-    elif 'Message from the controller' in text:
-        print('NUDGE_RECEIVED', flush=True)
-    elif '[router] New task for you' in text and MODE == 'record-only':
-        Path(str(EVIDENCE) + '.continued').write_text(text, encoding='utf-8')
+input_context = (windows_vt_input() if os.name == 'nt' else
+                 nullcontext(read_utf8_lines(lambda: os.read(0, 4096))))
+with input_context as lines:
+    print('READY ' + json.dumps({'pid': os.getpid(), 'tty': [os.isatty(0), os.isatty(1)]}), flush=True)
+    print('wrong\rRIGHT\x1b[K', flush=True)
+    if MODE == 'read-only':
+        print('This conversation is unavailable. Its cached transcript and draft remain here; input is paused.', flush=True)
+    if MODE in ('tree', 'parent-exit'):
+        descendant()
+        if MODE == 'parent-exit':
+            raise SystemExit(0)
+    question = callback('ask', 'controlled question', '--options', 'yes,no')
+    print('QUESTION ' + json.dumps(question), flush=True)
+    if MODE == 'pressure':
+        gate = Path(str(EVIDENCE) + '.pressure-gate')
+        deadline = time.monotonic() + 15
+        while not gate.exists() and time.monotonic() < deadline:
+            time.sleep(.01)
+        if not gate.exists():
+            raise TimeoutError('pressure gate not opened')
+        os.write(1, b'\x1b[6n')
+        chunk = b'PRESSURE' * 1024
+        for _ in range(2048):
+            os.write(1, chunk)
+        print('PRESSURE_FINISHED', flush=True)
+        Path(str(EVIDENCE) + '.pressure-written').write_text(str(len(chunk) * 2048))
+    for text in lines:
+        text = text.rstrip('\r\n').replace('\x1b[200~', '').replace('\x1b[201~', '')
+        if 'pressure-input:' in text:
+            import hashlib
+            payload = text.split('pressure-input:', 1)[1]
+            Path(str(EVIDENCE) + '.pressure-input').write_text(hashlib.sha256(payload.encode()).hexdigest())
+        elif 'Answer to question' in text:
+            print('ANSWER_RECEIVED', flush=True)
+            if '复验路径-中文-42 Ω😀' in text:
+                print('UNICODE_RECEIVED:复验路径-中文-42 Ω😀', flush=True)
+            # Marker proves that dropping a response never replays applied input.
+            with open(str(EVIDENCE) + '.applied', 'a', encoding='utf-8') as target:
+                target.write('once\n')
+            with open(str(EVIDENCE) + '.input.jsonl', 'a', encoding='utf-8') as target:
+                target.write(json.dumps(text) + '\n')
+            if MODE != 'record-only':
+                REPORT.write_text('controlled bundled worker completed\n', encoding='utf-8')
+                done = callback('done', '--report', str(REPORT), '--message-id', 'controlled:' + ATTEMPT)
+                print('DONE ' + json.dumps(done), flush=True)
+        elif 'Message from the controller' in text:
+            print('NUDGE_RECEIVED', flush=True)
+        elif '[router] New task for you' in text and MODE == 'record-only':
+            Path(str(EVIDENCE) + '.continued').write_text(text, encoding='utf-8')
