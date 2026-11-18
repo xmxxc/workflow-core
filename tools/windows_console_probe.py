@@ -31,6 +31,28 @@ def emit(root, event, **metadata):
         out.write(json.dumps(record) + '\n')
 
 
+def exception_fields(error):
+    """Closed built-in categories/codes, without dispatching exception-instance hooks."""
+    error_type = type(error)
+    fields = dict(category='Exception', errno=None, winerror=None)
+    for kind, label, codes in ((PermissionError, 'PermissionError', True), (FileExistsError, 'FileExistsError', True),
+                               (FileNotFoundError, 'FileNotFoundError', True), (TimeoutError, 'TimeoutError', True),
+                               (OSError, 'OSError', True), (ValueError, 'ValueError', False),
+                               (TypeError, 'TypeError', False), (RuntimeError, 'RuntimeError', False)):
+        if error_type is kind:
+            fields['category'] = label
+            if codes:
+                for name in ('errno', 'winerror'):
+                    try:
+                        # Exact built-in types: read native descriptors/storage, bypass instance hooks.
+                        value = object.__getattribute__(error, name)
+                    except AttributeError:
+                        continue
+                    fields[name] = value if type(value) is int else None
+            break
+    return fields
+
+
 def isolated_env(root):
     env = {key: os.environ[key] for key in ('SystemRoot', 'WINDIR', 'SystemDrive',
            'OS', 'PROCESSOR_ARCHITECTURE', 'NUMBER_OF_PROCESSORS') if key in os.environ}
@@ -719,44 +741,70 @@ def internal(args):
 def supervise(args):
     if os.name != 'nt':
         raise SystemExit('REFUSED: native Windows is required; Linux is not console evidence')
-    root = args.run_dir.resolve()
-    root.mkdir(parents=True, exist_ok=False)  # never attach to existing state
-    (root / 'herdr.toml').write_text('[terminal]\ndefault_shell = "cmd.exe"\n', encoding='utf-8')
-    env, native = isolated_env(root), Native()
-    job, children = native.job(), []
+    operation = 'resolve_run_dir'
+    try:
+        root = args.run_dir.resolve()
+        operation = 'create_run_dir'
+        root.mkdir(parents=True, exist_ok=False)  # never attach to existing state
+        operation = 'write_fixture_config'
+        (root / 'herdr.toml').write_text('[terminal]\ndefault_shell = "cmd.exe"\n', encoding='utf-8')
+        operation = 'prepare_environment'
+        env = isolated_env(root)
+        operation = 'initialize_native_api'
+        native = Native()
+        operation = 'create_containment_job'
+        job, children = native.job(), []
+    except Exception as error:
+        if args.run_dir.exists():
+            emit(args.run_dir, 'supervisor_error', stage=args.stage, supervisor_phase='setup',
+                 operation=operation, **exception_fields(error))
+        raise  # preserve the entry point's existing failure/exit behavior
     observation_job = None
     deadline, reason = time.monotonic() + args.seconds, 'error'
     finished, watchdog, outcome = None, None, []
     observer_code, shutdown, cleanup = None, 'not_started', 'owned_job_unconfirmed'
     print('STOP now: create ' + str(root / 'STOP'), flush=True)
+    operation = 'create_observation_job'
     try:
         observation_job = native.job(observe_only=True)
+        operation = 'write_job_name'
         (root / 'job-name').write_text(native.job_name, encoding='utf-8')
+        operation = 'duplicate_watchdog_handle'
         callback_job = native.duplicate_job(job)
+        operation = 'start_watchdog'
         finished, watchdog, outcome = start_watchdog(root / 'STOP', deadline,
             lambda: native.check(native.k.TerminateJobObject(callback_job, 1)),
             lambda: native.check(native.k.CloseHandle(callback_job)))
+        operation = 'check_watchdog_ready'
         if outcome:
             raise RuntimeError('watchdog unavailable before launch')
+        operation = 'launch_observer'
         observer = spawn(root, 'observer', args.stage, env, native, job, observation_job)
         children.append(observer)
+        operation = 'launch_phase'
         phase = spawn(root, 'phase', args.stage, env, native, job, observation_job)
         children.append(phase)
+        operation = 'check_stage_gate'
         if outcome or stop_reason(root / 'STOP', deadline):
             raise RuntimeError('probe stopped before stage authorization')
+        operation = 'authorize_stage'
         (root / 'GO').touch()
         known = {}
         while True:
+            operation = 'check_stop'
             reason = outcome[0] if outcome else stop_reason(root / 'STOP', deadline)
             if reason:
                 break
             with ExitStack() as handles:
                 owned, gap = {}, False
+                operation = 'enumerate_job_members'
                 for pid in native.members(job):
                     diagnostic = {}
+                    operation = 'acquire_owned_process'
                     pin = handles.enter_context(native.owned_process(job, pid, known.get(pid), diagnostic=diagnostic))
                     if pin is None:
                         known_pid = dict(candidate_pid=pid) if pid in known else {}
+                        operation = 'record_membership_gap'
                         emit(root, 'membership_identity_gap', stage=args.stage, observer=False,
                              **diagnostic, **known_pid)
                         gap = True
@@ -765,12 +813,16 @@ def supervise(args):
                         # Its API error remains evidence; it is not retroactive proof of cause.
                         for sample in metadata_exit_samples(pin, diagnostic):
                             event = sample.pop('event')
+                            operation = 'record_metadata_exit'
                             emit(root, event, stage=args.stage, observer=False, **sample)
                     else:
                         owned[pid] = pin[1]
                 temporary = root / 'members.next'
+                operation = 'write_members_snapshot'
                 temporary.write_text(json.dumps(list(owned.values())), encoding='utf-8')
+                operation = 'publish_members_snapshot'
                 os.replace(temporary, root / 'members.json')
+                operation = 'query_parent_snapshot'
                 parents = native.parents()
                 for pid, process in owned.items():
                     if known.get(pid) != process:
@@ -778,26 +830,35 @@ def supervise(args):
                         # A current pinned candidate is not historical parent proof.
                         if parent and int(parent['creation'].split(':')[1]) > int(process['creation'].split(':')[1]):
                             parent = None
+                        operation = 'record_process_observation'
                         emit(root, 'process_observed', stage=args.stage, process=process, parent_candidate=parent)
                         known[pid] = process
+                operation = 'release_sample_handles'
             if gap:
                 reason = 'membership_identity_gap'
                 break
-            phase_code, observer_code = phase.poll(), observer.poll()
+            operation = 'poll_phase'
+            phase_code = phase.poll()
+            operation = 'poll_observer'
+            observer_code = observer.poll()
             if observer_code is not None:  # failed/incomplete capture dominates simultaneous phase success
                 reason = 'observer_failed'
                 break
             if phase_code is not None:
+                operation = 'recheck_observer'
                 observer_code = observer.poll()  # recheck before accepting completion
                 reason = ('observer_failed' if observer_code is not None else
                           ('completed' if phase_code == 0 else 'phase_failed'))
+                operation = 'verify_positive_control'
                 if reason == 'completed' and args.stage == 'observer-selftest' and not positive_control_seen(read_events(root)):
                     reason = 'positive_control_unobserved'
                 break
+            operation = 'observation_pause'
             time.sleep(.02)
     except Exception as error:
         reason = 'probe_error'
-        emit(root, 'supervisor_error', stage=args.stage, category=type(error).__name__)
+        emit(root, 'supervisor_error', stage=args.stage, supervisor_phase='run',
+             operation=operation, **exception_fields(error))
     finally:
         # Cancellation fences future admissions. An admitted callback owns a separate handle
         # until its thread's finally, so an unresolved shutdown cannot use our closed handle.
@@ -812,18 +873,25 @@ def supervise(args):
             elif outcome:
                 reason = outcome[0]
         try:
+            operation = 'terminate_owned_job'
             native.check(native.k.TerminateJobObject(job, 1))
             cleanup_deadline = time.monotonic() + 1
+            operation = 'enumerate_cleanup_members'
             while native.members(job) and time.monotonic() < cleanup_deadline:
+                operation = 'cleanup_pause'
                 time.sleep(.01)
+                operation = 'enumerate_cleanup_members'
+            operation = 'verify_job_empty'
             if native.members(job):
                 raise RuntimeError('owned job cleanup unconfirmed')
             for child in children:
+                operation = 'wait_owned_root'
                 child.wait(timeout=max(0, cleanup_deadline - time.monotonic()))
             cleanup = 'owned_job_empty'
         except Exception as error:
             reason = 'cleanup_failed'
-            emit(root, 'cleanup_error', stage=args.stage, category=type(error).__name__)
+            emit(root, 'cleanup_error', stage=args.stage, supervisor_phase='cleanup',
+                 operation=operation, **exception_fields(error))
         finally:
             if observation_job is not None and not native.k.CloseHandle(observation_job):
                 reason = 'cleanup_failed'
@@ -855,7 +923,8 @@ def main():
     except Exception as error:
         # Keep OS messages, arbitrary exception strings and paths out of shared evidence.
         if args.run_dir.exists():
-            emit(args.run_dir, 'probe_error', stage=args.stage, category=type(error).__name__)
+            emit(args.run_dir, 'probe_error', stage=args.stage, supervisor_phase='entry',
+                 operation='invoke_command', **exception_fields(error))
         return 2
 
 

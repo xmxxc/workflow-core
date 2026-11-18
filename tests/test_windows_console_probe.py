@@ -842,6 +842,212 @@ class MetadataExitBoundaryRegressions(unittest.TestCase):
             self.assertEqual(native.calls.count('open'), 1)
             self.assertEqual(native.calls.count(('close', 555)), 1)
 
+class SupervisorTelemetryRegressions(unittest.TestCase):
+    """Actual supervisor control flow with deterministic boundary faults, no native APIs."""
+    def test_setup_permission_failure_preserves_entry_exit_and_errno(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+        class OS:
+            name = 'nt'
+            def __getattr__(self, key):
+                return getattr(os, key)
+        original_write = Path.write_text
+        def write(path, *args, **kwargs):
+            if path.name == 'herdr.toml':
+                raise PermissionError(13, 'R9_PRIVATE_MESSAGE', 'R9_PRIVATE_PATH')
+            return original_write(path, *args, **kwargs)
+        with tempfile.TemporaryDirectory(prefix='wfc35-r9-') as directory:
+            root = Path(directory) / 'run'
+            output = io.StringIO()
+            with patch.object(probe, 'os', OS()), patch.object(Path, 'write_text', write), \
+                    patch.object(probe, 'Native') as native, \
+                    patch.object(sys, 'argv', ['probe', '--stage', 'idle', '--run-dir', str(root)]), \
+                    contextlib.redirect_stdout(output):
+                self.assertEqual(probe.main(), 2)
+                native.assert_not_called()
+            events = probe.read_events(root)
+            failure = next(e for e in events if e['event'] == 'supervisor_error')
+            self.assertEqual((failure.get('operation'), failure.get('supervisor_phase'), failure.get('errno')),
+                             ('write_fixture_config', 'setup', 13))
+            self.assertIsNone(failure.get('winerror'))
+            self.assertEqual([e['event'] for e in events], ['supervisor_error', 'probe_error'])
+            recorded = output.getvalue() + '\n'.join(p.read_text() for p in root.glob('events-*.jsonl'))
+            self.assertFalse('R9_PRIVATE_' in recorded)
+
+    def fault(self, error, point='publish'):
+        import contextlib
+        import io
+        from unittest.mock import patch
+        reviews = ReviewRegressions()
+        native = reviews.fake_native()
+        if point == 'query':
+            def members(job):
+                if native.terminated:
+                    return []
+                raise error
+            native.members = members
+        if point == 'cleanup':
+            def terminate(*args):
+                native.terminated = True
+                raise error
+            native.k.TerminateJobObject = terminate
+        with tempfile.TemporaryDirectory(prefix='wfc35-r9-') as directory:
+            root = Path(directory) / 'run'
+            output = io.StringIO()
+            with contextlib.ExitStack() as patches, contextlib.redirect_stdout(output):
+                if point == 'publish':
+                    patches.enter_context(patch.object(probe.os, 'replace', side_effect=error))
+                code = reviews.run_supervisor(root, native)
+            events = probe.read_events(root)
+            recorded = output.getvalue() + '\n' + '\n'.join(
+                p.read_bytes().decode('utf-8', errors='replace') for p in root.rglob('*') if p.is_file())
+            return code, native, events, recorded
+
+    def assert_exception_hooks_unused(self, error, calls):
+        import contextlib
+        import io
+        from unittest.mock import patch
+        for entry in (False, True):
+            with self.subTest(entry=entry):
+                calls.clear()
+                if entry:
+                    with tempfile.TemporaryDirectory(prefix='wfc35-r10-') as directory:
+                        root = Path(directory)
+                        output = io.StringIO()
+                        with patch.object(probe, 'internal', side_effect=error), \
+                                patch.object(sys, 'argv', ['probe', '--stage', 'idle', '--internal', 'phase', '--run-dir', str(root)]), \
+                                contextlib.redirect_stdout(output):
+                            code = probe.main()
+                        events = probe.read_events(root)
+                        recorded = output.getvalue() + '\n'.join(
+                            p.read_bytes().decode('utf-8', errors='replace') for p in root.rglob('*') if p.is_file())
+                    failure = next(e for e in events if e['event'] == 'probe_error')
+                    self.assertEqual((failure['operation'], failure['supervisor_phase']), ('invoke_command', 'entry'))
+                else:
+                    code, native, events, recorded = self.fault(error)
+                    self.assertTrue(native.terminated)
+                    failure = next(e for e in events if e['event'] == 'supervisor_error')
+                    self.assertEqual(failure['operation'], 'publish_members_snapshot')
+                    end = next(e for e in events if e['event'] == 'supervisor_end')
+                    self.assertEqual((end['reason'], end['cleanup'], end['watchdog_shutdown']),
+                                     ('probe_error', 'owned_job_empty', 'joined'))
+                self.assertEqual(code, 2)
+                self.assertEqual(calls, [], 'exception introspection hook executed')
+                self.assertEqual((failure['category'], failure['errno'], failure['winerror']), ('Exception', None, None))
+                self.assertNotIn('R10_PRIVATE', recorded)
+
+    def test_exception_properties_never_run_before_cleanup_or_entry_exit(self):
+        calls = []
+        class PropertyError(PermissionError):
+            @property
+            def errno(self):
+                calls.append('errno')
+                print('R10_PRIVATE_PROPERTY')
+                return 13
+            @property
+            def winerror(self):
+                calls.append('winerror')
+                print('R10_PRIVATE_PROPERTY')
+                return 5
+        self.assert_exception_hooks_unused(PropertyError(13, 'R10_PRIVATE_MESSAGE'), calls)
+
+    def test_exception_attribute_hook_never_runs_before_cleanup_or_entry_exit(self):
+        calls = []
+        class AttributeErrorSentinel(PermissionError):
+            def __getattribute__(self, name):
+                if name in ('errno', 'winerror'):
+                    calls.append(name)
+                    print('R10_PRIVATE_ATTRIBUTE')
+                    raise AssertionError('blocking-hook sentinel; never actually wait')
+                return super().__getattribute__(name)
+        self.assert_exception_hooks_unused(AttributeErrorSentinel(13, 'R10_PRIVATE_MESSAGE'), calls)
+
+    def test_exception_class_hook_never_runs_before_cleanup_or_entry_exit(self):
+        calls = []
+        class ClassError(Exception):
+            def __getattribute__(self, name):
+                if name == '__class__':
+                    calls.append(name)
+                    print('R10_PRIVATE_CLASS')
+                return super().__getattribute__(name)
+        self.assert_exception_hooks_unused(ClassError('R10_PRIVATE_MESSAGE'), calls)
+
+    def test_publish_permission_failure_has_fixed_operation_and_numeric_codes(self):
+        error = PermissionError(13, 'R9_PRIVATE_MESSAGE', 'R9_PRIVATE_PATH')
+        error.winerror = 5
+        code, native, events, recorded = self.fault(error)
+        self.assertEqual(code, 2)
+        self.assertTrue(native.terminated)
+        failure = next(e for e in events if e['event'] == 'supervisor_error')
+        self.assertEqual((failure.get('operation'), failure.get('supervisor_phase'), failure['stage']),
+                         ('publish_members_snapshot', 'run', 'idle'))
+        self.assertEqual((failure['category'], failure.get('errno'), failure.get('winerror')), ('PermissionError', 13, 5))
+        end = next(e for e in events if e['event'] == 'supervisor_end')
+        self.assertEqual((end['reason'], end['cleanup'], end['watchdog_shutdown']), ('probe_error', 'owned_job_empty', 'joined'))
+        self.assertFalse('R9_PRIVATE_' in recorded, 'exception values were persisted')
+
+    def test_exception_markers_and_noninteger_codes_never_enter_logs(self):
+        markers = ('R9_PRIVATE_TYPE', 'R9_PRIVATE_MESSAGE', 'R9_PRIVATE_ARGV', 'R9_PRIVATE_ENV', 'R9_PRIVATE_TITLE', 'R9_PRIVATE_PATH')
+        formatted = []
+        def forbidden(self):
+            formatted.append(True)
+            raise RuntimeError('must not format exception')
+        secret_type = type(markers[0], (PermissionError,), {'__str__':forbidden, '__repr__':forbidden})
+        class IntSubclass(int):
+            pass
+        for errno_value, winerror_value in ((13, None), (markers[1], markers[2]), (True, IntSubclass(5))):
+            with self.subTest(numeric=type(errno_value) is int):
+                error = secret_type(13, markers[1], markers[5])
+                error.errno, error.winerror = errno_value, winerror_value
+                error.args = (markers[2], markers[3], markers[4])
+                code, native, events, recorded = self.fault(error)
+                self.assertEqual(code, 2)
+                self.assertTrue(native.terminated)
+                failure = next(e for e in events if e['event'] == 'supervisor_error')
+                self.assertEqual(failure['category'], 'Exception')
+                self.assertIsNone(failure.get('errno'))
+                self.assertIsNone(failure.get('winerror'))
+                self.assertFalse(any(marker in recorded for marker in markers), 'unapproved exception data was persisted')
+        self.assertEqual(formatted, [])
+
+    def test_genuine_builtin_codes_require_exact_integers(self):
+        class IntSubclass(int):
+            pass
+        for errno_value, winerror_value, expected in (
+                (13, None, (13, None)), (13, 5, (13, 5)),
+                ('R10_PRIVATE_ERRNO', 'R10_PRIVATE_WINERROR', (None, None)),
+                (True, IntSubclass(5), (None, None))):
+            with self.subTest(expected=expected):
+                error = PermissionError(13, 'R10_PRIVATE_MESSAGE', 'R10_PRIVATE_PATH')
+                error.errno, error.winerror = errno_value, winerror_value
+                code, native, events, recorded = self.fault(error)
+                self.assertEqual(code, 2)
+                self.assertTrue(native.terminated)
+                failure = next(e for e in events if e['event'] == 'supervisor_error')
+                self.assertEqual(failure['category'], 'PermissionError')
+                self.assertEqual((failure['errno'], failure['winerror']), expected)
+                self.assertNotIn('R10_PRIVATE', recorded)
+
+    def test_native_query_failure_label_and_errno_without_winerror(self):
+        code, native, events, recorded = self.fault(PermissionError(13, 'R9_PRIVATE_MESSAGE'), point='query')
+        self.assertEqual(code, 2)
+        failure = next(e for e in events if e['event'] == 'supervisor_error')
+        self.assertEqual((failure.get('operation'), failure.get('errno'), failure.get('winerror')),
+                         ('enumerate_job_members', 13, None))
+        self.assertTrue(native.terminated)
+        self.assertFalse('R9_PRIVATE_' in recorded)
+
+    def test_cleanup_failure_is_labeled_without_changing_outcome(self):
+        code, native, events, recorded = self.fault(PermissionError(13, 'R9_PRIVATE_MESSAGE'), point='cleanup')
+        self.assertEqual(code, 2)
+        failure = next(e for e in events if e['event'] == 'cleanup_error')
+        self.assertEqual((failure.get('operation'), failure.get('supervisor_phase'), failure.get('errno')),
+                         ('terminate_owned_job', 'cleanup', 13))
+        end = next(e for e in events if e['event'] == 'supervisor_end')
+        self.assertEqual((end['reason'], end['cleanup']), ('cleanup_failed', 'owned_job_unconfirmed'))
+        self.assertFalse('R9_PRIVATE_' in recorded)
+
 
 if __name__ == '__main__':
     unittest.main()
