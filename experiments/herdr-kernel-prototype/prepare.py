@@ -50,8 +50,10 @@ def main():
             raise SystemExit("unexpected selected symlink: " + rel)
         dst = scratch / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
-        data = dst.read_bytes()
+        # Hash and materialize actual pinned Git bytes, including on autocrlf hosts.
+        data = git(source, "cat-file", "blob", f"{PIN}:{rel}")
+        dst.write_bytes(data)
+        shutil.copymode(src, dst)
         manifest.append({"path": rel, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
     for name in ["Cargo.toml", "src"]:
         if (authored / name).is_dir():

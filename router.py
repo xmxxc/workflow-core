@@ -14,6 +14,8 @@ import wfc_platform
 import hashlib
 import host_launch
 import herdr_backend
+import bundled_backend
+import bundled_runtime
 import json
 import os
 import re
@@ -739,19 +741,19 @@ def cmd_dispatch(args):
                (dispatch_id, 1, attempt, str(task), str(report), created))
     db.execute("UPDATE dispatch SET launch_config = ? WHERE id = ?", (config, dispatch_id))
     create_audit = None
-    if args.backend == "herdr":
+    if args.backend in ("herdr", "bundled"):
         endpoint = getattr(args, "herdr_endpoint", None) or os.environ.get("WFC_HERDR_ENDPOINT")
         db.execute("UPDATE dispatch SET backend_handle = ?, started = ? WHERE id = ?",
-                   (json.dumps({"endpoint": endpoint}), time.time(), dispatch_id))
+                   (json.dumps({"endpoint": endpoint} if args.backend == "herdr" else {"state": "not-started"}), time.time(), dispatch_id))
         create_audit = lifecycle_event(db, dispatch_id, "create", round=1, attempt=attempt, to_attempt=attempt,
-                                       to_host=args.host, result="pending", diagnostic="Herdr create pending")
+                                       to_host=args.host, result="pending", diagnostic=f"{args.backend} create pending")
         # The attempt exists durably before Herdr can start an external writer.
         db.execute("COMMIT")
         try:
             with input_lock(dispatch_id):
                 created_result = backend.create(dispatch_id, cwd, command, extra_env, label)
         except (OSError, ValueError, TypeError, KeyError, RuntimeError):
-            created_result = backend_result(UNCERTAIN, "Herdr create requires explicit reconciliation", category="unknown")
+            created_result = backend_result(UNCERTAIN, f"{args.backend} create requires explicit reconciliation", category="unknown")
         db.execute("BEGIN IMMEDIATE")
         require_owner(db, scope, owner_token(args), "dispatch")
         finish_lifecycle_event(db, create_audit, created_result["result"], created_result.get("diagnostic"))
@@ -774,7 +776,7 @@ def cmd_dispatch(args):
         db.execute("UPDATE dispatch_round SET state = 'unknown', result = ? WHERE dispatch = ? AND round = 1 AND attempt = ?",
                    (json.dumps({"backend": args.backend, "result": created_result["result"],
                                 "diagnostic": diagnostic}, ensure_ascii=False), dispatch_id, attempt))
-        if created_result["result"] == UNCERTAIN and args.backend != "herdr":
+        if created_result["result"] == UNCERTAIN and args.backend not in ("herdr", "bundled"):
             db.execute("UPDATE dispatch_round SET state = 'running' WHERE dispatch = ? AND round = 1 AND attempt = ?",
                        (dispatch_id, attempt))
         db.execute("INSERT OR REPLACE INTO fault_event (dispatch, operation, outcome, category, diagnostic, created) "
@@ -1096,7 +1098,7 @@ def cmd_ask(args):
     # A fast newly launched Herdr worker may ask before resume's external call
     # returns. Record its exact-attempt question without promoting unknown state
     # or authorizing reply/input until the pending launch has settled.
-    pending_launch = (identity["backend"] == "herdr" and current_round is not None
+    pending_launch = (identity["backend"] in ("herdr", "bundled") and current_round is not None
                       and current_round["state"] == "unknown" and args.attempt == identity["current_attempt"]
                       and db.execute("SELECT 1 FROM lifecycle_event WHERE dispatch = ? AND round = ? "
                                      "AND to_attempt = ? AND operation IN ('resume', 'handoff') AND result = 'pending'",
@@ -1616,14 +1618,14 @@ class TmuxBackend(ExecutionBackend):
         return backend_result(UNCERTAIN, killed.stderr or killed.stdout or f"tmux exited {killed.returncode}")
 
 
-BACKENDS = {"tmux": TmuxBackend, "herdr": herdr_backend.HerdrBackend}
+BACKENDS = {"tmux": TmuxBackend, "herdr": herdr_backend.HerdrBackend, "bundled": bundled_backend.BundledBackend}
 
 
 def backend_for(dispatch_or_name, db=None):
     """Resolve a dispatch's recorded backend, defaulting pre-contract rows to tmux."""
     name = dispatch_or_name if isinstance(dispatch_or_name, str) else (dispatch_or_name["backend"] or "tmux")
-    if name == "herdr":
-        return herdr_backend.HerdrBackend(db, None if isinstance(dispatch_or_name, str) else dispatch_or_name)
+    if name in ("herdr", "bundled"):
+        return BACKENDS[name](db, None if isinstance(dispatch_or_name, str) else dispatch_or_name)
     factory = BACKENDS.get(name)
     if factory is None:
         raise SystemExit(f"unknown execution backend {name!r}")
@@ -3329,6 +3331,10 @@ def cmd_herdr_call(args):
 
 
 def main(argv):
+    if argv[:1] == ["_bundled-guard"]:
+        return bundled_runtime.guard(argv[1])
+    if argv[:1] == ["_bundled-runtime"]:
+        return bundled_runtime.run(argv[1])
     if argv[:1] == ["_host-run"]:
         return host_launch.supervise(argv[1])
     wfc_platform.configure_stdio()
