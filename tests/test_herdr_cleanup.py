@@ -1,5 +1,7 @@
 """Fixture cleanup control flow; modeled taskkill results are not Windows evidence."""
 import contextlib
+import ctypes
+from ctypes import wintypes
 import io
 import json
 import os
@@ -12,6 +14,139 @@ import unittest
 from unittest.mock import Mock, patch
 
 import test_herdr
+
+
+class OwnedWindowsDescendant:
+    """Retain a read-only handle to one creation identity across Job cleanup."""
+    def __init__(self, identity):
+        self.identity = dict(identity)
+        self.kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        signatures = {
+            'OpenProcess': ([wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+            'GetProcessTimes': ([wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4, wintypes.BOOL),
+            'WaitForSingleObject': ([wintypes.HANDLE, wintypes.DWORD], wintypes.DWORD),
+            'GetExitCodeProcess': ([wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+            'CloseHandle': ([wintypes.HANDLE], wintypes.BOOL),
+        }
+        for name, (args, result) in signatures.items():
+            function = getattr(self.kernel, name)
+            function.argtypes, function.restype = args, result
+        self.handle = self.kernel.OpenProcess(0x1000 | 0x100000, False, identity['pid'])
+        if not self.handle:
+            raise OSError(ctypes.get_last_error(), 'cannot observe owned descendant')
+        try:
+            times = [wintypes.FILETIME() for _ in range(4)]
+            if not self.kernel.GetProcessTimes(self.handle, *(ctypes.byref(value) for value in times)):
+                raise OSError(ctypes.get_last_error(), 'cannot verify descendant creation')
+            creation = 'windows:' + str((times[0].dwHighDateTime << 32) | times[0].dwLowDateTime)
+            if creation != identity['creation']:
+                raise AssertionError('descendant creation identity changed before observation')
+            if self.kernel.WaitForSingleObject(self.handle, 0) != 258:
+                raise AssertionError('controlled descendant must be live before cleanup')
+        except BaseException:
+            self.close()
+            raise
+
+    def wait_exited(self):
+        # Wait for this exact process object's exit event; Job accounting and a
+        # creation value alone are not substitutes for the native signal.
+        observed = self.kernel.WaitForSingleObject(self.handle, 5000)
+        if observed != 0:
+            raise AssertionError('owned descendant exit signal unconfirmed: ' + json.dumps({
+                **self.identity, 'wait_result': observed,
+                'winerror': ctypes.get_last_error() if observed == 0xffffffff else None}))
+        code = wintypes.DWORD()
+        if not self.kernel.GetExitCodeProcess(self.handle, ctypes.byref(code)):
+            raise OSError(ctypes.get_last_error(), 'cannot read signaled descendant exit code')
+        return {**self.identity, 'state': 'exited', 'wait_result': observed, 'exit_code': code.value}
+
+    def close(self):
+        if self.handle:
+            if not self.kernel.CloseHandle(self.handle):
+                raise OSError(ctypes.get_last_error(), 'cannot close descendant observation handle')
+            self.handle = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *error):
+        self.close()
+
+
+class DescendantObservation(unittest.TestCase):
+    def kernel(self, waits, exit_value=1):
+        kernel = Mock()
+        kernel.OpenProcess.return_value = 123
+        kernel.WaitForSingleObject.side_effect = waits
+        def times(handle, created, exited, system, user):
+            ctypes.cast(created, ctypes.POINTER(wintypes.FILETIME)).contents.dwLowDateTime = 7
+            return True
+        def exit_code(handle, code):
+            ctypes.cast(code, ctypes.POINTER(wintypes.DWORD)).contents.value = exit_value
+            return True
+        kernel.GetProcessTimes.side_effect = times
+        kernel.GetExitCodeProcess.side_effect = exit_code
+        return kernel
+
+    def test_native_case_uses_exit_signal_when_creation_identity_is_retained(self):
+        import wfc_platform
+        kernel = self.kernel([258, 0])
+        identity = {'pid': 456, 'creation': 'windows:7'}
+        fixture = SimpleNamespace(server=Mock(returncode=0), log=io.StringIO(json.dumps(identity)),
+                                  stop_server=Mock())
+        fixture.server.wait.return_value = 0
+        case = HerdrCleanup('test_native_job_cleans_descendant_after_root_exit')
+        native = HerdrCleanup.test_native_job_cleans_descendant_after_root_exit
+        body = getattr(native, '__wrapped__', native)
+        with patch.object(case, 'launch', return_value=fixture), \
+                patch.object(wfc_platform, 'process_identity', return_value=identity['creation']), \
+                patch.object(wfc_platform, 'process_probe', side_effect=[
+                    {'state': 'alive', 'identity': identity['creation']},
+                    {'state': 'exited', 'identity': None}]), \
+                patch.object(ctypes, 'WinDLL', return_value=kernel, create=True):
+            body(case)
+        fixture.stop_server.assert_called_once_with()
+        kernel.WaitForSingleObject.assert_any_call(123, 5000)
+
+    def test_unsignaled_or_failed_wait_cannot_confirm_exit(self):
+        for observed in (258, 0xffffffff):
+            with self.subTest(wait_result=observed):
+                kernel = self.kernel([258, observed])
+                with patch.object(ctypes, 'WinDLL', return_value=kernel, create=True), \
+                        patch.object(ctypes, 'get_last_error', return_value=5, create=True):
+                    with self.assertRaisesRegex(AssertionError, 'exit signal unconfirmed'):
+                        with OwnedWindowsDescendant({'pid': 456, 'creation': 'windows:7'}) as child:
+                            child.wait_exited()
+                kernel.GetExitCodeProcess.assert_not_called()
+                kernel.CloseHandle.assert_called_once_with(123)
+
+    def test_creation_mismatch_refuses_observation_and_closes_handle(self):
+        kernel = self.kernel([])
+        with patch.object(ctypes, 'WinDLL', return_value=kernel, create=True):
+            with self.assertRaisesRegex(AssertionError, 'creation identity changed'):
+                OwnedWindowsDescendant({'pid': 456, 'creation': 'windows:8'})
+        kernel.OpenProcess.assert_called_once_with(0x1000 | 0x100000, False, 456)
+        kernel.WaitForSingleObject.assert_not_called()
+        kernel.CloseHandle.assert_called_once_with(123)
+
+    def test_inaccessible_descendant_is_not_classified_as_exited(self):
+        kernel = self.kernel([])
+        kernel.OpenProcess.return_value = 0
+        with patch.object(ctypes, 'WinDLL', return_value=kernel, create=True), \
+                patch.object(ctypes, 'get_last_error', return_value=5, create=True):
+            with self.assertRaises(OSError):
+                OwnedWindowsDescendant({'pid': 456, 'creation': 'windows:7'})
+        kernel.WaitForSingleObject.assert_not_called()
+
+    def test_exit_code_alone_does_not_replace_the_signal(self):
+        kernel = self.kernel([258, 0], exit_value=259)
+        with patch.object(ctypes, 'WinDLL', return_value=kernel, create=True):
+            with OwnedWindowsDescendant({'pid': 456, 'creation': 'windows:7'}) as child:
+                # A signaled process can itself return 259; the event is authoritative.
+                result = child.wait_exited()
+        self.assertEqual(result['state'], 'exited')
+        self.assertEqual(result['exit_code'], 259)
+        self.assertEqual(result['wait_result'], 0)
 
 
 class HerdrCleanup(unittest.TestCase):
@@ -212,9 +347,21 @@ class HerdrCleanup(unittest.TestCase):
         case.log.seek(0)
         identity = json.loads(case.log.read())
         self.assertTrue(identity['creation'])
-        self.assertEqual(wfc_platform.process_identity(identity['pid']), identity['creation'])
-        case.stop_server()  # ActiveProcesses == 0 is required even though root already exited.
-        self.assertNotEqual(wfc_platform.process_identity(identity['pid']), identity['creation'])
+        before = wfc_platform.process_probe(identity['pid'])
+        self.assertEqual(before['state'], 'alive', before)
+        self.assertEqual(before['identity'], identity['creation'])
+        with OwnedWindowsDescendant(identity) as descendant:
+            signaled = None
+            try:
+                case.stop_server()  # Still requires Job ActiveProcesses == 0 and root reaping.
+                self.assertEqual(case.server.returncode, 0)
+                signaled = descendant.wait_exited()
+            finally:
+                after = wfc_platform.process_probe(identity['pid'])
+                print('[herdr-descendant-exit] ' + json.dumps({
+                    'owned': identity, 'before': before, 'signal': signaled, 'after': after}), file=sys.stderr)
+            self.assertEqual(signaled['state'], 'exited')
+            self.assertEqual(after['state'], 'exited', after)
 
 
 if __name__ == '__main__':
