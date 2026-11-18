@@ -223,7 +223,9 @@ class ReviewRegressions(unittest.TestCase):
             def parents(self):
                 return {}
             @contextmanager
-            def owned_process(self, job, pid, expected=None):
+            def owned_process(self, job, pid, expected=None, diagnostic=None):
+                if diagnostic is not None:
+                    diagnostic.update(category='membership_refused', api='IsProcessInJob', winerror=None)
                 yield None  # the numeric candidate is an outside-job replacement
         return Fake()
 
@@ -323,7 +325,7 @@ class ReviewRegressions(unittest.TestCase):
                     AttachConsole=lambda pid: calls.append('attach') or False)
                 native.identity = lambda h: 'windows:999' if case == 'wrong_creation' else 'windows:1'
                 process = dict(pid=321, creation='windows:1', image='owned.exe')
-                def metadata(handle, pid):
+                def metadata(handle, pid, creation=None):
                     self.assertFalse(closed)
                     calls.append('image')
                     return process
@@ -404,6 +406,289 @@ class ReviewRegressions(unittest.TestCase):
             self.assertEqual(end['reason'], 'watchdog_failed')
             self.assertEqual(end['watchdog_shutdown'], 'joined')
             self.assertEqual(end['cleanup'], 'owned_job_empty')
+
+class NativeGapRegressions(unittest.TestCase):
+    """Real native adapter/observer control flow with deterministic API outcomes."""
+    def native(self):
+        import ctypes as C
+        from types import SimpleNamespace
+        native = object.__new__(probe.Native)
+        native.W = SimpleNamespace(BOOL=C.c_int)
+        native.mode, native.calls = 'alive', []
+        process = dict(pid=321, creation='windows:1', image='owned.exe')
+        def member(handle, job, out):
+            native.calls.append('membership')
+            if native.mode == 'exit-during-member':
+                native.mode = 'exited'
+            C.cast(out, C.POINTER(C.c_int))[0] = native.mode != 'refused' and native.mode != 'exited'
+            return native.mode != 'member-query-failed'
+        def open_process(*args):
+            native.calls.append('open')
+            return 0 if native.mode == 'open-failed' else 555
+        def wait(*args):
+            native.calls.append('wait')
+            return 0 if native.mode == 'exited' else (0xffffffff if native.mode == 'wait-failed' else 258)
+        native.k = SimpleNamespace(OpenProcess=open_process, IsProcessInJob=member, WaitForSingleObject=wait,
+            CloseHandle=lambda h: native.calls.append(('close', h)) or True, FreeConsole=lambda: True,
+            AttachConsole=lambda pid: native.calls.append('attach') or False)
+        native.identity = lambda h: 'windows:1'
+        def metadata(handle, pid, creation=None):
+            native.calls.append('image')
+            return process.copy()
+        native.metadata = metadata
+        native.error_code = lambda: 87 if native.mode == 'open-failed' else 5
+        native.observation_job = lambda root: 123
+        native.windows = lambda owned: []
+        native.console = lambda p, h: native.calls.append('console') or dict(event='console_unavailable')
+        return native, process
+
+    def observe(self, mode, initial=None):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory(prefix='wfc35-r6-') as directory:
+            root = Path(directory)
+            native, process = self.native()
+            if initial is not None:
+                native.mode = initial
+            member = root / 'members.json'
+            member.write_text(json.dumps([process]))
+            rounds = []
+            def advance(_):
+                rounds.append(True)
+                native.mode = mode
+                if mode == 'replacement':
+                    member.write_text(json.dumps([{**process, 'creation': 'windows:999', 'image': 'unrelated.exe'}]))
+            with patch.object(probe, 'Native', lambda: native), patch.object(probe.time, 'sleep', advance), \
+                    patch.object(probe, 'stop_reason', lambda *a: 'deadline' if len(rounds) >= 2 else None):
+                probe.observe(root, 'observer-selftest')
+            return native, probe.read_events(root), (root / 'STOP').exists()
+
+    def test_verified_cached_exit_is_observed_without_STOP_or_reopen(self):
+        for mode in ('exited', 'exit-during-member'):
+            with self.subTest(mode=mode):
+                native, events, stopped = self.observe(mode)
+                self.assertFalse(stopped, events)
+                self.assertFalse(any(e['event'] == 'membership_identity_gap' for e in events), events)
+                exited = [e for e in events if e['event'] == 'owned_process_exited']
+                self.assertEqual(len(exited), 1, events)
+                self.assertEqual((exited[0]['candidate_pid'], exited[0]['creation'], exited[0]['proof']),
+                                 (321, 'windows:1', 'retained_handle_signaled'))
+                self.assertEqual(native.calls.count('open'), 1)
+                self.assertEqual(native.calls.count('image'), 1)
+                self.assertEqual(native.calls.count('console'), 1)
+                self.assertEqual(native.calls.count(('close', 555)), 1)
+
+    def test_cached_membership_refusal_is_not_an_exit(self):
+        native, events, stopped = self.observe('refused')
+        self.assertTrue(stopped)
+        gap = next(e for e in events if e['event'] == 'membership_identity_gap')
+        self.assertEqual((gap['candidate_pid'], gap['category'], gap['api']),
+                         (321, 'membership_refused', 'IsProcessInJob'))
+        self.assertFalse(any(e['event'] == 'owned_process_exited' for e in events))
+        self.assertEqual(native.calls.count('console'), 1)
+
+    def test_cached_query_failure_is_unknown_and_stops(self):
+        for mode, api in (('wait-failed', 'WaitForSingleObject'), ('member-query-failed', 'IsProcessInJob')):
+            with self.subTest(mode=mode):
+                native, events, stopped = self.observe(mode)
+                self.assertTrue(stopped)
+                gap = next(e for e in events if e['event'] == 'membership_identity_gap')
+                self.assertEqual((gap['category'], gap['api'], gap['winerror']), ('query_failed', api, 5))
+                self.assertFalse(any(e['event'] == 'owned_process_exited' for e in events))
+                self.assertEqual(native.calls.count('console'), 1)
+
+    def test_changed_publication_never_observes_replacement(self):
+        native, events, stopped = self.observe('replacement')
+        self.assertTrue(stopped)
+        gap = next(e for e in events if e['event'] == 'membership_identity_gap')
+        self.assertEqual(gap['category'], 'published_identity_changed')
+        self.assertNotIn('unrelated.exe', json.dumps(events))
+        self.assertNotIn('windows:999', json.dumps(events))
+        self.assertEqual(native.calls.count('open'), 1)
+        self.assertEqual(native.calls.count('console'), 1)
+
+    def test_console_exit_proof_and_query_or_attach_failures_remain_distinct(self):
+        for case in ('exited', 'wait-failed', 'alive'):
+            with self.subTest(case=case):
+                native, process = self.native()
+                with native.owned_process(123, 321, process) as pin:
+                    self.assertIsNotNone(pin)
+                    native.mode = case
+                    event = probe.Native.console(native, process, pin[0])
+                if case == 'exited':
+                    self.assertEqual(event['event'], 'owned_process_exited')
+                    self.assertEqual(event['proof'], 'retained_handle_signaled')
+                    self.assertNotIn('attach', native.calls)
+                elif case == 'wait-failed':
+                    self.assertEqual((event['event'], event['category'], event['api'], event['winerror']),
+                        ('console_identity_ambiguous', 'query_failed', 'WaitForSingleObject', 5))
+                    self.assertNotIn('attach', native.calls)
+                else:
+                    self.assertEqual((event['event'], event['category'], event['api'], event['winerror']),
+                        ('console_unavailable', 'attach_failed', 'AttachConsole', 5))
+
+    def test_unverified_open_failure_is_not_verified_exit(self):
+        native, process = self.native()
+        native.mode, diagnostic = 'open-failed', {}
+        # Entry disappearance (including ERROR_INVALID_PARAMETER) is not exit proof.
+        with native.owned_process(123, 321, process, diagnostic=diagnostic) as pin:
+            self.assertIsNone(pin)
+        self.assertEqual(diagnostic, dict(category='query_failed', api='OpenProcess', winerror=87))
+        self.assertNotIn('image', native.calls)
+        native, events, stopped = self.observe('open-failed', initial='open-failed')
+        self.assertTrue(stopped)
+        self.assertFalse(any(e['event'] == 'owned_process_exited' for e in events))
+        gap = next(e for e in events if e['event'] == 'membership_identity_gap')
+        self.assertEqual((gap['candidate_pid'], gap['api'], gap['winerror']), (321, 'OpenProcess', 87))
+        self.assertNotIn('image', native.calls)
+        self.assertNotIn('console', native.calls)
+
+class EnumWindowLivenessRegressions(unittest.TestCase):
+    """Real ownership/observer/window/console seam; only Win32 calls are simulated."""
+    def observe(self, position=1, result=0xffffffff, window='owned'):
+        import ctypes as C
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        native, process = NativeGapRegressions().native()
+        native_type = probe.Native
+        native.W.DWORD = C.c_uint32
+        native.callback = lambda fn: fn
+        sampling = dict(active=False, waits=0, injected=0, owners=0)
+        original_wait = native.k.WaitForSingleObject
+        def wait(handle, timeout):
+            if sampling['active']:
+                sampling['waits'] += 1
+                if sampling['waits'] == position and result is not None:
+                    sampling['injected'] += 1
+                    native.calls.append(('enum_wait', result))
+                    if result == 0:
+                        native.mode = 'exited'
+                    return result
+            return original_wait(handle, timeout)
+        def owner(hwnd, output):
+            if sampling['active']:
+                sampling['owners'] += 1
+                if window == 'vanished' and sampling['owners'] == 2:
+                    return 0
+            C.cast(output, C.POINTER(C.c_uint32))[0] = (999 if sampling['active'] and window == 'foreign' else process['pid'])
+            return 1
+        def enum(callback, param):
+            sampling['active'] = True
+            try:
+                if window != 'empty':
+                    self.assertTrue(callback(456, param))
+            finally:
+                sampling['active'] = False
+            return True
+        def members(output, count):
+            output[0] = process['pid']
+            return 1
+        native.k.WaitForSingleObject = wait
+        native.k.AttachConsole = lambda pid: native.calls.append('attach') or True
+        native.k.SetConsoleCtrlHandler = lambda *args: True
+        native.k.GetConsoleWindow = lambda: 456
+        native.k.GetConsoleProcessList = members
+        native.u = SimpleNamespace(EnumWindows=enum, GetWindowThreadProcessId=owner,
+            IsWindowVisible=lambda hwnd: window != 'hidden')
+        native.windows = lambda pins: native_type.windows(native, pins)
+        def console(proc, handle):
+            native.calls.append(('console_STOP_present', (root / 'STOP').exists()))
+            return native_type.console(native, proc, handle)
+        native.console = console
+        def associated_process(pid):
+            self.assertEqual(pid, process['pid'])  # no metadata query for foreign enum owner 999
+            native.calls.append('associated_owner')
+            return process.copy()
+        native.process = associated_process
+        with tempfile.TemporaryDirectory(prefix='wfc35-r7-') as directory:
+            root = Path(directory)
+            (root / 'members.json').write_text(json.dumps([process]))
+            rounds = []
+            with patch.object(probe, 'Native', lambda: native), \
+                    patch.object(probe.time, 'sleep', lambda _: rounds.append(True)), \
+                    patch.object(probe, 'stop_reason', lambda *args: 'deadline' if rounds else None):
+                probe.observe(root, 'idle')
+            return native, sampling, probe.read_events(root), (root / 'STOP').exists()
+
+    def assert_unknown_sticks(self, position):
+        native, sampling, events, stopped = self.observe(position)
+        self.assertEqual(sampling['injected'], 1)
+        self.assertTrue(stopped, events)
+        diagnostics = [e for e in events if e.get('api') == 'WaitForSingleObject']
+        self.assertTrue(diagnostics, events)
+        self.assertEqual((diagnostics[0]['category'], diagnostics[0]['winerror'], diagnostics[0]['candidate_pid']),
+                         ('query_failed', 5, 321))
+        self.assertEqual(diagnostics[0]['check'], 'before_visibility' if position == 1 else 'after_visibility')
+        self.assertFalse(any(e['event'] == 'owned_process_exited' for e in events))
+        self.assertTrue(any(e['event'] == 'console_association' for e in events), events)
+        self.assertIn('attach', native.calls)
+        self.assertIn(('console_STOP_present', True), native.calls)
+        # Unknown classification must be persisted before later successful association.
+        self.assertLess(events.index(diagnostics[0]), next(i for i,e in enumerate(events) if e['event']=='console_association'))
+        self.assertEqual(native.calls.count('open'), 1)
+        self.assertEqual(native.calls.count('image'), 1)
+
+    def test_first_callback_wait_failure_survives_later_console_success(self):
+        self.assert_unknown_sticks(1)
+
+    def test_second_callback_wait_failure_survives_later_console_success(self):
+        self.assert_unknown_sticks(2)
+
+    def test_propagated_STOP_cannot_be_accepted_as_simultaneous_phase_success(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        reviews = ReviewRegressions()
+        native = reviews.fake_native()
+        class OS:
+            name = 'nt'
+            def __getattr__(self, key):
+                return getattr(os, key)
+        with tempfile.TemporaryDirectory(prefix='wfc35-r7-boundary-') as directory:
+            root = Path(directory) / 'run'
+            class Phase(reviews.Child):
+                def poll(self):
+                    (root / 'STOP').touch()
+                    return 0
+            def spawn(root, role, *args):
+                return reviews.Child(None) if role == 'observer' else Phase(0)
+            def watchdog(stop, deadline, terminate, release):
+                # Model a callback not yet scheduled when phase completion is sampled.
+                thread = SimpleNamespace(join=lambda timeout: release(), is_alive=lambda: False)
+                return threading.Event(), thread, []
+            with patch.object(probe, 'os', OS()), patch.object(probe, 'Native', lambda: native),                     patch.object(probe, 'isolated_env', lambda root: {}), patch.object(probe, 'spawn', spawn),                     patch.object(probe, 'start_watchdog', watchdog):
+                code = probe.supervise(SimpleNamespace(run_dir=root, stage='idle', seconds=6))
+            self.assertEqual(code, 2)
+            end = next(e for e in probe.read_events(root) if e['event'] == 'supervisor_end')
+            self.assertEqual(end['reason'], 'STOP')
+            self.assertEqual(end['cleanup'], 'owned_job_empty')
+
+    def test_signaled_retained_object_stays_exit_proof_at_either_position(self):
+        for position in (1, 2):
+            with self.subTest(position=position):
+                native, sampling, events, stopped = self.observe(position, result=0)
+                self.assertEqual(sampling['injected'], 1)
+                self.assertFalse(stopped, events)
+                exited = [e for e in events if e['event'] == 'owned_process_exited']
+                self.assertEqual(len(exited), 1, events)
+                self.assertEqual((exited[0]['candidate_pid'], exited[0]['proof']), (321, 'retained_handle_signaled'))
+                self.assertNotIn('attach', native.calls)
+
+    def test_ordinary_no_visible_window_results_do_not_force_failure(self):
+        for window in ('empty', 'foreign', 'hidden', 'vanished'):
+            with self.subTest(window=window):
+                native, sampling, events, stopped = self.observe(result=None, window=window)
+                self.assertFalse(stopped, events)
+                self.assertFalse(any(e.get('category') == 'query_failed' for e in events), events)
+                self.assertFalse(any(e['event'] == 'owned_process_exited' for e in events))
+                if window == 'foreign':
+                    self.assertEqual(sampling['waits'], 0)
+                    for event in events:
+                        self.assertNotEqual(event.get('candidate_pid'), 999)
+                        for field in ('owner', 'process'):
+                            self.assertNotEqual((event.get(field) or {}).get('pid'), 999)
+                if window == 'hidden':
+                    windows = [e for e in events if e['event'] == 'owned_window']
+                    self.assertTrue(windows)
+                    self.assertFalse(windows[0]['visible'])
 
 
 if __name__ == '__main__':

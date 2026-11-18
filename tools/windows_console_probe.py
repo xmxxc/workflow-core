@@ -189,34 +189,84 @@ class Native:
         finally:
             self.k.CloseHandle(handle)
 
-    def metadata(self, handle, pid):
-        creation = self.identity(handle)
+    def metadata(self, handle, pid, creation=None):
+        creation = creation or self.identity(handle)
         image = C.create_unicode_buffer(32768)
         size = self.W.DWORD(len(image))
         self.check(self.k.QueryFullProcessImageNameW(handle, 0, image, C.byref(size)))
         return dict(pid=pid, creation=creation, image=Path(image.value).name)
 
-    def alive(self, handle):
-        return self.k.WaitForSingleObject(handle, 0) == 258  # WAIT_TIMEOUT only
+    def error_code(self):
+        return getattr(C, 'get_last_error', lambda: 0)()
+
+    def liveness(self, handle):
+        result = self.k.WaitForSingleObject(handle, 0)
+        if result == 258:
+            return 'alive', {}
+        if result == 0:
+            return 'exited', {}
+        return 'unknown', dict(category='query_failed' if result == 0xffffffff else 'unexpected_result',
+            api='WaitForSingleObject', winerror=self.error_code() if result == 0xffffffff else None)
+
+    def retained_state(self, job, pin, expected):
+        handle, process = pin
+        if process != expected:
+            return 'unknown', dict(category='published_identity_changed', api=None, winerror=None)
+        state, diagnostic = self.liveness(handle)
+        if state != 'alive':
+            return state, diagnostic  # only a previously verified, still-retained object can prove exit
+        member = self.W.BOOL()
+        if not self.k.IsProcessInJob(handle, job, C.byref(member)):
+            return 'unknown', dict(category='query_failed', api='IsProcessInJob', winerror=self.error_code())
+        if not member.value:
+            # The object can exit between wait and membership query; prove that on this handle.
+            state, diagnostic = self.liveness(handle)
+            if state == 'exited':
+                return state, diagnostic
+            return 'unknown', diagnostic or dict(category='membership_refused', api='IsProcessInJob', winerror=None)
+        return 'alive', {}
 
     @contextmanager
-    def owned_process(self, job, pid, expected=None):
-        """Pin one process object; authorize before querying image or attaching by PID."""
+    def owned_process(self, job, pid, expected=None, diagnostic=None):
+        """Acquire one live owned object; failures never establish an exit proof."""
+        diagnostic = diagnostic if diagnostic is not None else {}
         handle = self.k.OpenProcess(0x1000 | 0x100000, False, pid)
-        pin = None
+        api = 'OpenProcess'
+        def refuse(category, operation, winerror=None):
+            diagnostic.update(category=category, api=operation, winerror=winerror)
+            return None
+        def validate():
+            nonlocal api
+            if not handle:
+                return refuse('query_failed', api, self.error_code())
+            api = 'IsProcessInJob'
+            member = self.W.BOOL()
+            if not self.k.IsProcessInJob(handle, job, C.byref(member)):
+                return refuse('query_failed', api, self.error_code())
+            if not member.value:
+                return refuse('membership_refused', api)
+            state, detail = self.liveness(handle)
+            if state != 'alive':
+                diagnostic.update(detail or dict(category='unverified_exit', api='WaitForSingleObject', winerror=None))
+                return None
+            api = 'GetProcessTimes'
+            creation = self.identity(handle)
+            if expected is not None and creation != expected.get('creation'):
+                return refuse('published_identity_changed', api)
+            api = 'QueryFullProcessImageNameW'
+            process = self.metadata(handle, pid, creation=creation)
+            if expected is not None and process != expected:
+                return refuse('published_identity_changed', api)
+            state, detail = self.liveness(handle)
+            if state != 'alive':
+                diagnostic.update(detail or dict(category='unverified_exit', api='WaitForSingleObject', winerror=None))
+                return None
+            return handle, process
         try:
-            if handle:
-                member = self.W.BOOL()
-                if (self.k.IsProcessInJob(handle, job, C.byref(member)) and member.value
-                        and self.alive(handle)):
-                    creation = self.identity(handle)
-                    if expected is None or creation == expected.get('creation'):
-                        process = self.metadata(handle, pid)
-                        if self.alive(handle) and (expected is None or process == expected):
-                            pin = (handle, process)
-        except OSError:
-            pass  # no foreign metadata escapes; caller records a membership gap
-        try:
+            try:
+                pin = validate()
+            except OSError:
+                pin = refuse('query_failed', api, self.error_code())
             yield pin
         finally:
             if handle:
@@ -290,43 +340,73 @@ class Native:
             self.k.CloseHandle(handle)
 
     def windows(self, pins):
-        windows = []
+        samples = []
+        def live(pid, check):
+            handle, process = pins[pid]
+            state, diagnostic = self.liveness(handle)
+            if state == 'alive':
+                return True
+            if state == 'exited':
+                samples.append(owned_exit(process))
+            else:
+                samples.append(dict(event='window_identity_ambiguous', candidate_pid=pid,
+                                    check=check, **diagnostic))
+            return False
         def sample(hwnd, _):
             pid = self.W.DWORD()
-            if self.u.GetWindowThreadProcessId(hwnd, C.byref(pid)) and pid.value in pins and self.alive(pins[pid.value][0]):
+            if (self.u.GetWindowThreadProcessId(hwnd, C.byref(pid)) and pid.value in pins
+                    and live(pid.value, 'before_visibility')):
                 visible, again = bool(self.u.IsWindowVisible(hwnd)), self.W.DWORD()
-                if self.u.GetWindowThreadProcessId(hwnd, C.byref(again)) and again.value == pid.value:
-                    if self.alive(pins[pid.value][0]):
-                        windows.append(dict(hwnd=int(hwnd), owner=pins[pid.value][1], visible=visible))
+                if (self.u.GetWindowThreadProcessId(hwnd, C.byref(again)) and again.value == pid.value
+                        and live(pid.value, 'after_visibility')):
+                    samples.append(dict(event='owned_window', hwnd=int(hwnd), owner=pins[pid.value][1], visible=visible))
             return True
         callback = self.callback(sample)
         self.check(self.u.EnumWindows(callback, 0))
-        return windows
+        return samples
 
     def console(self, process, handle):
-        # Called only in the dedicated console-free observer, never the user's shell.
-        if not self.alive(handle):
-            return dict(event='console_identity_ambiguous')
+        # Called only for a retained verified object, in the console-free observer.
+        def lifecycle_event():
+            state, diagnostic = self.liveness(handle)
+            if state == 'exited':
+                return owned_exit(process)
+            if state == 'unknown':
+                return dict(event='console_identity_ambiguous', candidate_pid=process['pid'], **diagnostic)
+            return None
+        event = lifecycle_event()
+        if event:
+            return event
         if not self.k.AttachConsole(process['pid']):
-            return dict(event='console_unavailable', process=process)
+            code = self.error_code()
+            return lifecycle_event() or dict(event='console_unavailable', process=process,
+                category='attach_failed', api='AttachConsole', winerror=code)
         try:
             self.k.SetConsoleCtrlHandler(None, True)  # never generate console control events
-            if not self.alive(handle):
-                return dict(event='console_identity_ambiguous')
+            event = lifecycle_event()
+            if event:
+                return event
             hwnd = self.k.GetConsoleWindow()
             pids = (self.W.DWORD * 128)()
             count = self.k.GetConsoleProcessList(pids, 128)
             if not count or count > 128:
-                return dict(event='console_membership_unknown', process=process)
+                code = self.error_code() if not count else None
+                return lifecycle_event() or dict(event='console_membership_unknown', process=process,
+                    category='query_failed' if not count else 'membership_limit',
+                    api='GetConsoleProcessList', winerror=code)
             owner = self.W.DWORD()
             if hwnd:
                 self.u.GetWindowThreadProcessId(hwnd, C.byref(owner))
             # Console host can be outside our job. Query only the API-associated owner.
             host = self.process(owner.value) if owner.value else None
+            event = lifecycle_event()
+            if event:
+                return event
             again = self.W.DWORD()
-            if (not self.alive(handle) or process['pid'] not in pids[:count]
+            if (process['pid'] not in pids[:count]
                     or (hwnd and (not self.u.GetWindowThreadProcessId(hwnd, C.byref(again)) or again.value != owner.value))):
-                return dict(event='console_identity_ambiguous', process=process)
+                return dict(event='console_identity_ambiguous', candidate_pid=process['pid'],
+                            category='console_identity_changed', api=None, winerror=None)
             return dict(event='console_association', process=process, hwnd=int(hwnd or 0),
                         owner=host, visible=bool(hwnd and self.u.IsWindowVisible(hwnd)),
                         attached_owned_pid_present=process['pid'] in pids[:count])
@@ -355,43 +435,75 @@ def spawn(root, role, stage, env, native, job, observation_job):
         raise
 
 
+def owned_exit(process):
+    return dict(event='owned_process_exited', candidate_pid=process['pid'], creation=process['creation'],
+                proof='retained_handle_signaled', api='WaitForSingleObject')
+
+
+def observer_pin(native, job, process, retained, cache):
+    pid, diagnostic = process['pid'], {}
+    if pid in cache:
+        pin = cache[pid]
+        state, diagnostic = native.retained_state(job, pin, process)
+        return state, pin, diagnostic
+    if len(cache) >= 128:
+        return 'unknown', None, dict(category='retained_handle_limit', api=None, winerror=None)
+    with ExitStack() as acquired:
+        pin = acquired.enter_context(native.owned_process(job, pid, process, diagnostic=diagnostic))
+        if pin is None:
+            return 'unknown', None, diagnostic
+        retained.enter_context(acquired.pop_all())
+    cache[pid] = pin
+    return 'alive', pin, {}
+
+
 def observe(root, stage):
     native, seen = Native(), set()
+    def record(samples):
+        for sample in samples:
+            event = sample['event']
+            if event in ('console_identity_ambiguous', 'window_identity_ambiguous'):
+                (root / 'STOP').touch()
+            key = json.dumps(sample, sort_keys=True)
+            if key not in seen:
+                metadata = {k: v for k, v in sample.items() if k != 'event'}
+                emit(root, event, stage=stage, **metadata)
+                seen.add(key)
     native.k.FreeConsole()
     (root / 'observer-ready').touch()
     deadline = time.monotonic() + 10
-    while not stop_reason(root / 'STOP', deadline):
-        try:
-            candidates = json.loads((root / 'members.json').read_text())
-        except (OSError, ValueError):
-            time.sleep(.02)
-            continue
-        with ExitStack() as handles:
-            pins, job = {}, native.observation_job(root)
+    # Keep verified objects pinned for this bounded observer lifetime, including after exit.
+    # A first unseen/unverifiable candidate still has no exit proof and must stop the capture.
+    with ExitStack() as retained:
+        cache = {}
+        while not stop_reason(root / 'STOP', deadline):
+            try:
+                candidates = json.loads((root / 'members.json').read_text())
+            except (OSError, ValueError):
+                time.sleep(.02)
+                continue
+            pins, samples, job = {}, [], native.observation_job(root)
             try:
                 for process in candidates:
-                    pin = handles.enter_context(native.owned_process(job, process['pid'], process))
-                    if pin is None:
-                        emit(root, 'membership_identity_gap', stage=stage, observer=True)
+                    state, pin, diagnostic = observer_pin(native, job, process, retained, cache)
+                    if state == 'exited':
+                        samples.append(owned_exit(pin[1]))
+                    elif state == 'unknown':
+                        emit(root, 'membership_identity_gap', stage=stage, observer=True,
+                             candidate_pid=process['pid'], **diagnostic)
                         (root / 'STOP').touch()
                     else:
                         pins[process['pid']] = pin
             finally:
                 # Query handle is never retained through attachment or sampling/blocking work.
                 native.check(native.k.CloseHandle(job))
-            samples = [dict(event='owned_window', **w) for w in native.windows(pins)]
+            samples.extend(native.windows(pins))
+            # Persist uncertainty and request STOP before any later console queries.
+            record(samples)
             for pid, (handle, process) in pins.items():
                 if pid != os.getpid():
-                    samples.append(native.console(process, handle))
-        for sample in samples:
-            ambiguous = sample['event'] == 'console_identity_ambiguous'
-            key = json.dumps(sample, sort_keys=True)
-            if key not in seen:
-                emit(root, sample.pop('event'), stage=stage, **sample)
-                seen.add(key)
-                if ambiguous:
-                    (root / 'STOP').touch()
-        time.sleep(.01)
+                    record([native.console(process, handle)])
+            time.sleep(.01)
 
 
 def fixture_server(root):
@@ -609,9 +721,12 @@ def supervise(args):
             with ExitStack() as handles:
                 owned, gap = {}, False
                 for pid in native.members(job):
-                    pin = handles.enter_context(native.owned_process(job, pid))
+                    diagnostic = {}
+                    pin = handles.enter_context(native.owned_process(job, pid, diagnostic=diagnostic))
                     if pin is None:
-                        emit(root, 'membership_identity_gap', stage=args.stage, observer=False)
+                        known_pid = dict(candidate_pid=pid) if pid in known else {}
+                        emit(root, 'membership_identity_gap', stage=args.stage, observer=False,
+                             **diagnostic, **known_pid)
                         gap = True
                     else:
                         owned[pid] = pin[1]
@@ -677,6 +792,10 @@ def supervise(args):
             if not native.k.CloseHandle(job):
                 reason = 'cleanup_failed'
                 cleanup = 'owned_job_unconfirmed'
+        # The observer can request STOP after the final phase poll but before cleanup.
+        # It is now stopped; a persisted failure marker cannot become completed.
+        if reason == 'completed' and (root / 'STOP').exists():
+            reason = 'STOP'
         # Choose a return/report only after bounded cancellation, callback join and cleanup.
         emit(root, 'supervisor_end', stage=args.stage, reason=reason, cleanup=cleanup,
              observer_returncode=observer_code, watchdog_shutdown=shutdown, watchdog_outcome=list(outcome))
