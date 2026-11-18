@@ -33,7 +33,7 @@ Static inspection of that pinned source found `crates/ghostty-vt/build.rs` reque
 
 Start only with a reviewed candidate and passing exact-SHA native CI. This is a foreground `wait`/reply handoff; #35's stopped Desktop probe and its A/D matrix remain separate. Historical #30 rc.4 manual success does not establish bundled-backend success. Do not rerun either matrix as part of this guide.
 
-Set paths to the unpacked candidate and an actual installed host. For Codex JS, use the actual JS file plus explicit Node runtime; for a native host use `command = @('C:\actual\host.exe')` and omit `runtime`. Do not use an npm `.cmd` shim. Keep the existing authorized host login configuration; do not copy credentials, change global PATH, or automate login.
+Set paths to the unpacked candidate and an actual installed host. The user-verified Windows Codex 0.164.0 invocation uses `--no-daemon --model gpt-6.1-sol` and process `TERM=xterm-256color`. For Codex JS, use the actual JS file plus explicit Node runtime; for a native Codex host use `command = @('C:\actual\codex.exe', '--no-daemon', '--model', 'gpt-6.1-sol')` and omit `runtime`. Do not use an npm `.cmd` shim. Keep the existing authorized host login configuration; do not copy credentials, change global PATH, or automate login. These invocation settings do not establish bundled-backend manual acceptance, which remains pending; Claude remains disabled.
 
 ```powershell
 $ErrorActionPreference = 'Stop'
@@ -51,10 +51,12 @@ python --version
 Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, BuildNumber
 $work = Join-Path $env:TEMP ('wfc-bundled-manual-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory "$work\reports" | Out-Null
+Remove-Item Env:WFC_DISPATCH, Env:WFC_OWNER_TOKEN, Env:WFC_CONTROLLER_TOKEN, Env:WFC_BUNDLED_KERNEL, Env:WFC_STATE, Env:WFC_LAUNCH_CONFIG, Env:TERM -ErrorAction SilentlyContinue
 $env:WFC_STATE = "$work\state"
-Remove-Item Env:WFC_DISPATCH, Env:WFC_OWNER_TOKEN, Env:WFC_CONTROLLER_TOKEN, Env:WFC_BUNDLED_KERNEL, Env:WFC_LAUNCH_CONFIG -ErrorAction SilentlyContinue
-$launch = @{ hosts = @{ codex = @{ command = @($hostJs); runtime = @($node) } } } | ConvertTo-Json -Depth 6
+$env:TERM = 'xterm-256color'
+$launch = @{ hosts = @{ codex = @{ command = @($hostJs, '--no-daemon', '--model', 'gpt-6.1-sol'); runtime = @($node) } } } | ConvertTo-Json -Depth 6
 [IO.File]::WriteAllText("$work\launch.json", $launch, [Text.UTF8Encoding]::new($false))
+$env:WFC_LAUNCH_CONFIG = "$work\launch.json"
 @'
 Use only this scratch directory. Invoke the exact WFC ask command in your brief once with BUNDLED_READY?, then end the turn. On BUNDLED_GO, write BUNDLED_PASS to the assigned report, invoke the brief's exact done command, and end the turn. Preserve its dispatch, attempt and message ID. Do not ask twice; on resume inspect prior work first.
 '@ | Set-Content -Encoding ascii "$work\task.md"

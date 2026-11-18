@@ -154,8 +154,10 @@ class HerdrContract(unittest.TestCase):
         self.env.pop('WFC_OPENCODE_DB', None)
         self.log = (self.root / 'server.log').open('w', encoding='utf-8')
         self.addCleanup(self.log.close)
-        self.server = subprocess.Popen([BINARY, 'server'], env=self.env, stdout=self.log, stderr=self.log)
+        self.server = None
+        self.server_job = None
         self.addCleanup(self.stop_server)
+        self.start_server()
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             status = subprocess.run([BINARY, 'status', 'server', '--json'], env=self.env, capture_output=True)
@@ -175,11 +177,62 @@ class HerdrContract(unittest.TestCase):
         self.launch.write_text(json.dumps({'hosts': {'codex': {'command': [str(self.host)],
                                 'runtime': [sys.executable, '-u']}}}), encoding='utf-8')
 
+    def start_server(self):
+        self.server = None
+        self.server_job = None
+        if os.name != 'nt':
+            self.server = subprocess.Popen([BINARY, 'server'], env=self.env, stdout=self.log, stderr=self.log)
+            return
+        from bundled_runtime import WindowsContainment
+        self.server_job = WindowsContainment()
+        # Herdr can restore PTYs during startup. This one-shot launch gate has no
+        # children until its owned Popen is assigned; all later descendants inherit the Job.
+        gate = ('import subprocess,sys; ready=sys.stdin.buffer.read(1); '
+                'sys.exit(subprocess.call(sys.argv[1:], stdin=subprocess.DEVNULL) if ready==b"1" else 74)')
+        try:
+            self.server = subprocess.Popen([sys.executable, '-c', gate, BINARY, 'server'],
+                                           stdin=subprocess.PIPE, env=self.env, stdout=self.log, stderr=self.log)
+            try:
+                self.server_job.attach(self.server.pid)
+                self.server.stdin.write(b'1')
+                self.server.stdin.flush()
+            finally:
+                self.server.stdin.close()
+        except BaseException:
+            if self.server is None:
+                self.server_job.dispose()
+                self.server_job = None
+            else:
+                self.stop_server()
+            raise
+
     def stop_server(self):
+        if self.server is None:
+            return
         evidence = {'pid': self.server.pid, 'poll_before': self.server.poll(),
                     'taskkill': None, 'reaped_returncode': None}
         try:
-            if evidence['poll_before'] is None:
+            job = getattr(self, 'server_job', None)
+            if job is not None:
+                evidence['job_empty'] = False
+                failure = None
+                try:
+                    job.stop()  # Includes bounded native ActiveProcesses == 0 verification.
+                    evidence['job_empty'] = True
+                except OSError as error:
+                    failure = error
+                    evidence['job_error'] = repr(error)
+                finally:
+                    job.dispose()  # KILL_ON_JOB_CLOSE also fences a failed stop/query.
+                    self.server_job = None
+                try:
+                    evidence['reaped_returncode'] = self.server.wait(timeout=10)
+                except subprocess.TimeoutExpired as error:
+                    evidence['wait_timed_out'] = True
+                    failure = failure or error
+                if failure is not None:
+                    raise AssertionError('Herdr fixture Job cleanup unconfirmed: ' + json.dumps(evidence)) from failure
+            elif evidence['poll_before'] is None:
                 if os.name == 'nt':
                     # This Popen owns the isolated service; retain tree cleanup and its diagnostics.
                     command = ['taskkill', '/PID', str(self.server.pid), '/T', '/F']
@@ -514,7 +567,7 @@ while True:
         dispatch = self.dispatch()
         before = self.cli('status', '--dispatch', dispatch)['dispatches'][0]
         self.stop_server()
-        self.server = subprocess.Popen([BINARY, 'server'], env=self.env, stdout=self.log, stderr=self.log)
+        self.start_server()
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             status = subprocess.run([BINARY, 'status', 'server', '--json'], env=self.env, capture_output=True)
