@@ -53,12 +53,27 @@ if os.name != 'nt':
     tty.setraw(0)
 print('READY ' + json.dumps({'pid': os.getpid(), 'tty': [os.isatty(0), os.isatty(1)]}), flush=True)
 print('wrong\rRIGHT\x1b[K', flush=True)
+if MODE == 'read-only':
+    print('This conversation is unavailable. Its cached transcript and draft remain here; input is paused.', flush=True)
 if MODE in ('tree', 'parent-exit'):
     descendant()
     if MODE == 'parent-exit':
         raise SystemExit(0)
 question = callback('ask', 'controlled question', '--options', 'yes,no')
 print('QUESTION ' + json.dumps(question), flush=True)
+if MODE == 'pressure':
+    gate = Path(str(EVIDENCE) + '.pressure-gate')
+    deadline = time.monotonic() + 15
+    while not gate.exists() and time.monotonic() < deadline:
+        time.sleep(.01)
+    if not gate.exists():
+        raise TimeoutError('pressure gate not opened')
+    os.write(1, b'\x1b[6n')
+    chunk = b'PRESSURE' * 1024
+    for _ in range(2048):
+        os.write(1, chunk)
+    print('PRESSURE_FINISHED', flush=True)
+    Path(str(EVIDENCE) + '.pressure-written').write_text(str(len(chunk) * 2048))
 buffer = ''
 while True:
     raw = os.read(0, 4096)
@@ -69,13 +84,20 @@ while True:
         match = re.search(r'[\r\n]', buffer)
         text, buffer = buffer[:match.start()], buffer[match.end():]
         text = text.replace('\x1b[200~', '').replace('\x1b[201~', '')
-        if 'Answer to question' in text:
+        if 'pressure-input:' in text:
+            import hashlib
+            payload = text.split('pressure-input:', 1)[1]
+            Path(str(EVIDENCE) + '.pressure-input').write_text(hashlib.sha256(payload.encode()).hexdigest())
+        elif 'Answer to question' in text:
             print('ANSWER_RECEIVED', flush=True)
             # Marker proves that dropping a response never replays applied input.
             with open(str(EVIDENCE) + '.applied', 'a', encoding='utf-8') as target:
                 target.write('once\n')
-            REPORT.write_text('controlled bundled worker completed\n', encoding='utf-8')
-            done = callback('done', '--report', str(REPORT), '--message-id', 'controlled:' + ATTEMPT)
-            print('DONE ' + json.dumps(done), flush=True)
+            with open(str(EVIDENCE) + '.input.jsonl', 'a', encoding='utf-8') as target:
+                target.write(json.dumps(text) + '\n')
+            if MODE != 'record-only':
+                REPORT.write_text('controlled bundled worker completed\n', encoding='utf-8')
+                done = callback('done', '--report', str(REPORT), '--message-id', 'controlled:' + ATTEMPT)
+                print('DONE ' + json.dumps(done), flush=True)
         elif 'Message from the controller' in text:
             print('NUDGE_RECEIVED', flush=True)

@@ -21,7 +21,14 @@ and Linux cgroup inode/device/path. The runtime also checks the Rust kernel's
 independent generation and unit nonce. The RPC server proves possession of a
 private capability for each fresh client challenge before the client sends input.
 The capability is kept in an owner-private snapshot, excluded from public status.
-Each frame is bounded to 2 MiB and each socket operation has a deadline. Input is
+The pre-authentication challenge and capability frames each have a 256-byte
+limit and share one absolute 0.5-second budget. A separate capability frame must
+succeed before the runtime accepts a larger operation. Authenticated frames have
+a 2 MiB limit and a two-second absolute read deadline; the client exchange has
+one six-second deadline. Progress cannot reset these clocks. Malformed or deeply
+nested JSON is rejected within the connection. Lifecycle observation runs before
+accepting more clients whenever its 0.2-second poll is due, including a busy
+accept backlog. Native cleanup retains its separately bounded deadline. Input is
 sent once. A partial write, missing receipt or response identity mismatch remains
 uncertain; it never triggers a resend, service restart or silent reattachment.
 
@@ -30,6 +37,17 @@ and lifecycle reconciliation. A live execution can serve later task rounds. Resu
 creates a new execution identity after confirmed cleanup; it cannot recover a live
 PTY from a dead service. A dead parent alone is not proof of a stopped process tree.
 The runtime empties the whole container before publishing confirmed absence.
+Current uncertain backend inspection takes priority over a pending question in
+status, while completed/failed/cancelled task facts and question history remain.
+
+The Rust kernel uses a 64-slot event queue: copied PTY output is at most 512 KiB
+in that queue (8 KiB per output chunk), with producer backpressure. A dedicated
+writer thread consumes a 32-item FIFO shared by input and terminal query replies.
+An input is limited to 2 MiB and acknowledged after write completion; the event
+consumer keeps parsing output while that write waits. Input/query byte sequences
+cannot interleave. Query-reply queue saturation or a PTY write failure becomes an
+explicit kernel failure for owned containment cleanup. These limits bound queued
+work, rather than promising that an unresponsive worker will consume input.
 
 ## Linux platform contract
 
@@ -72,8 +90,10 @@ raw-stdio ConPTY baseline alone does not prove these lifecycle properties.
 ## Building and acceptance
 
 Use the pinned extraction/build method in
-`experiments/herdr-kernel-prototype/prepare.py`. Rust sources and Cargo lock are
-unchanged by this runtime adapter. Preserve all existing upstream source hashes,
+`experiments/herdr-kernel-prototype/prepare.py`. The authored companion Rust
+source now supplies bounded queues and concurrent PTY writing. Upstream source
+blobs, Cargo.toml, Cargo.lock and target dependencies remain unchanged. Preserve
+all existing upstream source hashes,
 portable-pty patches and Ghostty/ConPTY dependencies. The selected upstream source
 closure remains 1,378 files / 20,553,673 bytes before build output. Binary size does
 not measure source-maintenance cost. The separately maintained dependency notice

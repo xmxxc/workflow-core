@@ -80,6 +80,31 @@ class BackendContract(unittest.TestCase):
         gc.collect()
         self.tmp.cleanup()
 
+    def test_current_backend_uncertainty_overrides_question_but_preserves_terminal_facts(self):
+        db = router.connect()
+        db.execute("INSERT INTO dispatch (id, host, backend, cwd, task, created, started, report_dir, report, "
+                   "scope, role, current_round, current_attempt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                   ("d-status", "structured", "fake", str(self.cwd), "task", 1, 1, str(self.cwd), "report",
+                    "s-status", "worker", 1, "a-status"))
+        db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, state, created) "
+                   "VALUES ('d-status', 1, 'a-status', 'task', 'report', 'running', 1)")
+        router.post(db, "d-status", "controller", "question", {"question": "pending", "round": 1, "attempt": "a-status"})
+        self.fake.inspect_result = "uncertain"
+        for state, expected in (("running", "unknown"), ("completed", "completed"), ("failed", "failed"),
+                                ("cancelled", "cancelled")):
+            with self.subTest(state=state):
+                db.execute("UPDATE dispatch_round SET state = ? WHERE dispatch = 'd-status'", (state,))
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    router.main(["status", "--dispatch", "d-status"])
+                view = json.loads(output.getvalue())["dispatches"][0]
+                self.assertEqual(view["status"], expected)
+                self.assertEqual(view["backendResult"], "uncertain")
+                self.assertFalse(view["signals"]["waitingHuman"])
+                self.assertTrue(view["signals"]["fault"]["requiresDecision"])
+                self.assertEqual(view["messages"][0]["question"], "pending")
+        db.close()
+
     def test_opencode_v2_records_reach_public_wait_on_native_platform(self):
         task = self.cwd / "task.md"
         task.write_text("task", encoding="utf-8")

@@ -90,10 +90,10 @@ class BundledNative(unittest.TestCase):
             return json.loads(value.stdout)
         return value
 
-    def dispatch(self, mode=''):
+    def dispatch(self, mode='', *extra):
         self.config(mode)
         value = self.cli('dispatch', '--backend', 'bundled', '--host', 'codex', '--task', str(self.task),
-                         '--cwd', str(self.root), '--report', str(self.report), '--launch-config', str(self.launch))
+                         '--cwd', str(self.root), '--report', str(self.report), '--launch-config', str(self.launch), *extra)
         self.dispatches.append(value['dispatch'])
         self.assertEqual(value['backend'], 'bundled')
         return value
@@ -127,7 +127,7 @@ class BundledNative(unittest.TestCase):
         import wfc_platform
         import bundled_runtime
         for dispatch in self.dispatches:
-            self.cli('close', dispatch, success=False)
+            self.cli('close', dispatch, *getattr(self, 'owner_args', []), success=False)
         # Direct capability-guarded cleanup also covers a failed CLI create/close.
         for path in (self.root / 'state' / 'bundled').glob('*.json'):
             try:
@@ -247,6 +247,8 @@ class BundledNative(unittest.TestCase):
         value = self.dispatch('tree')
         handle = self.handle(value['dispatch'])
         child = self.descendant_identity()
+        self.until(lambda: any(item['type'] == 'question' for item in self.status(value['dispatch'])['messages']))
+        self.assertEqual(self.status(value['dispatch'])['status'], 'waiting-human')
         self.assertEqual(wfc_platform.process_identity(handle['service']['pid']), handle['service']['creation'])
         os.kill(handle['service']['pid'], signal.SIGTERM if os.name == 'nt' else signal.SIGKILL)
         self.assert_stopped(child)
@@ -257,6 +259,263 @@ class BundledNative(unittest.TestCase):
         else:
             self.until(lambda: not self.status(value['dispatch'])['backendAlive'])
         self.assertEqual(self.status(value['dispatch'])['attempt'], value['attempt'])
+
+
+    def question(self):
+        messages = self.cli('wait', '--timeout', '5')['messages']
+        return next(item for item in messages if item.get('question') == 'controlled question')
+
+    def test_malformed_and_deep_connections_leave_same_execution_live(self):
+        import socket
+        import struct
+        import bundled_runtime as runtime
+        value = self.dispatch('record-only')
+        handle = self.handle(value['dispatch'])
+        malformed = [b'{', b'[]', b'\xff', b'{"a":' + b'[' * 10000 + b'0' + b']' * 10000 + b'}']
+        for raw in malformed:
+            for authenticated in (False, True):
+                with socket.create_connection(('127.0.0.1', handle['endpoint']), timeout=2) as stream:
+                    stream.settimeout(2)
+                    if authenticated:
+                        stream.sendall(runtime.encode({'challenge': 'x' * 32}))
+                        runtime.receive(stream)
+                        stream.sendall(runtime.encode({'token': handle['token']}))
+                    try:
+                        stream.sendall(struct.pack('!I', len(raw)) + raw)
+                        self.assertEqual(stream.recv(1), b'')
+                    except ConnectionResetError:
+                        pass
+                self.assertEqual(runtime.call(handle, 'read')['result'], 'accepted')
+                self.assertEqual(self.status(value['dispatch'])['backendHandle']['generation'], handle['generation'])
+        self.assertTrue(self.status(value['dispatch'])['backendAlive'])
+
+    def test_slow_unauthenticated_backlog_cannot_delay_parent_exit_cleanup(self):
+        import socket
+        import threading
+        import time
+        import wfc_platform
+        value = self.dispatch('tree')
+        handle = self.handle(value['dispatch'])
+        descendant = self.descendant_identity()
+        self.question()
+        stopped = threading.Event()
+        clients = []
+        def drip():
+            try:
+                for _ in range(8):
+                    stream = socket.create_connection(('127.0.0.1', handle['endpoint']), timeout=1)
+                    clients.append(stream)
+                while not stopped.wait(.04):
+                    for stream in clients:
+                        try:
+                            stream.sendall(b'\x00')
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+        thread = threading.Thread(target=drip)
+        thread.start()
+        try:
+            # Kill only the identified PTY host, leaving an escaped descendant.
+            # Polling must run despite an accept backlog and partial frame progress.
+            receipt = json.loads(next((self.root / 'state' / 'bundled').glob('*.launch.json')).read_text())
+            pid, creation = receipt['pid'], receipt['processStart']
+            self.assertEqual(wfc_platform.process_identity(pid), creation)
+            import signal
+            started = time.monotonic()
+            os.kill(pid, signal.SIGTERM)
+            self.assert_stopped(descendant)
+            self.assertLess(time.monotonic() - started, 4)
+        finally:
+            stopped.set()
+            for stream in clients:
+                stream.close()
+            thread.join(timeout=3)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(self.status(value['dispatch'])['backendAlive'])
+
+    @unittest.skipUnless(os.name != 'nt', 'executable script protocol fixture is Unix-only')
+    def test_bad_companion_protocol_refuses_worker_launch(self):
+        bad = self.root / 'bad-kernel'
+        bad.write_text('#!' + sys.executable + '\nimport json,time\nprint(json.dumps({"event":"hello","generation":"bad","protocol":999}),flush=True)\ntime.sleep(30)\n')
+        bad.chmod(0o755)
+        self.env['WFC_BUNDLED_KERNEL'] = str(bad)
+        failed = self.cli('dispatch', '--backend', 'bundled', '--host', 'codex', '--task', str(self.task),
+                          '--cwd', str(self.root), '--report', str(self.report), '--launch-config', str(self.launch),
+                          success=False)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn('startup not confirmed', failed.stderr)
+        [view] = self.cli('status')['dispatches']
+        self.dispatches.append(view['dispatch'])
+        self.assertEqual(view['status'], 'unknown')
+        self.assertFalse(self.evidence.exists())
+        self.assertFalse(self.report.exists())
+
+    def test_owner_and_callback_credentials_remain_isolated(self):
+        owner = self.cli('owner', 'acquire', '--scope', 'controlled-owner', '--owner', 'controller')
+        self.owner_args = ['--owner-token', owner['token']]
+        value = self.dispatch('record-only', '--scope', 'controlled-owner', *self.owner_args)
+        self.handle(value['dispatch'])
+        question = self.cli('wait', '--timeout', '5', '--scope', 'controlled-owner', *self.owner_args)['messages'][0]
+        rejected = self.cli('reply', str(question['id']), 'unsafe', '--owner-token', 'stale', success=False)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn('stale_controller_owner', rejected.stderr)
+        self.report.write_text('callback isolation fixture')
+        for token, attempt in (('stale', value['attempt']), (owner['token'], 'a-stale')):
+            failed = subprocess.run([sys.executable, str(self.program), 'done', '--report', str(self.report),
+                                     '--attempt', attempt], capture_output=True, text=True, encoding='utf-8', timeout=15,
+                                    env={**self.env, 'WFC_DISPATCH': value['dispatch'], 'WFC_OWNER_TOKEN': token})
+            self.assertNotEqual(failed.returncode, 0)
+        view = self.status(value['dispatch'])
+        self.assertEqual(view['attempt'], value['attempt'])
+        self.assertEqual(view['status'], 'waiting-human')
+        self.assertFalse(any(item['type'] in ('reply', 'done') for item in view['messages']))
+        self.assertFalse(Path(str(self.evidence) + '.applied').exists())
+
+    def test_concurrent_public_reply_claims_apply_one_atomic_answer(self):
+        value = self.dispatch('record-only')
+        self.handle(value['dispatch'])
+        question = self.question()
+        processes = [subprocess.Popen([sys.executable, str(self.program), 'reply', str(question['id']), answer],
+                                      env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                     for answer in ('concurrent answer A', 'concurrent answer B')]
+        try:
+            replies = [process.communicate(timeout=20) for process in processes]
+            self.assertEqual(sorted(process.returncode for process in processes), [0, 1], replies)
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+        self.until(lambda: Path(str(self.evidence) + '.applied').exists())
+        self.assertEqual(Path(str(self.evidence) + '.applied').read_text(), 'once\n')
+        view = self.status(value['dispatch'])
+        [reply] = [item for item in view['messages'] if item['type'] == 'reply']
+        [actual] = [json.loads(line) for line in Path(str(self.evidence) + '.input.jsonl').read_text().splitlines()]
+        self.assertEqual(actual, f"[router] Answer to question {question['id']}: {reply['answer']}")
+
+    def test_read_only_refusal_releases_unapplied_public_reply(self):
+        value = self.dispatch('read-only')
+        self.handle(value['dispatch'])
+        question = self.question()
+        refused = self.cli('reply', str(question['id']), 'unsafe', success=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('paused', refused.stderr)
+        self.assertFalse(Path(str(self.evidence) + '.applied').exists())
+        self.assertFalse(any(item['type'] == 'reply' for item in self.status(value['dispatch'])['messages']))
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux RSS pressure measurement')
+    def test_output_pressure_drains_while_large_input_and_query_reply_are_pending(self):
+        import hashlib
+        import threading
+        import time
+        import bundled_runtime as runtime
+        value = self.dispatch('pressure')
+        handle = self.handle(value['dispatch'])
+        self.question()
+        def rss():
+            status = Path('/proc/' + str(handle['kernel']['pid']) + '/status').read_text()
+            return int(next(line for line in status.splitlines() if line.startswith('VmRSS:')).split()[1]) * 1024
+        initial = peak = rss()
+        payload = 'x' * (96 * 1024)
+        result = []
+        Path(str(self.evidence) + '.pressure-gate').touch()
+        thread = threading.Thread(target=lambda: result.append(runtime.call(handle, 'input', text='pressure-input:' + payload + '\r')))
+        thread.start()
+        try:
+            deadline = time.monotonic() + 10
+            while thread.is_alive() and time.monotonic() < deadline:
+                peak = max(peak, rss())
+                time.sleep(.01)
+            thread.join(timeout=1)
+            self.assertFalse(thread.is_alive(), 'input deadlocked behind output backpressure')
+            self.assertEqual(result[0]['result'], 'accepted', result)
+            target = Path(str(self.evidence) + '.pressure-input')
+            self.until(lambda: target.exists())
+            self.assertEqual(target.read_text(), hashlib.sha256(payload.encode()).hexdigest())
+            self.assertEqual(int(Path(str(self.evidence) + '.pressure-written').read_text()), 16 * 1024 * 1024)
+            self.assertLess(peak - initial, 16 * 1024 * 1024)
+            self.assertEqual(runtime.call(handle, 'read')['result'], 'accepted')
+            print('PRESSURE_METRICS ' + json.dumps({'output_bytes': 16 * 1024 * 1024,
+                  'input_bytes': len(payload), 'rss_initial': initial, 'rss_peak': peak, 'rss_growth': peak - initial}))
+        finally:
+            thread.join(timeout=7)
+
+
+
+    def test_applied_input_with_lost_response_retains_public_reply_claim(self):
+        import hashlib
+        import hmac
+        import socket
+        import threading
+        import bundled_runtime as runtime
+        import wfc_platform
+        value = self.dispatch('record-only')
+        handle = self.handle(value['dispatch'])
+        question = self.question()
+        listener = socket.socket()
+        listener.bind(('127.0.0.1', 0))
+        listener.listen(8)
+        listener.settimeout(.1)
+        stopped = threading.Event()
+        inputs, failures = [], []
+        def serve():
+            while not stopped.is_set():
+                try:
+                    client, _ = listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                try:
+                    with client:
+                        client.settimeout(3)
+                        challenge = runtime.receive(client)['challenge']
+                        proof = hmac.new(handle['token'].encode(), ('server:' + challenge).encode(), hashlib.sha256).hexdigest()
+                        client.sendall(runtime.encode({'proof': proof}))
+                        self.assertEqual(runtime.receive(client)['token'], handle['token'])
+                        request = runtime.receive(client)
+                        result = runtime.call(handle, request['op'], **{
+                            key: request[key] for key in ('text', 'cols', 'rows') if key in request})
+                        if request['op'] == 'input':
+                            inputs.append(request['text'])
+                            self.assertEqual(result['result'], 'accepted', result)
+                            if request['text'] == '\r':
+                                continue  # real PTY write completed; deliberately lose only its response
+                        client.sendall(runtime.encode({**result, 'id': request['id'], 'generation': handle['generation']}))
+                except Exception as error:
+                    failures.append(str(error))
+        proxy = threading.Thread(target=serve)
+        proxy.start()
+        runtime.publish(handle['snapshot'], {**handle, 'endpoint': listener.getsockname()[1]})
+        try:
+            failed = self.cli('reply', str(question['id']), 'apply once', success=False)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn('uncertain', failed.stderr)
+            marker = Path(str(self.evidence) + '.applied')
+            self.until(lambda: marker.exists())
+            self.assertEqual(marker.read_text(), 'once\n')
+            before = self.status(value['dispatch'])
+            self.assertEqual(before['status'], 'unknown')
+            [claimed] = [message for message in before['messages'] if message['type'] == 'reply']
+            self.assertEqual(claimed['to'], question['id'])
+            retry = self.cli('reply', str(question['id']), 'apply once', success=False)
+            self.assertNotEqual(retry.returncode, 0)
+            self.assertIn('already answered', retry.stderr)
+            self.assertEqual(marker.read_text(), 'once\n')
+            self.assertEqual(inputs, ['\x1b[200~' + f"[router] Answer to question {question['id']}: apply once" + '\x1b[201~', '\r'])
+            after = self.status(value['dispatch'])
+            self.assertEqual(after['attempt'], value['attempt'])
+            self.assertEqual([message['id'] for message in after['messages'] if message['type'] == 'reply'], [claimed['id']])
+        finally:
+            if wfc_platform.process_identity(handle['service']['pid']) == handle['service']['creation']:
+                runtime.publish(handle['snapshot'], handle)
+            stopped.set()
+            listener.close()
+            proxy.join(timeout=8)
+        self.assertFalse(proxy.is_alive())
+        self.assertFalse(failures, failures)
+
 
 
 class BundledTransport(unittest.TestCase):
@@ -285,6 +544,9 @@ class BundledTransport(unittest.TestCase):
                     challenge = bundled_runtime.receive(stream)['challenge']
                     proof = hmac.new(handle['token'].encode(), ('server:' + challenge).encode(), hashlib.sha256).hexdigest()
                     stream.sendall(bundled_runtime.encode({'proof': proof}))
+                    auth = bundled_runtime.receive(stream)
+                    if auth.get('token') != handle['token']:
+                        raise ValueError('test capability mismatch')
                     requests.append(bundled_runtime.receive(stream))
                     # Applied once, then connection closes before the acknowledgement.
             except Exception as error:

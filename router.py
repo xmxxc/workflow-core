@@ -2259,7 +2259,7 @@ def fault_category(kind, message=""):
     return "host_error"
 
 
-def canonical_status(db, row, legacy_state, last, alive, watch):
+def canonical_status(db, row, legacy_state, last, alive, watch, inspection=None):
     """Return the multi-signal status contract while retaining legacy ``state``."""
     # Cleanup messages are still visible as the last event, but say nothing about the task.
     if last and last["type"] == "closed":
@@ -2330,6 +2330,13 @@ def canonical_status(db, row, legacy_state, last, alive, watch):
                  "operation": "launch", "requiresDecision": True}
         if current_round_state != "failed":
             status = "unknown" if launch["category"] == "unknown" else "failed"
+    if inspection and inspection["result"] != "accepted":
+        fault = {"category": inspection.get("category", "backend_uncertain"), "kind": "backend_observation",
+                 "diagnostic": inspection.get("diagnostic") or "execution identity is uncertain",
+                 "operation": "inspect", "requiresDecision": True}
+        if status not in ("completed", "failed", "cancelled", "reclaimed"):
+            status = "unknown"
+        alive = False
     host_active = bool(alive and status in ("online", "waiting-human") and not idle)
     activity = "active" if host_active else ("idle" if alive else "unknown")
     return status, {"processOnline": bool(alive), "online": bool(alive), "hostActive": host_active,
@@ -2382,7 +2389,7 @@ def cmd_status(args):
         watch = db.execute("SELECT since FROM screen_watch WHERE dispatch = ?", (row["id"],)).fetchone()
         inspection = backend_for(row).inspect(row["id"])
         alive = inspection.get("alive", False)
-        canonical, signals = canonical_status(db, row, state, last, alive, watch)
+        canonical, signals = canonical_status(db, row, state, last, alive, watch, inspection=inspection)
         lifecycle = "running" if canonical == "online" else canonical
         rounds = [dict(r) for r in db.execute("SELECT round, attempt, task, report, state, result, created, completed "
                                                "FROM dispatch_round WHERE dispatch = ? ORDER BY round, created", (row["id"],))]

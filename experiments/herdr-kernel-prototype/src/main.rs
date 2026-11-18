@@ -1,11 +1,12 @@
-//! Throwaway extraction probe. Private stdio protocol, no durable PTY recovery.
+//! Extracted PTY kernel. Private stdio protocol; lifecycle containment belongs to WFC runtime.
 use anyhow::{bail, ensure, Context, Result};
 use ghostty_vt::Terminal;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Read, Write};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use uuid::Uuid;
 
@@ -13,14 +14,40 @@ enum Event {
     Command(String),
     Output(String, String, Vec<u8>),
     End(String, String, Option<String>),
+    WriteComplete(Option<Value>, bool),
     Disconnect,
+}
+
+// 64 output events hold at most 512 KiB of copied PTY bytes. Backpressure
+// reaches the PTY reader instead of growing an unbounded output backlog.
+const EVENT_CAPACITY: usize = 64;
+const WRITE_CAPACITY: usize = 32;
+const INPUT_LIMIT: usize = 2 * 1024 * 1024;
+
+struct WriteRequest {
+    bytes: Vec<u8>,
+    response: Option<Value>,
+}
+
+#[derive(Clone)]
+struct Writer {
+    tx: mpsc::SyncSender<WriteRequest>,
+    overflow: Arc<AtomicBool>,
+}
+
+impl Writer {
+    fn enqueue(&self, bytes: Vec<u8>, response: Option<Value>) -> Result<()> {
+        self.tx
+            .try_send(WriteRequest { bytes, response })
+            .map_err(|_| anyhow::anyhow!("pty_writer_queue_full_or_closed"))
+    }
 }
 
 struct Unit {
     nonce: String,
     child: Box<dyn Child + Send + Sync>,
     master: Box<dyn MasterPty + Send>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    writer: Writer,
     terminal: Terminal,
     cols: u16,
     rows: u16,
@@ -102,7 +129,7 @@ fn pty_size(cols: u16, rows: u16) -> PtySize {
     }
 }
 
-fn spawn(v: &Value, tx: mpsc::Sender<Event>) -> Result<Unit> {
+fn spawn(v: &Value, tx: mpsc::SyncSender<Event>) -> Result<Unit> {
     let (cols, rows) = size(v)?;
     let argv = v["argv"].as_array().context("missing argv")?;
     ensure!(!argv.is_empty(), "empty argv");
@@ -118,13 +145,46 @@ fn spawn(v: &Value, tx: mpsc::Sender<Event>) -> Result<Unit> {
     }
     let pair = native_pty_system().openpty(pty_size(cols, rows))?;
     let mut reader = pair.master.try_clone_reader()?;
-    let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
+    let mut pty_writer = pair.master.take_writer()?;
+    let (write_tx, write_rx) = mpsc::sync_channel::<WriteRequest>(WRITE_CAPACITY);
+    let writer = Writer {
+        tx: write_tx,
+        overflow: Arc::new(AtomicBool::new(false)),
+    };
+    let write_events = tx.clone();
+    thread::spawn(move || {
+        while let Ok(request) = write_rx.recv() {
+            // Only this thread writes the PTY. Each input/paste and terminal
+            // query response is one FIFO item; their bytes cannot interleave.
+            let success = pty_writer
+                .write_all(&request.bytes)
+                .and_then(|_| pty_writer.flush())
+                .is_ok();
+            let response = request.response.map(|mut response| {
+                response["ok"] = json!(success);
+                if success {
+                    response["result"] = json!({"written": true});
+                } else {
+                    response["error"] = json!("pty_write_failed");
+                }
+                response
+            });
+            if write_events
+                .send(Event::WriteComplete(response, success))
+                .is_err()
+                || !success
+            {
+                break;
+            }
+        }
+    });
     let mut terminal = Terminal::new(cols, rows, 1000)?;
     let reply_writer = writer.clone();
     terminal.set_write_pty_callback(move |bytes| {
-        if let Ok(mut writer) = reply_writer.lock() {
-            let _ = writer.write_all(bytes);
-            let _ = writer.flush();
+        // Parsing never waits for PTY input capacity. Saturation is an explicit
+        // kernel failure, observed/contained by the owning runtime.
+        if reply_writer.enqueue(bytes.to_vec(), None).is_err() {
+            reply_writer.overflow.store(true, Ordering::Release);
         }
     })?;
     let child = pair.slave.spawn_command(cmd)?;
@@ -175,8 +235,8 @@ fn handle(
     v: &Value,
     generation: &str,
     units: &mut HashMap<String, Unit>,
-    tx: &mpsc::Sender<Event>,
-) -> Result<Value> {
+    tx: &mpsc::SyncSender<Event>,
+) -> Result<Option<Value>> {
     ensure!(string(v, "generation")? == generation, "stale_generation");
     let name = string(v, "unit")?;
     let op = string(v, "op")?;
@@ -185,28 +245,33 @@ fn handle(
         let unit = spawn(v, tx.clone())?;
         let result = json!({"nonce": unit.nonce, "pid": unit.child.process_id()});
         units.insert(name.to_string(), unit);
-        return Ok(result);
+        return Ok(Some(result));
     }
     let unit = units.get_mut(name).context("unknown_unit")?;
     ensure!(string(v, "nonce")? == unit.nonce, "wrong_nonce");
     unit.poll()?;
     match op {
-        "read" => Ok(json!({
+        "read" => Ok(Some(json!({
             "text": unit.terminal.read_text_viewport((0, 0), (unit.cols - 1, u32::from(unit.rows - 1)), false)?,
             "screen": format!("{:?}", unit.terminal.active_screen()?),
             "cols": unit.cols, "rows": unit.rows, "eof": unit.eof, "read_error": unit.read_error,
             "exit": unit.exit.as_ref().map(|s| json!({"code": s.exit_code(), "signal": s.signal()}))
-        })),
+        }))),
         "input" => {
             ensure!(unit.exit.is_none(), "unit_exited");
-            let mut writer = unit
-                .writer
-                .lock()
-                .map_err(|_| anyhow::anyhow!("writer poisoned"))?;
-            writer.write_all(string(v, "text")?.as_bytes())?;
-            writer.flush()?;
-            Ok(json!({"written": true}))
+            let text = string(v, "text")?;
+            ensure!(text.len() <= INPUT_LIMIT, "input_too_large");
+            unit.writer.enqueue(
+                text.as_bytes().to_vec(),
+                Some(json!({
+                    "id": v["id"], "generation": generation
+                })),
+            )?;
+            // Completion arrives as an event. The parser keeps consuming output
+            // while input is blocked, so bounded output backpressure cannot deadlock it.
+            Ok(None)
         }
+
         "resize" => {
             ensure!(unit.exit.is_none(), "unit_exited");
             let (cols, rows) = size(v)?;
@@ -214,12 +279,12 @@ fn handle(
             unit.terminal.resize(cols, rows, 1, 1)?;
             unit.cols = cols;
             unit.rows = rows;
-            Ok(json!({"cols": cols, "rows": rows}))
+            Ok(Some(json!({"cols": cols, "rows": rows})))
         }
         "close" => {
             unit.close()?;
             units.remove(name);
-            Ok(json!({"closed": true}))
+            Ok(Some(json!({"closed": true})))
         }
         _ => bail!("unknown_op"),
     }
@@ -236,9 +301,9 @@ fn emit(value: Value) -> Result<()> {
 fn main() -> Result<()> {
     let generation = Uuid::new_v4().to_string();
     emit(
-        json!({"event": "hello", "generation": generation, "recovery": "lost", "transport": "private-stdio-ndjson"}),
+        json!({"event": "hello", "generation": generation, "recovery": "lost", "transport": "private-stdio-ndjson", "protocol": 1, "output_queue_chunks": EVENT_CAPACITY, "output_chunk_bytes": 8192, "write_queue_items": WRITE_CAPACITY}),
     )?;
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(EVENT_CAPACITY);
     let stdin_tx = tx.clone();
     thread::spawn(move || {
         for line in io::stdin().lock().lines() {
@@ -257,9 +322,19 @@ fn main() -> Result<()> {
     while let Ok(event) = rx.recv() {
         match event {
             Event::Disconnect => break,
+            Event::WriteComplete(response, success) => {
+                if let Some(response) = response {
+                    emit(response)?;
+                }
+                ensure!(success, "PTY writer failed");
+            }
             Event::Output(name, nonce, bytes) => {
                 if let Some(unit) = units.get_mut(&name).filter(|u| u.nonce == nonce) {
                     unit.terminal.write(&bytes);
+                    ensure!(
+                        !unit.writer.overflow.load(Ordering::Acquire),
+                        "PTY query reply queue saturated"
+                    );
                 }
             }
             Event::End(name, nonce, error) => {
@@ -274,14 +349,16 @@ fn main() -> Result<()> {
                 let result = request
                     .map_err(anyhow::Error::from)
                     .and_then(|v| handle(&v, &generation, &mut units, &tx));
-                emit(match result {
-                    Ok(result) => {
+                let response = match result {
+                    Ok(None) => continue,
+                    Ok(Some(result)) => {
                         json!({"id": id, "generation": generation, "ok": true, "result": result})
                     }
                     Err(error) => {
                         json!({"id": id, "generation": generation, "ok": false, "error": error.to_string()})
                     }
-                })?;
+                };
+                emit(response)?;
             }
         }
     }

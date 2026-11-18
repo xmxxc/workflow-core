@@ -128,13 +128,18 @@ reattachment or implicit retry. A lost input acknowledgement is uncertain.
 Restart generates a new generation and reports prior PTYs lost. WFC keeps
 dispatch, attempts, messages, owners and wakeup policy.
 
-Limits: input/channel/output backpressure is unbounded; input or close may
-block the service; no size/rate/resource production budget exists beyond a
-geometry limit. Close kills the verified live Unix leader's process group.
+Current kernel flow control: 64 event slots bound copied PTY output backlog
+to 512 KiB, and one writer thread consumes a bounded 32-item FIFO for atomic
+input/query responses. Input is limited to 2 MiB; acknowledgement follows the
+completed write while terminal parsing continues. Queue saturation/write failure
+is explicit. Standalone close still kills the verified live Unix leader's process group.
 New sessions/groups, surviving descendants after leader exit, and children
 ignoring hangup after server SIGKILL are **observed containment failures**.
-The Windows branch only calls the vendored direct-child kill operation; no
-Windows job lifecycle was extracted or validated.
+These are historical standalone-prototype containment failures. The opt-in WFC
+runtime supplies the separately documented cgroup/Job ownership boundary; see
+`../../docs/bundled-backend.md`. The standalone Windows close operation still calls
+the vendored direct-child kill operation. The new WFC Job lifecycle requires its
+own native acceptance; the raw-stdio Windows baseline does not validate it.
 
 ## WFC and actual host evidence
 

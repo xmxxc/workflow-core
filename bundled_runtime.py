@@ -24,6 +24,9 @@ import wfc_platform
 
 LIMIT = 2 * 1024 * 1024
 TIMEOUT = 6
+PREAUTH_LIMIT = 256
+PREAUTH_TIMEOUT = .5
+FRAME_TIMEOUT = 2
 
 
 def read_json(path):
@@ -35,19 +38,38 @@ def publish(path, value):
     host_launch.write_private(path, value)
 
 
-def receive(stream):
+def budget(deadline):
+    seconds = deadline - time.monotonic()
+    if seconds <= 0:
+        raise TimeoutError('bundled connection deadline exceeded')
+    return seconds
+
+
+def remaining(stream, deadline):
+    stream.settimeout(budget(deadline))
+
+
+def receive(stream, *, limit=LIMIT, deadline=None):
+    # A complete frame, including its header, shares one absolute deadline.
+    if deadline is None:
+        deadline = time.monotonic() + (stream.gettimeout() or FRAME_TIMEOUT)
     def exact(size):
         chunks = bytearray()
         while len(chunks) < size:
+            remaining(stream, deadline)
             part = stream.recv(size - len(chunks))
             if not part:
                 raise EOFError('incomplete bundled frame')
             chunks.extend(part)
+        remaining(stream, deadline)
         return chunks
     size = struct.unpack('!I', exact(4))[0]
-    if not 0 < size <= LIMIT:
+    if not 0 < size <= limit:
         raise ValueError('bundled frame exceeds size limit')
-    value = json.loads(exact(size))
+    try:
+        value = json.loads(exact(size).decode('utf-8'))
+    except RecursionError:
+        raise ValueError('bundled JSON nesting exceeds parser bounds') from None
     if not isinstance(value, dict):
         raise ValueError('bundled frame must be an object')
     return value
@@ -74,17 +96,21 @@ def call(handle, op, **data):
         payload = {key: handle[key] for key in ('token', 'generation', 'unit', 'nonce', 'attempt')}
         payload.update(id=ident, op=op, **data)
         frame = encode(payload)
+        deadline = time.monotonic() + TIMEOUT
         with socket.create_connection(('127.0.0.1', handle['endpoint']), timeout=TIMEOUT) as stream:
-            stream.settimeout(TIMEOUT)
+            remaining(stream, deadline)
             challenge = uuid.uuid4().hex
             stream.sendall(encode({'challenge': challenge}))
-            proof = receive(stream).get('proof', '')
+            proof = receive(stream, limit=PREAUTH_LIMIT, deadline=deadline).get('proof', '')
             expected = hmac.new(handle['token'].encode(), ('server:' + challenge).encode(), hashlib.sha256).hexdigest()
             if not hmac.compare_digest(str(proof), expected):
                 raise ValueError('bundled server capability proof failed')
+            remaining(stream, deadline)
+            stream.sendall(encode({'token': handle['token']}))
+            remaining(stream, deadline)
             sent = True  # sendall may partially deliver before raising
             stream.sendall(frame)
-            response = receive(stream)
+            response = receive(stream, deadline=deadline)
         if response.get('id') != ident or response.get('generation') != handle['generation']:
             raise ValueError('bundled response identity mismatch')
         if response.get('result') not in ('accepted', 'completed', 'refused', 'uncertain', 'definitely-not-sent'):
@@ -247,7 +273,8 @@ class Kernel:
         try:
             containment.attach(self.child.pid)
             hello = self.responses.get(timeout=TIMEOUT)
-            if not hello or hello.get('event') != 'hello':
+            if (not isinstance(hello, dict) or hello.get('event') != 'hello' or hello.get('protocol') != 1
+                    or not isinstance(hello.get('generation'), str) or not hello['generation']):
                 raise ValueError('invalid bundled kernel hello')
             self.generation = hello['generation']
         except BaseException:
@@ -255,14 +282,14 @@ class Kernel:
             self.child.wait(timeout=TIMEOUT)
             raise
 
-    def call(self, op, spec, **data):
+    def call(self, op, spec, *, deadline=None, **data):
         ident = uuid.uuid4().hex
         request = {'id': ident, 'generation': self.generation, 'unit': spec['unit'],
                    'nonce': spec.get('kernel_nonce'), 'op': op, **data}
         try:
             self.child.stdin.write((json.dumps(request) + '\n').encode())
             self.child.stdin.flush()
-            result = self.responses.get(timeout=TIMEOUT)
+            result = self.responses.get(timeout=min(TIMEOUT, budget(deadline)) if deadline else TIMEOUT)
         except (OSError, queue.Empty) as error:
             raise RuntimeError('bundled kernel transport became uncertain') from error
         if not result or result.get('id') != ident or result.get('generation') != self.generation:
@@ -295,14 +322,14 @@ def run(spec_path):
                           kernel={'pid': kernel.child.pid, 'creation': wfc_platform.process_identity(kernel.child.pid)},
                           kernel_generation=kernel.generation, worker_pid=spawn['result']['pid'])
             publish(spec['snapshot'], handle)
+            next_observation = 0.0
             while True:
                 if kernel.child.poll() is not None:
                     raise OSError('bundled kernel exited; live terminal recovery is unavailable')
-                try:
-                    stream, _ = listener.accept()
-                except socket.timeout:
+                if time.monotonic() >= next_observation:
                     view = kernel.call('read', spec)
-                    if not view.get('ok'):
+                    next_observation = time.monotonic() + .2
+                    if not view.get('ok') or view['result'].get('read_error'):
                         raise OSError('bundled terminal observation failed')
                     if view['result'].get('exit') is not None:
                         containment.stop()
@@ -311,17 +338,26 @@ def run(spec_path):
                         publish(spec['snapshot'], {**handle, 'state': 'exited', 'cleanup': 'confirmed',
                                                   'final_screen': view['result']['text']})
                         break
+                try:
+                    stream, _ = listener.accept()
+                except socket.timeout:
                     continue
                 with stream:
-                    stream.settimeout(2)
+                    connection_deadline = time.monotonic() + TIMEOUT
+                    preauth_deadline = min(connection_deadline, time.monotonic() + PREAUTH_TIMEOUT)
                     close_requested = False
                     try:
-                        challenge = receive(stream).get('challenge')
+                        challenge = receive(stream, limit=PREAUTH_LIMIT, deadline=preauth_deadline).get('challenge')
                         if not isinstance(challenge, str) or len(challenge) != 32:
                             raise ValueError('invalid bundled challenge')
                         proof = hmac.new(spec['token'].encode(), ('server:' + challenge).encode(), hashlib.sha256).hexdigest()
+                        remaining(stream, preauth_deadline)
                         stream.sendall(encode({'proof': proof}))
-                        request = receive(stream)
+                        # Authenticate a small capability frame before accepting a large operation.
+                        auth = receive(stream, limit=PREAUTH_LIMIT, deadline=preauth_deadline)
+                        if not hmac.compare_digest(str(auth.get('token', '')), spec['token']):
+                            continue
+                        request = receive(stream, deadline=min(connection_deadline, time.monotonic() + FRAME_TIMEOUT))
                         if (not hmac.compare_digest(str(request.get('token', '')), spec['token'])
                                 or any(request.get(key) != spec[key] for key in ('generation', 'unit', 'nonce', 'attempt'))):
                             result = {'result': 'refused', 'category': 'bundled_ownership',
@@ -335,7 +371,7 @@ def run(spec_path):
                             result = {'result': 'completed'}
                         elif request['op'] in ('read', 'input', 'resize'):
                             extra = {key: request[key] for key in ('text', 'cols', 'rows') if key in request}
-                            response = kernel.call(request['op'], spec, **extra)
+                            response = kernel.call(request['op'], spec, deadline=connection_deadline, **extra)
                             if response.get('ok'):
                                 result = {'result': 'accepted', 'data': response['result']}
                             else:
@@ -344,6 +380,7 @@ def run(spec_path):
                                           'diagnostic': 'bundled kernel operation failed'}
                         else:
                             result = {'result': 'refused', 'diagnostic': 'unknown bundled operation'}
+                        remaining(stream, connection_deadline)
                         stream.sendall(encode({**result, 'id': request.get('id'), 'generation': spec['generation']}))
                     except (OSError, EOFError, ValueError, KeyError, TypeError, queue.Empty):
                         # A disconnected client cannot cancel or replay a request already delivered.
