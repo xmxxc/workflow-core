@@ -397,7 +397,43 @@ class HerdrBackend:
                                                        'keys': ['Enter']}, guard=True)
         if result.get('absent'):
             return {'result': 'definitely-not-sent', 'diagnostic': 'Herdr unit is absent'}
+        if result['result'] == 'accepted' and host == 'codex':
+            return self._submit_codex_draft(dispatch_id, text, handle, router.screen_notices(observed.get('screen', '')))
         return result
+
+    def _submit_codex_draft(self, dispatch_id, text, handle, before):
+        """Recover a dropped burst Enter only for a stable, complete Codex draft.
+
+        Acceptance of send_input does not mean the host submitted it. Never replay
+        text, or infer a key's outcome from a later screen after an unknown result.
+        """
+        import router
+        for retry in range(router.ENTER_RETRIES + 1):
+            boxes = []
+            for _ in range(2):
+                time.sleep(.3)
+                observed = self.read(dispatch_id)
+                if observed['result'] != 'accepted':
+                    return {**observed, 'result': 'uncertain'}  # text may already have arrived
+                found = router.screen_notices(observed.get('screen', ''))
+                notice = next((text for kind, text in found if kind == 'state'), None)
+                if not notice and len(router.refusals(found)) > len(router.refusals(before)):
+                    notice = router.refusals(found)[-1]
+                if notice:
+                    return {'result': 'uncertain', 'category': 'permission_required', 'diagnostic': notice}
+                boxes.append(router.codex_input_box(observed.get('screen', ''), require_complete=True))
+            box = boxes[-1]
+            # A prefix/suffix can also belong to an overlapping or partially drawn
+            # draft. Only the complete visible text authorizes another Enter.
+            if (box is None or box != boxes[0] or box.scrolled or not box.text.strip()
+                    or ''.join(box.text.split()) != ''.join(text.split())):
+                return {'result': 'accepted'}
+            if retry == router.ENTER_RETRIES:
+                return {'result': 'uncertain', 'diagnostic': 'typed text remained in the Codex input box'}
+            entered = self._call(handle, 'pane.send_keys', {'pane_id': handle['pane'], 'keys': ['Enter']}, guard=True)
+            if entered['result'] != 'accepted' or entered.get('absent'):
+                return {**entered, 'result': 'uncertain'}  # never make the accepted text replayable
+        return {'result': 'accepted'}
 
     @observed_operation
     def interrupt(self, dispatch_id):

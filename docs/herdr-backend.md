@@ -43,6 +43,14 @@ python3 wfc.py herdr-reconcile d-... --pane p-... --terminal t-... \
 
 Codex 0.169.0 的 Linux 实测中，主进程已收到正确 WFC 环境，但其生成的 shell snapshot 带有上一个 dispatch/state，回调因 attempt 不匹配而被拒绝。WFC brief 的 ask/done 命令现在显式设置当前 `WFC_DISPATCH` 和绝对 `WFC_STATE`；Unix 以引用后的 `env` 参数传入，Windows 以 PowerShell literal 设置后启动 Python。不依赖宿主 shell snapshot 的这两个环境值，不改变宿主全局配置。owner token 仍从继承环境读取并校验；失效凭据拒绝，不在 brief 中嵌入凭据或绕过 owner fencing。
 
+## Codex reply 的 Enter
+
+Herdr 0.9.5 的 `pane.send_input(text, keys=[Enter])` 将 paste 和 Enter 合在同一批字节中；API 接受不保证 Codex 已提交。Codex 普通输入现在在发送后使用现有 composer parser 读取两次画面，相隔 300ms。只有两次显示相同、完整的本次文本时才补 Enter，最多沿用 `ENTER_RETRIES` 的两次上限；每次补键后重新观察。已清空、已提交、其他草稿、仅前缀重合、滚动裁剪、无法识别或正在改变的输入框不授权补键。长回复若只能看到部分内容，仍需显式检查；这里的 accepted 继续只是后端接受回执。
+
+补键沿用 service identity、workspace nonce、pane/terminal fencing 和 blocked 检查，整个 submit 持有现有 dispatch input lock。初次发送未知时立即停止；发送文本后的读取或补键失败、单元消失、只读提示或补键后仍保留完整草稿时返回 uncertain，保留 reply claim，不自动重打文本或重试未知的键。此适配只用于 Codex 普通输入。受控 raw TUI 的公开 ask/reply 回归将合并 Enter 丢弃，并单独记录宿主 user 事件；它不证明原生 Windows Codex 或无人值守 A 已通过。
+
+Windows A/D 短复验：每项独立配置 endpoint、`HERDR_CONFIG_PATH`、所有 XDG 目录和 `WFC_STATE`，记录 Herdr/Codex/Python 版本。A 对 worker 的 ask 调用一次公开 reply，不补人工键，确认同一 worker 恰好一条匹配 user 消息；随后 done 必须经 detached relay 唤醒同一 Desktop 聊天且 ack 为 processed。D 接替 owner 后，旧凭据继续被拒绝，新 reply 只进入原 worker 一次且无人工补键；保留旧 owner done 拒绝语义。A 的 detached relay 和 D 的接替完成路径仍分别受 #31、#4/#6 约束，不能从本项 reply 回归推定通过。
+
 ## OpenCode 2.0.12 首次 prompt
 
 Herdr 首次启动 OpenCode 后，WFC 使用 5 秒观察窗口读取其 composer（单次 RPC 另受现有超时限制）。仅当两次相隔 300ms 的画面都能识别同一个输入框，且可见文本是本次 argv brief 的完整内容或末尾，且包含本次 attempt时，补发一次 Enter；不重打文本。已提交、显示其他内容、无法识别或出现只读/blocked 提示时不补键。补键仍使用原 service/nonce/pane fencing，发送结果未知时保留 uncertain。创建过程持有 dispatch input lock，使 nudge/reply 与初始提交串行。

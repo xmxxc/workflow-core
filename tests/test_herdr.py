@@ -8,10 +8,128 @@ import tempfile
 import time
 import unittest
 import uuid
+from unittest.mock import patch
+
+import herdr_backend
 
 ROOT = Path(__file__).resolve().parent.parent
 BINARY = os.environ.get('WFC_HERDR_TEST_BINARY')
 PROGRAM = Path(os.environ.get('WFC_TEST_PROGRAM', ROOT / 'wfc.py')).resolve()
+
+
+class CodexSubmission(unittest.TestCase):
+    text = '[router] Answer to question 1: finish the controlled task exactly once'
+
+    def screen(self, draft):
+        return '› ' + draft + '\n\n  gpt-controlled · test\n'
+
+    def submit(self, screens, results=None, host='codex', before=None):
+        backend = herdr_backend.HerdrBackend()
+        observations = [{'result': 'accepted', 'screen': before or self.screen('')}] + [
+            {'result': 'accepted', 'screen': s} if isinstance(s, str) else s for s in screens]
+        with patch.object(backend, 'read', side_effect=observations) as read, \
+                patch.object(backend, '_handle', return_value={'pane': 'owned-pane'}), \
+                patch.object(backend, '_call', side_effect=results or [{'result': 'accepted'}] * 4) as call, \
+                patch.object(herdr_backend.time, 'sleep'):
+            outcome = backend.submit('d-test', self.text, host)
+        return outcome, call.call_args_list, read.call_count
+
+    def test_stable_complete_draft_gets_only_enter_then_empty_box_stops(self):
+        full = self.screen(self.text)
+        outcome, calls, reads = self.submit([full, full, self.screen(''), self.screen('')])
+        self.assertEqual(outcome['result'], 'accepted')
+        self.assertEqual(reads, 5)
+        self.assertEqual([c.args[1] for c in calls], ['pane.send_input', 'pane.send_keys'])
+        self.assertEqual(calls[0].args[2]['text'], self.text)
+        self.assertEqual(calls[1].args[2], {'pane_id': 'owned-pane', 'keys': ['Enter']})
+        self.assertTrue(all(c.kwargs['guard'] for c in calls))
+
+    def test_empty_other_overlapping_scrolled_unreadable_or_changing_drafts_get_no_key(self):
+        for first, second in (
+                ('', ''), ('Ask Codex to do anything', 'Ask Codex to do anything'),
+                ('unrelated draft', 'unrelated draft'), (self.text[:30], self.text[:30]),
+                (self.text + ' extra', self.text + ' extra'),
+                (self.text + ' ↑', self.text + ' ↑'),
+                (self.text, self.text + ' changed')):
+            with self.subTest(first=first, second=second):
+                outcome, calls, _ = self.submit([self.screen(first), self.screen(second)])
+                self.assertEqual(outcome['result'], 'accepted')
+                self.assertEqual(len(calls), 1)
+        outcome, calls, _ = self.submit(['transcript only', 'transcript only'])
+        self.assertEqual((outcome['result'], len(calls)), ('accepted', 1))
+
+    def test_observation_failure_or_read_only_after_text_stays_uncertain(self):
+        for observation in ({'result': 'uncertain', 'category': 'herdr_restart'},
+                            {'result': 'refused'}, {'result': 'definitely-not-sent'},
+                            'This conversation is unavailable. Its cached transcript and draft remain here; input is paused.'):
+            with self.subTest(observation=observation):
+                outcome, calls, _ = self.submit([observation])
+                self.assertEqual((outcome['result'], len(calls)), ('uncertain', 1))
+
+    def test_either_scroll_direction_in_either_observation_gets_no_recovery_key(self):
+        full = self.screen(self.text)
+        for marker in ('↑', '↓'):
+            clipped = self.screen(self.text + ' ' + marker)
+            for frames in ([clipped] * 6, [clipped, full] + [full] * 4,
+                           [full, clipped] + [full] * 4):
+                with self.subTest(marker=marker, first=frames[0], second=frames[1]):
+                    outcome, calls, _ = self.submit(frames)
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(outcome['result'], 'accepted')
+
+    def test_complete_box_reader_preserves_default_scroll_contract(self):
+        import router
+        for marker in ('↑', '↓'):
+            with self.subTest(marker=marker):
+                frame = self.screen(self.text + ' ' + marker)
+                self.assertEqual(router.codex_input_box(frame), router.InputBox(self.text, marker == '↑'))
+                self.assertIsNone(router.codex_input_box(frame, require_complete=True))
+                # Transcript arrows do not crop the composer below them.
+                transcript = '› earlier message ' + marker + '\n\n' + self.screen(self.text)
+                self.assertEqual(router.codex_input_box(transcript, require_complete=True),
+                                 router.InputBox(self.text, False))
+
+    def test_unknown_initial_send_never_reads_or_sends_again(self):
+        outcome, calls, reads = self.submit([], [{'result': 'uncertain'}])
+        self.assertEqual((outcome['result'], len(calls), reads), ('uncertain', 1, 1))
+
+    def test_new_refusal_after_input_or_followup_enter_stops_keys(self):
+        full = self.screen(self.text)
+        refused = 'This conversation is read-only or unavailable; no operation was sent.\n' + full
+        for screens, writes in (([refused] * 6, 1), ([full, full] + [refused] * 4, 2)):
+            with self.subTest(writes=writes):
+                outcome, calls, _ = self.submit(screens)
+                self.assertEqual(outcome['result'], 'uncertain')
+                self.assertEqual(len(calls), writes)
+                self.assertEqual(outcome['category'], 'permission_required')
+
+    def test_old_transcript_refusal_does_not_prevent_recovered_enter(self):
+        refusal = 'This conversation is read-only or unavailable; no operation was sent.\n'
+        full = refusal + self.screen(self.text)
+        empty = refusal + self.screen('')
+        outcome, calls, _ = self.submit([full, full, empty, empty], before=empty)
+        self.assertEqual((outcome['result'], len(calls)), ('accepted', 2))
+
+    def test_failed_followup_key_never_replays_text_or_key(self):
+        for result in ('uncertain', 'refused', 'definitely-not-sent'):
+            with self.subTest(result=result):
+                full = self.screen(self.text)
+                outcome, calls, reads = self.submit([full, full],
+                    [{'result': 'accepted'}, {'result': result, 'category': 'herdr_restart'}])
+                self.assertEqual((outcome['result'], len(calls), reads), ('uncertain', 2, 3))
+                self.assertEqual(outcome['category'], 'herdr_restart')
+        full = self.screen(self.text)
+        outcome, calls, _ = self.submit([full, full], [{'result': 'accepted'}, {'result': 'accepted', 'absent': True}])
+        self.assertEqual((outcome['result'], len(calls)), ('uncertain', 2))
+
+    def test_persistently_stuck_draft_is_bounded_and_uncertain(self):
+        outcome, calls, _ = self.submit([self.screen(self.text)] * 6)
+        self.assertEqual((outcome['result'], len(calls)), ('uncertain', 3))
+
+    def test_other_hosts_keep_one_combined_send(self):
+        for host in ('opencode', 'claude', None):
+            outcome, calls, reads = self.submit([], host=host)
+            self.assertEqual((outcome['result'], len(calls), reads), ('accepted', 1, 1))
 
 
 @unittest.skipUnless(BINARY, 'set WFC_HERDR_TEST_BINARY to the pinned Herdr 0.9.5 binary')
@@ -241,6 +359,103 @@ for line in sys.stdin:
     subprocess.run([sys.executable,program,'done','--report',row['report'],'--attempt',row['current_attempt']],check=True)
     finished=True
 '''.replace('PROGRAM', repr(program)), encoding='utf-8')
+
+    def codex_composer_host(self, drop_enter=True):
+        """A raw terminal with Codex's composer and burst-Enter suppression.
+
+        Herdr's send_input writes bracketed paste and Enter in one operation.
+        Record host submissions separately from the backend's acceptance receipt.
+        """
+        events = self.root / 'host-events.jsonl'
+        self.host.write_text(r'''import json,os,subprocess,sys,termios,time,tty
+from pathlib import Path
+tty.setraw(sys.stdin.fileno())
+text=''; pending=''; pasted_at=0
+def draw():
+    print('\x1b[2J\x1b[H› '+text+'\r\n\r\n  gpt-controlled · test\r\n',end='',flush=True)
+subprocess.run([sys.executable,PROGRAM,'ask','COMPOSER_READY',
+               '--attempt',sys.argv[-1].split('--attempt ')[1].split()[0]],stdout=subprocess.DEVNULL,check=True)
+print('\x1b[?2004h',end='',flush=True)
+draw()
+while True:
+    pending+=os.read(sys.stdin.fileno(),65536).decode('utf-8')
+    while pending:
+        if pending.startswith('\x1b[200~'):
+            end=pending.find('\x1b[201~')
+            if end<0:break
+            text+=pending[6:end];pending=pending[end+6:]
+            pasted_at=time.monotonic();draw()
+        else:
+            char,pending=pending[0],pending[1:]
+            if char in '\r\n':
+                if DROP and time.monotonic()-pasted_at<.15:
+                    with Path(EVENTS).open('a') as f:f.write(json.dumps({'dropped':True,'draft':text})+'\n')
+                    continue
+                with Path(EVENTS).open('a') as f:f.write(json.dumps({'user':text})+'\n')
+                text='';draw()
+            elif char=='\x03':sys.exit(0)
+            else:text+=char;pasted_at=time.monotonic();draw()
+'''.replace('PROGRAM', repr(str(PROGRAM))).replace('EVENTS', repr(str(events)))
+            .replace('DROP', repr(drop_enter)), encoding='utf-8')
+        return events
+
+    @unittest.skipIf(os.name == 'nt', 'raw POSIX controlled TUI; Windows live retest is separate')
+    def test_public_reply_submits_a_codex_draft_after_burst_enter_is_dropped(self):
+        events = self.codex_composer_host()
+        dispatch = self.dispatch()
+        try:
+            [question] = self.cli('wait', '--timeout', '5')['messages']
+            self.assertEqual(question['question'], 'COMPOSER_READY')
+            answer = 'finish the controlled task exactly once'
+            self.cli('reply', str(question['id']), answer)
+            time.sleep(.1)
+            recorded = [json.loads(line) for line in events.read_text().splitlines()]
+            self.assertEqual(len([e for e in recorded if e.get('dropped')]), 1, recorded)
+            users = [e['user'] for e in recorded if 'user' in e]
+            self.assertEqual(len(users), 1, recorded)
+            self.assertIn(answer, users[0])
+        finally:
+            self.assertEqual(self.cli('close', dispatch)['result'], 'completed')
+
+    @unittest.skipIf(os.name == 'nt', 'raw POSIX controlled TUI; Windows live retest is separate')
+    def test_public_reply_already_submitted_gets_no_empty_enter(self):
+        events = self.codex_composer_host(drop_enter=False)
+        dispatch = self.dispatch()
+        try:
+            [question] = self.cli('wait', '--timeout', '5')['messages']
+            self.cli('reply', str(question['id']), 'submit once')
+            recorded = [json.loads(line) for line in events.read_text().splitlines()]
+            self.assertEqual(recorded, [{'user': f"[router] Answer to question {question['id']}: submit once"}])
+        finally:
+            self.assertEqual(self.cli('close', dispatch)['result'], 'completed')
+
+    @unittest.skipIf(os.name == 'nt', 'raw POSIX controlled TUI; Windows live retest is separate')
+    def test_public_reply_and_concurrent_nudge_do_not_mix_codex_drafts(self):
+        events = self.codex_composer_host()
+        dispatch = self.dispatch()
+        children = []
+        try:
+            [question] = self.cli('wait', '--timeout', '5')['messages']
+            for command in (['reply', str(question['id']), 'reply marker'],
+                            ['nudge', dispatch, '--text', 'nudge marker']):
+                children.append(subprocess.Popen([sys.executable, str(PROGRAM), *command], env=self.env,
+                                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+                time.sleep(.1)
+            for child in children:
+                out, err = child.communicate(timeout=20)
+                self.assertEqual(child.returncode, 0, err.decode())
+            users = [event['user'] for line in events.read_text().splitlines()
+                     if 'user' in (event := json.loads(line))]
+            self.assertEqual(len(users), 2, users)
+            self.assertEqual(sum('reply marker' in text for text in users), 1, users)
+            self.assertEqual(sum('nudge marker' in text for text in users), 1, users)
+            self.assertFalse(any('reply marker' in text and 'nudge marker' in text for text in users), users)
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                    child.communicate()
+            self.assertEqual(self.cli('close', dispatch)['result'], 'completed')
     def test_question_reply_done_continue_and_restart_keep_round_identity(self):
         self.interactive_host()
         dispatch = self.dispatch()
@@ -323,6 +538,18 @@ for line in sys.stdin:
 
     @unittest.skipIf(os.name == 'nt', 'Unix socket fault proxy; native pipe uses the same result contract')
     def test_lost_input_response_is_unknown_and_not_replayed(self):
+        self.lost_response('pane.send_input')
+
+    @unittest.skipIf(os.name == 'nt', 'raw POSIX TUI and Unix socket fault proxy')
+    def test_lost_followup_enter_response_keeps_public_reply_claimed(self):
+        events = self.codex_composer_host()
+        self.lost_response('pane.send_keys', public_reply=True)
+        users = [event['user'] for line in events.read_text().splitlines()
+                 if 'user' in (event := json.loads(line))]
+        self.assertEqual(len(users), 1, users)
+        self.assertIn('one intent', users[0])
+
+    def lost_response(self, lost_method, public_reply=False):
         import socket
         import threading
         real_endpoint = self.endpoint
@@ -347,8 +574,9 @@ for line in sys.stdin:
                         target.sendall(raw)
                         with target.makefile('rb') as incoming:
                             response = incoming.readline(2 * 1024 * 1024)
-                    if method == 'pane.send_input':
+                    if method in ('pane.send_input', 'pane.send_keys'):
                         calls.append(method)
+                    if method == lost_method:
                         stopped.wait(3)  # backend accepted; its response is lost
                         return
                     stream.write(response)
@@ -374,8 +602,13 @@ for line in sys.stdin:
         try:
             dispatch = self.dispatch()
             before = self.cli('status', '--dispatch', dispatch)['dispatches'][0]
+            if public_reply:
+                [question] = self.cli('wait', '--timeout', '5')['messages']
+                command = ['reply', str(question['id']), 'one intent']
+            else:
+                command = ['nudge', dispatch, '--text', 'one intent']
             self.env['WFC_HERDR_TIMEOUT'] = '1'
-            result = subprocess.run([sys.executable, str(PROGRAM), 'nudge', dispatch, '--text', 'one intent'],
+            result = subprocess.run([sys.executable, str(PROGRAM), *command],
                                     env=self.env, capture_output=True, text=True, encoding='utf-8', timeout=20)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('uncertain', result.stderr)
@@ -384,7 +617,12 @@ for line in sys.stdin:
                 view = self.cli('status', '--dispatch', dispatch)['dispatches'][0]
                 self.assertEqual(view['attempt'], before['attempt'])
                 self.cli('wait', '--timeout', '0')
-            self.assertEqual(calls, ['pane.send_input'])
+            if public_reply:
+                retry = subprocess.run([sys.executable, str(PROGRAM), *command], env=self.env,
+                                       capture_output=True, text=True, encoding='utf-8', timeout=15)
+                self.assertNotEqual(retry.returncode, 0)
+                self.assertIn('already answered', retry.stderr)
+            self.assertEqual(calls, ['pane.send_input', 'pane.send_keys'] if public_reply else ['pane.send_input'])
             self.assertEqual(self.cli('close', dispatch)['result'], 'completed')
         finally:
             stopped.set()
