@@ -69,6 +69,7 @@ class BundledNative(unittest.TestCase):
         self.env = {key: value for key, value in os.environ.items()
                     if key not in ('WFC_DISPATCH', 'WFC_OWNER_TOKEN', 'WFC_STATE', 'WFC_LAUNCH_CONFIG')}
         self.env.update(WFC_STATE=str(self.root / 'state'), CODEX_HOME=str(self.root / 'codex-home'), PYTHONUTF8='1',
+                        WFC_BUNDLED_DIAGNOSTICS='1',
                         WFC_BUNDLED_KERNEL=str(Path(os.environ['WFC_BUNDLED_TEST_KERNEL']).resolve()))
         if os.environ.get('WFC_BUNDLED_TEST_DISCOVERY'):
             self.env.pop('WFC_BUNDLED_KERNEL', None)
@@ -201,8 +202,12 @@ class BundledNative(unittest.TestCase):
         value = self.dispatch()
         dispatch = value['dispatch']
         first = self.handle(dispatch)
-        self.assertEqual(self.cli('interrupt', dispatch)['result'], 'accepted')
-        self.assertEqual(self.cli('close', dispatch)['result'], 'completed')
+        from bundled_diagnostics import close_evidence, safe_outcome
+        interrupted = self.cli('interrupt', dispatch)
+        self.assertEqual(interrupted['result'], 'accepted', safe_outcome(interrupted))
+        closed = self.cli('close', dispatch)
+        self.assertEqual(closed['result'], 'completed', json.dumps({
+            'close': safe_outcome(closed), 'evidence': close_evidence(dispatch, first)}))
         resumed = self.cli('resume', dispatch)
         self.assertNotEqual(resumed['attempt'], value['attempt'])
         second = self.handle(dispatch)

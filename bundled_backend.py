@@ -117,7 +117,8 @@ class BundledBackend:
         handle['receipt'] = str(receipt)
         spec = {**handle, 'host_spec': str(host_spec), 'token': uuid.uuid4().hex + uuid.uuid4().hex, 'binary': binary,
                 'argv': [sys.executable, str(router.PROGRAM), '_host-run', str(host_spec)],
-                'env': extra_env, 'cwd': str(cwd), 'cgroup_root': root}
+                'env': extra_env, 'cwd': str(cwd), 'cgroup_root': root,
+                'diagnostics': os.environ.get('WFC_BUNDLED_DIAGNOSTICS') == '1'}
         host_launch.write_private(spec_path, spec)
         self._save(dispatch_id, handle)
         try:

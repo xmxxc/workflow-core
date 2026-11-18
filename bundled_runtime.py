@@ -5,6 +5,7 @@ The guardian owns Linux cgroup cleanup; the runtime owns the native Windows Job.
 Neither endpoint nor process IDs alone authorize an operation. No request replay.
 """
 import ctypes
+from collections import deque
 import hmac
 import hashlib
 import json
@@ -36,6 +37,34 @@ def read_json(path):
 def publish(path, value):
     """Atomic, private snapshots; all paths originate in the private launch spec."""
     host_launch.write_private(path, value)
+
+
+class LifecycleTrace:
+    """Opt-in bounded diagnostics. Never read by ownership/cleanup decisions."""
+    FIELDS = {'pid', 'creation', 'code', 'error_type', 'errno', 'winerror', 'active', 'total', 'terminated'}
+
+    def __init__(self, spec, role):
+        self.path = Path(spec['snapshot']).with_suffix('.' + role + '.trace.json') if spec.get('diagnostics') else None
+        self.identity = {key: spec[key] for key in ('unit', 'generation', 'attempt')}
+        self.role = role
+        self.events = deque(maxlen=48)
+        self.started = time.monotonic()
+
+    def record(self, phase, **fields):
+        if self.path is None:
+            return
+        safe = {key: value[:128] if isinstance(value, str) else value for key, value in fields.items()
+                if key in self.FIELDS and (value is None or isinstance(value, (str, int, float, bool)))}
+        self.events.append({'phase': phase[:64], 'elapsed': round(time.monotonic() - self.started, 6), **safe})
+        try:
+            publish(self.path, {'version': 1, **self.identity, 'role': self.role, 'events': list(self.events)})
+        except OSError:
+            pass  # Evidence loss must not change lifecycle semantics.
+
+
+def trace_error(trace, phase, error):
+    trace.record(phase, error_type=type(error).__name__, errno=getattr(error, 'errno', None),
+                 winerror=getattr(error, 'winerror', None))
 
 
 def budget(deadline):
@@ -85,6 +114,7 @@ def encode(value):
 def call(handle, op, **data):
     """Single bounded attempt. A failed send or response is never made replayable."""
     sent = False
+    phase = 'identity'
     try:
         if not handle.get('service') or not handle.get('endpoint'):
             raise ValueError('bundled runtime identity is incomplete')
@@ -97,8 +127,10 @@ def call(handle, op, **data):
         payload.update(id=ident, op=op, **data)
         frame = encode(payload)
         deadline = time.monotonic() + TIMEOUT
+        phase = 'connect'
         with socket.create_connection(('127.0.0.1', handle['endpoint']), timeout=TIMEOUT) as stream:
             remaining(stream, deadline)
+            phase = 'challenge'
             challenge = uuid.uuid4().hex
             stream.sendall(encode({'challenge': challenge}))
             proof = receive(stream, limit=PREAUTH_LIMIT, deadline=deadline).get('proof', '')
@@ -106,19 +138,23 @@ def call(handle, op, **data):
             if not hmac.compare_digest(str(proof), expected):
                 raise ValueError('bundled server capability proof failed')
             remaining(stream, deadline)
+            phase = 'authenticate'
             stream.sendall(encode({'token': handle['token']}))
             remaining(stream, deadline)
+            phase = 'request'
             sent = True  # sendall may partially deliver before raising
             stream.sendall(frame)
+            phase = 'response'
             response = receive(stream, deadline=deadline)
+        phase = 'response_identity'
         if response.get('id') != ident or response.get('generation') != handle['generation']:
             raise ValueError('bundled response identity mismatch')
         if response.get('result') not in ('accepted', 'completed', 'refused', 'uncertain', 'definitely-not-sent'):
             raise ValueError('invalid bundled response')
         return response
-    except (OSError, EOFError, ValueError, KeyError, TypeError):
+    except (OSError, EOFError, ValueError, KeyError, TypeError) as error:
         return {'result': 'uncertain' if sent else 'definitely-not-sent', 'category': 'bundled_unavailable',
-                'diagnostic': 'bundled runtime connection or identity observation failed; no request was replayed'}
+                'diagnostic': 'bundled runtime observation failed at ' + phase + ' (' + type(error).__name__ + '); no request was replayed'}
 
 
 def cgroup_root(value):
@@ -159,7 +195,9 @@ class LinuxContainment:
         with os.fdopen(fd, 'w') as stream:
             stream.write(str(pid))
 
-    def stop(self):
+    def stop(self, trace=None):
+        record = trace or (lambda *args, **kwargs: None)
+        record('cgroup_kill_begin')
         fd = os.open('cgroup.kill', os.O_WRONLY, dir_fd=self.fd)
         with os.fdopen(fd, 'w') as stream:
             stream.write('1')
@@ -168,6 +206,7 @@ class LinuxContainment:
             fd = os.open('cgroup.events', os.O_RDONLY, dir_fd=self.fd)
             with os.fdopen(fd) as stream:
                 if 'populated 0' in stream.read().splitlines():
+                    record('cgroup_empty', active=0)
                     return
             time.sleep(.02)
         raise TimeoutError('bundled cgroup remained populated after kill')
@@ -228,21 +267,33 @@ class WindowsContainment:
         finally:
             self.kernel.CloseHandle(process)
 
-    def stop(self):
+    def stop(self, trace=None):
+        record = trace or (lambda *args, **kwargs: None)
+        record('job_terminate_begin')
         if not self.kernel.TerminateJobObject(self.handle, 1):
-            raise ctypes.WinError(ctypes.get_last_error())
+            code = ctypes.get_last_error()
+            record('job_terminate_failed', winerror=code)
+            raise ctypes.WinError(code)
         # JOBOBJECT_BASIC_ACCOUNTING_INFORMATION: four LARGE_INTEGERs, four DWORDs.
         class Accounting(ctypes.Structure):
             _fields_ = [('times', ctypes.c_int64 * 4), ('faults', ctypes.c_uint32),
                         ('total', ctypes.c_uint32), ('active', ctypes.c_uint32), ('terminated', ctypes.c_uint32)]
         deadline = time.monotonic() + TIMEOUT
+        previous = None
         while time.monotonic() < deadline:
             info = Accounting()
             if not self.kernel.QueryInformationJobObject(self.handle, 1, ctypes.byref(info), ctypes.sizeof(info), None):
-                raise ctypes.WinError(ctypes.get_last_error())
+                code = ctypes.get_last_error()
+                record('job_query_failed', winerror=code)
+                raise ctypes.WinError(code)
+            if info.active != previous:
+                record('job_accounting', active=info.active, total=info.total, terminated=info.terminated)
+                previous = info.active
             if info.active == 0:
+                record('job_empty', active=0)
                 return
             time.sleep(.02)
+        record('job_cleanup_timeout', active=previous)
         raise TimeoutError('bundled Job remained populated after termination')
 
     def dispose(self):
@@ -299,12 +350,15 @@ class Kernel:
 
 def run(spec_path):
     spec = read_json(spec_path)
+    trace = LifecycleTrace(spec, 'runtime')
+    trace.record('runtime_start', pid=os.getpid(), creation=wfc_platform.process_identity(os.getpid()))
     Path(spec_path).unlink()
     containment = WindowsContainment() if wfc_platform.WINDOWS else LinuxContainment(spec['cgroup'])
     kernel = None
     closed = False
     try:
         kernel = Kernel(spec['binary'], containment, spec['env'])
+        trace.record('kernel_ready', pid=kernel.child.pid, creation=wfc_platform.process_identity(kernel.child.pid))
         spawn = kernel.call('spawn', spec, argv=spec['argv'], cwd=spec['cwd'], cols=120, rows=40)
         if not spawn.get('ok'):
             raise OSError('bundled kernel refused worker creation')
@@ -325,6 +379,7 @@ def run(spec_path):
             next_observation = 0.0
             while True:
                 if kernel.child.poll() is not None:
+                    trace.record('kernel_ended', code=kernel.child.returncode)
                     raise OSError('bundled kernel exited; live terminal recovery is unavailable')
                 if time.monotonic() >= next_observation:
                     view = kernel.call('read', spec)
@@ -332,11 +387,13 @@ def run(spec_path):
                     if not view.get('ok') or view['result'].get('read_error'):
                         raise OSError('bundled terminal observation failed')
                     if view['result'].get('exit') is not None:
-                        containment.stop()
+                        trace.record('host_exit_observed', code=view['result']['exit'].get('code'))
+                        containment.stop(trace=trace.record)
                         kernel.child.wait(timeout=TIMEOUT)
                         closed = True
                         publish(spec['snapshot'], {**handle, 'state': 'exited', 'cleanup': 'confirmed',
                                                   'final_screen': view['result']['text']})
+                        trace.record('exit_cleanup_published', code=kernel.child.returncode)
                         break
                 try:
                     stream, _ = listener.accept()
@@ -363,15 +420,22 @@ def run(spec_path):
                             result = {'result': 'refused', 'category': 'bundled_ownership',
                                       'diagnostic': 'bundled execution identity refused'}
                         elif request['op'] == 'close':
-                            containment.stop()
+                            trace.record('close_received')
+                            containment.stop(trace=trace.record)
                             kernel.child.wait(timeout=TIMEOUT)
+                            trace.record('close_kernel_waited', code=kernel.child.returncode)
                             closed = True
                             close_requested = True
                             publish(spec['snapshot'], {**handle, 'state': 'closed', 'cleanup': 'confirmed'})
+                            trace.record('close_cleanup_published')
                             result = {'result': 'completed'}
                         elif request['op'] in ('read', 'input', 'resize'):
                             extra = {key: request[key] for key in ('text', 'cols', 'rows') if key in request}
+                            if request['op'] == 'input' and request.get('text') == '\x03':
+                                trace.record('interrupt_received')
                             response = kernel.call(request['op'], spec, deadline=connection_deadline, **extra)
+                            if request['op'] == 'input' and request.get('text') == '\x03':
+                                trace.record('interrupt_kernel_replied', code=int(bool(response.get('ok'))))
                             if response.get('ok'):
                                 result = {'result': 'accepted', 'data': response['result']}
                             else:
@@ -380,21 +444,31 @@ def run(spec_path):
                                           'diagnostic': 'bundled kernel operation failed'}
                         else:
                             result = {'result': 'refused', 'diagnostic': 'unknown bundled operation'}
+                        if close_requested:
+                            trace.record('close_reply_begin')
                         remaining(stream, connection_deadline)
                         stream.sendall(encode({**result, 'id': request.get('id'), 'generation': spec['generation']}))
-                    except (OSError, EOFError, ValueError, KeyError, TypeError, queue.Empty):
+                        if close_requested:
+                            trace.record('close_reply_sent')
+                    except (OSError, EOFError, ValueError, KeyError, TypeError, queue.Empty) as error:
+                        trace_error(trace, 'connection_error', error)
                         # A disconnected client cannot cancel or replay a request already delivered.
                         pass
                     if close_requested:
                         break
+    except BaseException as error:
+        trace_error(trace, 'runtime_error', error)
+        raise
     finally:
         try:
             if not closed:
-                containment.stop()
+                trace.record('final_cleanup_begin')
+                containment.stop(trace=trace.record)
                 if kernel:
                     kernel.child.wait(timeout=TIMEOUT)
                 publish(spec['snapshot'], {key: spec[key] for key in
                         ('generation', 'unit', 'nonce', 'attempt')} | {'state': 'faulted', 'cleanup': 'confirmed'})
+                trace.record('fault_cleanup_published')
         finally:
             containment.dispose()
             Path(spec_path).unlink(missing_ok=True)
@@ -409,6 +483,8 @@ def guard(spec_path):
     lifecycle containment, not a security sandbox for a hostile same-user worker.
     """
     spec = read_json(spec_path)
+    trace = LifecycleTrace(spec, 'guardian')
+    trace.record('guardian_start', pid=os.getpid(), creation=wfc_platform.process_identity(os.getpid()))
     containment = None
     try:
         if not wfc_platform.WINDOWS:
@@ -424,12 +500,14 @@ def guard(spec_path):
         child = subprocess.Popen([sys.executable, str(router.PROGRAM), '_bundled-runtime', str(spec_path)],
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                  close_fds=True)
-        child.wait()
+        trace.record('runtime_started', pid=child.pid, creation=wfc_platform.process_identity(child.pid))
+        code = child.wait()
+        trace.record('runtime_ended', code=code)
     finally:
         cleaned = False
         if containment:
             try:
-                containment.stop()
+                containment.stop(trace=trace.record)
                 cleaned = True
             finally:
                 containment.dispose()
@@ -444,5 +522,6 @@ def guard(spec_path):
         if snapshot.get('state') not in ('closed', 'exited'):
             publish(spec['snapshot'], {**snapshot, 'state': 'faulted',
                                       'cleanup': 'confirmed' if cleaned else 'unknown'})
+        trace.record('guardian_finished', code=int(cleaned))
         Path(spec_path).unlink(missing_ok=True)
         Path(spec['host_spec']).unlink(missing_ok=True)

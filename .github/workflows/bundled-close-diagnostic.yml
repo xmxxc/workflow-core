@@ -1,0 +1,137 @@
+name: Bundled Windows close diagnostic
+
+on:
+  push:
+    branches: [codex/bundled-close-diagnostic-26]
+
+permissions:
+  contents: read
+
+jobs:
+  close-diagnostic:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      PYTHONUTF8: '1'
+      RUSTUP_TOOLCHAIN: '1.96.1'
+      # Process-local override applies to checkout without changing user config.
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: core.autocrlf
+      GIT_CONFIG_VALUE_0: 'false'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Verify isolated diagnostic identity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = "$env:RUNNER_TEMP/bundled-close-evidence"
+          New-Item -ItemType Directory $out | Out-Null
+          "CARGO_HOME=$env:RUNNER_TEMP/bundled-close-cargo" >> $env:GITHUB_ENV
+          $base = '95b5574f1febc3a5bd9b8749b94bf5799718cc35'
+          $head = git rev-parse HEAD
+          if ($LASTEXITCODE -or $head -ne $env:GITHUB_SHA) { throw 'Checkout SHA mismatch' }
+          $tree = git rev-parse 'HEAD^{tree}'
+          if ($LASTEXITCODE) { throw 'Cannot read checkout tree' }
+          @{ commit=$head; tree=$tree; base=$base; os=[Environment]::OSVersion.VersionString;
+             diagnostic_patch_sha256='f6f1815ff33183cd2f18a4de520741de36c9541f42eaafb2619a2bd64f047fe1' } |
+            ConvertTo-Json | Set-Content -Encoding utf8 "$out/identity.json"
+          if ($env:GITHUB_REF -ne 'refs/heads/codex/bundled-close-diagnostic-26') { throw 'Wrong diagnostic branch' }
+          git merge-base --is-ancestor $base HEAD
+          if ($LASTEXITCODE) { throw 'Diagnostic tree must descend from the fixed base' }
+          $expected = @{
+            'bundled_runtime.py' = 'fc4a02ab992322f237676e750709d6ba9108ea5e2f6d35fe25b85b25a08283bd'
+            'bundled_backend.py' = '42b54adbbb356dd587e55bb0c456452117a91702ff06723a5c95c40f9a39bac7'
+            'tests/test_bundled.py' = 'eaaf8729bf84646af561eb20a7f42cef020bc3c3e6269060290718c00639ffd6'
+            'tests/test_bundled_protocol.py' = '3be42d4ae243f62709475517eb4f1bccbdc42f2e24f0cea81bc7c39a26dab557'
+            'tests/bundled_diagnostics.py' = '70c1788885098d297c004c7b9ee643bcd97af65e6ea6e04e1fc4a86a4d64adf4'
+            'tools/probe_bundled_close.py' = 'd14fdab5900008931d586db9047d4de8e81617fb303af63a33e582aa644a9c9e'
+            'tools/bundled_close_native_probe.ps1' = '5d0a60ff5056d957bcb6199574decb226291ee7170b4ad4fb08026497e258b7e'
+          }
+          $allowed = @($expected.Keys) + @('.github/workflows/bundled-close-diagnostic.yml')
+          $changed = @(git diff --name-only $base HEAD)
+          if ($LASTEXITCODE) { throw 'Cannot compare fixed diagnostic tree' }
+          foreach ($path in $changed) {
+            if ($path -notin $allowed) { throw "Change outside fixed diagnostic inputs: $path" }
+          }
+          foreach ($path in $expected.Keys) {
+            if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected[$path]) {
+              throw "Fixed diagnostic file mismatch: $path"
+            }
+          }
+          $dirty = git status --porcelain
+          if ($LASTEXITCODE -or $dirty) { throw 'Diagnostic checkout must be clean' }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: herdrdev/herdr
+          ref: ee5bfb5041bb3e4a49d591c72308aae3c81ecdde
+          path: upstream
+          persist-credentials: false
+      - uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943
+        with:
+          version: '0.16.0'
+      - name: Build the unchanged pinned native kernel
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install 1.96.1 --profile minimal
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $rust = rustc -Vv
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $cargo = cargo -V
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $zig = zig version
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $python = python --version
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $prepared = "$env:RUNNER_TEMP/bundled-close-prepared"
+          python experiments/herdr-kernel-prototype/prepare.py --source upstream --scratch $prepared
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          foreach ($path in @('src/main.rs', 'Cargo.toml', 'Cargo.lock')) {
+            if ((Get-FileHash "$prepared/$path").Hash -ne (Get-FileHash "experiments/herdr-kernel-prototype/$path").Hash) {
+              throw "Prepared input mismatch: $path"
+            }
+          }
+          cargo build --manifest-path "$prepared/Cargo.toml" --release --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $kernel = "$prepared/target/x86_64-pc-windows-msvc/release/herdr-kernel-prototype.exe"
+          @{ kernel_sha256=(Get-FileHash $kernel -Algorithm SHA256).Hash.ToLowerInvariant();
+             kernel_bytes=(Get-Item $kernel).Length;
+             rust_source_sha256=(Get-FileHash "$prepared/src/main.rs").Hash.ToLowerInvariant();
+             cargo_lock_sha256=(Get-FileHash "$prepared/Cargo.lock").Hash.ToLowerInvariant();
+             cargo_manifest_sha256=(Get-FileHash "$prepared/Cargo.toml").Hash.ToLowerInvariant();
+             upstream_commit='ee5bfb5041bb3e4a49d591c72308aae3c81ecdde';
+             target='x86_64-pc-windows-msvc'; rust=$rust; cargo=$cargo; zig=$zig; python=$python } |
+            ConvertTo-Json | Set-Content -Encoding utf8 "$env:RUNNER_TEMP/bundled-close-evidence/build-hashes.json"
+          "PROBE_KERNEL=$kernel" >> $env:GITHUB_ENV
+      - name: Probe source and relocated close only
+        shell: pwsh
+        timeout-minutes: 6
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Remove-Item Env:WFC_DISPATCH, Env:WFC_OWNER_TOKEN, Env:WFC_CONTROLLER_TOKEN, Env:WFC_LAUNCH_CONFIG, Env:WFC_TEST_PROGRAM, Env:WFC_BUNDLED_TEST_DISCOVERY, Env:WFC_BUNDLED_KERNEL -ErrorAction SilentlyContinue
+          $env:CODEX_HOME = "$env:RUNNER_TEMP/bundled-close-no-account"
+          $env:WFC_STATE = "$env:RUNNER_TEMP/bundled-close-state"
+          $env:TERM = 'xterm-256color'
+          & ./tools/bundled_close_native_probe.ps1 -ProbeKernel $env:PROBE_KERNEL -ProbeOut "$env:RUNNER_TEMP/bundled-close-evidence"
+          exit $LASTEXITCODE
+      - name: Preserve only allowlisted internal diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: internal-bundled-close-${{ github.sha }}-${{ github.run_id }}
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/bundled-close-evidence/identity.json
+            ${{ runner.temp }}/bundled-close-evidence/build-hashes.json
+            ${{ runner.temp }}/bundled-close-evidence/close-source.json
+            ${{ runner.temp }}/bundled-close-evidence/close-source.log
+            ${{ runner.temp }}/bundled-close-evidence/close-packaged.json
+            ${{ runner.temp }}/bundled-close-evidence/close-packaged.log
+            ${{ runner.temp }}/bundled-close-evidence/result.json
