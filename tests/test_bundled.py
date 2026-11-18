@@ -69,6 +69,7 @@ class BundledNative(unittest.TestCase):
         self.env = {key: value for key, value in os.environ.items()
                     if key not in ('WFC_DISPATCH', 'WFC_OWNER_TOKEN', 'WFC_STATE', 'WFC_LAUNCH_CONFIG')}
         self.env.update(WFC_STATE=str(self.root / 'state'), CODEX_HOME=str(self.root / 'codex-home'), PYTHONUTF8='1',
+                        WFC_BUNDLED_DIAGNOSTICS='1',
                         WFC_BUNDLED_KERNEL=str(Path(os.environ['WFC_BUNDLED_TEST_KERNEL']).resolve()))
         if os.environ.get('WFC_BUNDLED_TEST_DISCOVERY'):
             self.env.pop('WFC_BUNDLED_KERNEL', None)
@@ -201,8 +202,12 @@ class BundledNative(unittest.TestCase):
         value = self.dispatch()
         dispatch = value['dispatch']
         first = self.handle(dispatch)
-        self.assertEqual(self.cli('interrupt', dispatch)['result'], 'accepted')
-        self.assertEqual(self.cli('close', dispatch)['result'], 'completed')
+        from bundled_diagnostics import close_evidence, safe_outcome
+        interrupted = self.cli('interrupt', dispatch)
+        self.assertEqual(interrupted['result'], 'accepted', safe_outcome(interrupted))
+        closed = self.cli('close', dispatch)
+        self.assertEqual(closed['result'], 'completed', json.dumps({
+            'close': safe_outcome(closed), 'evidence': close_evidence(dispatch, first)}))
         resumed = self.cli('resume', dispatch)
         self.assertNotEqual(resumed['attempt'], value['attempt'])
         second = self.handle(dispatch)
@@ -510,6 +515,63 @@ class BundledNative(unittest.TestCase):
         finally:
             if wfc_platform.process_identity(handle['service']['pid']) == handle['service']['creation']:
                 runtime.publish(handle['snapshot'], handle)
+            stopped.set()
+            listener.close()
+            proxy.join(timeout=8)
+        self.assertFalse(proxy.is_alive())
+        self.assertFalse(failures, failures)
+
+
+    def test_completed_close_with_lost_response_uses_matching_receipt_once(self):
+        import hashlib
+        import hmac
+        import socket
+        import threading
+        import bundled_runtime as runtime
+        value = self.dispatch('record-only')
+        handle = self.handle(value['dispatch'])
+        self.question()
+        listener = socket.socket()
+        listener.bind(('127.0.0.1', 0))
+        listener.listen(8)
+        listener.settimeout(.1)
+        stopped = threading.Event()
+        operations, failures = [], []
+        def serve():
+            while not stopped.is_set():
+                try:
+                    client, _ = listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                try:
+                    with client:
+                        client.settimeout(7)
+                        challenge = runtime.receive(client)['challenge']
+                        proof = hmac.new(handle['token'].encode(), ('server:' + challenge).encode(), hashlib.sha256).hexdigest()
+                        client.sendall(runtime.encode({'proof': proof}))
+                        self.assertEqual(runtime.receive(client)['token'], handle['token'])
+                        request = runtime.receive(client)
+                        operations.append(request['op'])
+                        result = runtime.call(handle, request['op'])
+                        if request['op'] == 'close':
+                            self.assertEqual(result['result'], 'completed', result)
+                            continue  # Real container emptied; lose only the completed response.
+                        client.sendall(runtime.encode({**result, 'id': request['id'], 'generation': handle['generation']}))
+                except Exception as error:
+                    failures.append(type(error).__name__)
+        proxy = threading.Thread(target=serve)
+        proxy.start()
+        runtime.publish(handle['snapshot'], {**handle, 'endpoint': listener.getsockname()[1]})
+        try:
+            result = self.cli('close', value['dispatch'])
+            self.assertEqual(result['result'], 'completed', result)
+            receipt = runtime.read_json(handle['snapshot'])
+            self.assertTrue(runtime.confirmed_cleanup(handle, receipt))
+            self.assertEqual(receipt['state'], 'closed')
+            self.assertEqual(operations.count('close'), 1)
+        finally:
             stopped.set()
             listener.close()
             proxy.join(timeout=8)

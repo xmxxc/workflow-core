@@ -31,6 +31,13 @@ accepting more clients whenever its 0.2-second poll is due, including a busy
 accept backlog. Native cleanup retains its separately bounded deadline. Input is
 sent once. A partial write, missing receipt or response identity mismatch remains
 uncertain; it never triggers a resend, service restart or silent reattachment.
+After an inspection or close transport/preflight failure, the adapter reads the
+private snapshot once more. It recognizes completion only from a confirmed
+terminal receipt whose HMAC validates against the capability digest committed in
+the launch handle, with the same attempt, unit, nonce, generation and recorded
+process/container identities. Diagnostic traces never authorize completion. An
+explicit refusal remains a refusal. Earlier unsigned terminal snapshots require
+explicit reconciliation; they are not silently upgraded.
 
 The router continues owning rounds, callbacks, message receipts, controller fencing
 and lifecycle reconciliation. A live execution can serve later task rounds. Resume

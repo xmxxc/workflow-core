@@ -77,7 +77,7 @@ TABLES = {
     # Durable lifecycle operations are separate from worker/controller messages.  An
     # operation can cross a tmux boundary after the router has committed its fencing
     # decision, so its pending/accepted/uncertain result must survive a router restart.
-    "lifecycle_event": "id INTEGER PRIMARY KEY AUTOINCREMENT, dispatch TEXT, operation TEXT, round INTEGER, attempt TEXT, from_attempt TEXT, to_attempt TEXT, from_host TEXT, to_host TEXT, result TEXT, diagnostic TEXT, owner_generation INTEGER, owner_token TEXT, resolver_actor TEXT, resolution_evidence TEXT, resolved_at REAL, consumed_at REAL, created REAL",
+    "lifecycle_event": "id INTEGER PRIMARY KEY AUTOINCREMENT, dispatch TEXT, operation TEXT, round INTEGER, attempt TEXT, from_attempt TEXT, to_attempt TEXT, from_host TEXT, to_host TEXT, result TEXT, diagnostic TEXT, owner_generation INTEGER, owner_token TEXT, resolver_actor TEXT, resolution_evidence TEXT, resolution_owner_generation INTEGER, resolved_at REAL, consumed_at REAL, created REAL",
     "waiter": "pid INTEGER PRIMARY KEY, kind TEXT, since REAL",
 }
 # Column upgrades: `started` is set once the worker's tmux session exists (the watchdog ignores
@@ -96,7 +96,7 @@ ADDED_COLUMNS = {
                 "state": "TEXT", "status_version": "INTEGER", "resolver_actor": "TEXT",
                 "resolution_source": "TEXT", "resolution_reason": "TEXT", "resolution_evidence": "TEXT",
                 "resolved_at": "REAL"},
-    "lifecycle_event": {"owner_generation": "INTEGER", "owner_token": "TEXT", "resolver_actor": "TEXT", "resolution_evidence": "TEXT", "resolved_at": "REAL", "consumed_at": "REAL"},
+    "lifecycle_event": {"owner_generation": "INTEGER", "owner_token": "TEXT", "resolver_actor": "TEXT", "resolution_evidence": "TEXT", "resolution_owner_generation": "INTEGER", "resolved_at": "REAL", "consumed_at": "REAL"},
     "waiter": {"process_start": "TEXT"},
 }
 
@@ -252,6 +252,11 @@ def preflight_controller(db, scope, token, operation):
 
 def cmd_owner(args):
     db = connect()
+    with owner_lock(clean_label(args.scope)):
+        return _mutate_owner(args, db)
+
+
+def _mutate_owner(args, db):
     scope = clean_label(args.scope or "")
     if not scope:
         raise SystemExit("--scope is required")
@@ -927,20 +932,23 @@ def lifecycle_event(db, dispatch_id, operation, *, round=None, attempt=None,
     return cur.lastrowid
 
 
-def finish_lifecycle_event(db, event_id, result, diagnostic=None, actor=None, evidence=None):
+def finish_lifecycle_event(db, event_id, result, diagnostic=None, actor=None, evidence=None, resolution_generation=None):
     db.execute("UPDATE lifecycle_event SET result = ?, diagnostic = COALESCE(?, diagnostic), "
                "resolver_actor = COALESCE(?, resolver_actor), resolution_evidence = COALESCE(?, resolution_evidence), "
+               "resolution_owner_generation = COALESCE(?, resolution_owner_generation), "
                "resolved_at = CASE WHEN ? IS NULL THEN resolved_at ELSE ? END WHERE id = ?",
-               (result, diagnostic, actor, evidence, actor, time.time(), event_id))
+               (result, diagnostic, actor, evidence, resolution_generation, actor, time.time(), event_id))
 
 
 def lifecycle_view(row):
     return {"id": row["id"], "operation": row["operation"], "round": row["round"],
             "attempt": row["attempt"], "fromAttempt": row["from_attempt"], "toAttempt": row["to_attempt"],
             "fromHost": row["from_host"], "toHost": row["to_host"], "result": row["result"],
+            "ownerGeneration": row["owner_generation"],
             **({"diagnostic": row["diagnostic"]} if row["diagnostic"] else {}),
             **({"resolution": {"actor": row["resolver_actor"], "evidence": row["resolution_evidence"],
                                 "at": local_time(row["resolved_at"]),
+                                "ownerGeneration": row["resolution_owner_generation"],
                                 **({"consumedAt": local_time(row["consumed_at"])} if row["consumed_at"] else {})}}
                if row["resolver_actor"] else {}),
             "at": local_time(row["created"])}
@@ -1161,6 +1169,7 @@ def cmd_resolve(args):
     if row is None or row["recipient"] != "controller":
         db.execute("ROLLBACK")
         raise SystemExit(f"no controller message with id {args.message}")
+    require_owner(db, owner_scope(db, row["dispatch"]), owner_token(args), "resolve")
     if row["state"] == "received" or row["state"] == "processed":
         same_claim = (row["resolver_actor"] == args.actor and row["resolution_source"] == args.source
                       and row["resolution_reason"] == args.reason and row["resolution_evidence"] == args.evidence
@@ -1695,6 +1704,7 @@ class input_lock:
 
     def __init__(self, dispatch_id):
         self.path = state_dir() / f"input-{dispatch_id}.lock"
+        self.timeout_error = "input_lock_timeout"
 
     def __enter__(self):
         self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
@@ -1703,11 +1713,19 @@ class input_lock:
         except BaseException as err:
             os.close(self.fd)
             if isinstance(err, TimeoutError):
-                raise SystemExit(json.dumps({"error": "input_lock_timeout", "requiresDecision": True}))
+                raise SystemExit(json.dumps({"error": self.timeout_error, "requiresDecision": True}))
             raise
 
     def __exit__(self, *exc):
         os.close(self.fd)
+
+
+class owner_lock(input_lock):
+    """Serialize owner changes with authorized input, without holding SQLite during I/O."""
+    def __init__(self, scope):
+        digest = hashlib.sha256(scope.encode()).hexdigest()
+        self.path = state_dir() / ("owner-" + digest + ".lock")
+        self.timeout_error = "controller_owner_lock_timeout"
 
 
 def holding_input_lock(command):
@@ -1717,6 +1735,19 @@ def holding_input_lock(command):
             return command(args)
     locked.__doc__ = command.__doc__
     return locked
+
+
+def question_is_writable(db, question):
+    body = json.loads(question["body"])
+    current = db.execute("SELECT d.current_round, d.current_attempt, r.state FROM dispatch d "
+                         "LEFT JOIN dispatch_round r ON r.dispatch = d.id AND r.round = d.current_round "
+                         "AND r.attempt = d.current_attempt WHERE d.id = ?", (question["dispatch"],)).fetchone()
+    if current is None or current["state"] != "running":
+        return False
+    if body.get("round") is None and body.get("attempt") is None:
+        return current["current_round"] == 1 and not db.execute(
+            "SELECT 1 FROM lifecycle_event WHERE dispatch = ? LIMIT 1", (question["dispatch"],)).fetchone()
+    return (body.get("round"), body.get("attempt")) == (current["current_round"], current["current_attempt"])
 
 
 def cmd_reply(args):
@@ -1729,20 +1760,7 @@ def cmd_reply(args):
     # Claim the question before typing, so two concurrent replies cannot both type an answer.
     db.execute("BEGIN IMMEDIATE")
     require_owner(db, owner_scope(db, question["dispatch"]), owner_token(args), "reply")
-    question_body = json.loads(question["body"])
-    current = db.execute("SELECT current_round, current_attempt FROM dispatch WHERE id = ?",
-                         (question["dispatch"],)).fetchone()
-    legacy_question = question_body.get("round") is None and question_body.get("attempt") is None
-    attempt_row = db.execute("SELECT state FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
-                             (question["dispatch"], question_body.get("round"), question_body.get("attempt"))).fetchone()
-    lifecycle_seen = db.execute("SELECT 1 FROM lifecycle_event WHERE dispatch = ? LIMIT 1",
-                                (question["dispatch"],)).fetchone()
-    valid_attempt = (legacy_question and current is not None and current["current_round"] == 1 and not lifecycle_seen
-                     or not legacy_question and current is not None
-                     and question_body.get("round") == current["current_round"]
-                     and question_body.get("attempt") == current["current_attempt"]
-                     and attempt_row is not None and attempt_row["state"] == "running")
-    if not valid_attempt:
+    if not question_is_writable(db, question):
         db.execute("ROLLBACK")
         raise SystemExit(f"question {args.message} belongs to an attempt that is no longer accepted")
     if answered(db, question["id"]):
@@ -1751,20 +1769,34 @@ def cmd_reply(args):
     reply_id = post(db, question["dispatch"], "worker", "reply", {"to": question["id"], "answer": answer})
     db.execute("COMMIT")
     with input_lock(question["dispatch"]):
-        input_started = time.time()
-        dispatch_row = db.execute("SELECT * FROM dispatch WHERE id = ?", (question["dispatch"],)).fetchone()
-        outcome = backend_submit(dispatch_row, f"[router] Answer to question {question['id']}: {answer}")
-        if outcome["result"] in (DEFINITELY_NOT_SENT, "refused"):
-            db.execute("DELETE FROM message WHERE id = ?", (reply_id,))
-            state = backend_fault_state(outcome)
-            persist_input_fault(db, question["dispatch"], "reply", state, outcome.get("diagnostic"), outcome.get("category"))
-            if outcome["result"] == "refused":
-                mark_backend_reported(db, dispatch_row)
-            raise backend_failure(outcome, f"answer to question {question['id']}")
-        if outcome["result"] == UNCERTAIN:
-            persist_input_fault(db, question["dispatch"], "reply", backend_fault_state(outcome), outcome.get("diagnostic"), outcome.get("category"))
-            raise backend_failure(outcome, f"answer to question {question['id']}")  # the claim stays
-        clear_input_fault(db, question["dispatch"], input_started)
+        with owner_lock(owner_scope(db, question["dispatch"])):
+            input_started = time.time()
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                dispatch_row = db.execute("SELECT * FROM dispatch WHERE id = ?", (question["dispatch"],)).fetchone()
+                require_owner(db, dispatch_row["scope"], owner_token(args), "reply")
+                if not question_is_writable(db, question):
+                    raise SystemExit(f"question {args.message} belongs to an attempt that is no longer accepted")
+                require_no_unresolved_lifecycle(db, question["dispatch"])
+            except SystemExit:
+                # This process knows it has not crossed the backend boundary. Release
+                # only its own intent; an uncertain/applied input claim is never removed.
+                db.execute("DELETE FROM message WHERE id = ?", (reply_id,))
+                db.execute("COMMIT")
+                raise
+            db.execute("COMMIT")
+            outcome = backend_submit(dispatch_row, f"[router] Answer to question {question['id']}: {answer}")
+            if outcome["result"] in (DEFINITELY_NOT_SENT, "refused"):
+                db.execute("DELETE FROM message WHERE id = ?", (reply_id,))
+                state = backend_fault_state(outcome)
+                persist_input_fault(db, question["dispatch"], "reply", state, outcome.get("diagnostic"), outcome.get("category"))
+                if outcome["result"] == "refused":
+                    mark_backend_reported(db, dispatch_row)
+                raise backend_failure(outcome, f"answer to question {question['id']}")
+            if outcome["result"] == UNCERTAIN:
+                persist_input_fault(db, question["dispatch"], "reply", backend_fault_state(outcome), outcome.get("diagnostic"), outcome.get("category"))
+                raise backend_failure(outcome, f"answer to question {question['id']}")  # the claim stays
+            clear_input_fault(db, question["dispatch"], input_started)
     emit({"replied": question["id"], "dispatch": question["dispatch"]})
 
 
@@ -1854,27 +1886,43 @@ def cmd_nudge(args):
     if not inspection.get("alive", False):
         raise SystemExit("execution backend reports the worker is not running; use resume instead")
     text = " ".join(args.text.splitlines())  # a newline would submit half the line
-    db.execute("BEGIN IMMEDIATE")
-    require_owner(db, row["scope"], owner_token(args), "nudge")
-    if done_current_task(db, args.dispatch):
-        db.execute("ROLLBACK")
-        raise SystemExit(f"dispatch {args.dispatch} already finished its task; give the next one with `continue`")
-    message_id = post(db, args.dispatch, "worker", "nudge", {"text": text})
-    db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
-    db.execute("COMMIT")
-    outcome = backend_submit(row, f"[router] Message from the controller: {text}")
-    typed, diagnostic = backend_fault_state(outcome), outcome.get("diagnostic")
-    if outcome["result"] in (DEFINITELY_NOT_SENT, "refused"):
-        db.execute("DELETE FROM message WHERE id = ?", (message_id,))
-        persist_input_fault(db, args.dispatch, "nudge", typed, diagnostic, outcome.get("category"))
-        if outcome["result"] == "refused":
-            mark_backend_reported(db, row)
-        raise backend_failure(outcome, "the message")
-    if outcome["result"] == UNCERTAIN:
-        persist_input_fault(db, args.dispatch, "nudge", typed, diagnostic, outcome.get("category"))
-        raise backend_failure(outcome, "the message")
-    clear_input_fault(db, args.dispatch)
-    emit({"nudged": args.dispatch, "message": message_id})
+    def writable():
+        current_row, attempt = _current_attempt(db, args.dispatch)
+        require_owner(db, current_row["scope"], owner_token(args), "nudge")
+        if done_current_task(db, args.dispatch):
+            raise SystemExit(f"dispatch {args.dispatch} already finished its task; give the next one with `continue`")
+        require_no_unresolved_lifecycle(db, args.dispatch)
+        if attempt["state"] != "running":
+            raise SystemExit(f"attempt {attempt['attempt']} is not writable; reconcile and resume it first")
+        return current_row
+
+    with owner_lock(row["scope"]):
+        db.execute("BEGIN IMMEDIATE")
+        row = writable()
+        message_id = post(db, args.dispatch, "worker", "nudge", {"text": text})
+        db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
+        db.execute("COMMIT")
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            row = writable()
+        except SystemExit:
+            db.execute("DELETE FROM message WHERE id = ?", (message_id,))
+            db.execute("COMMIT")
+            raise
+        db.execute("COMMIT")
+        outcome = backend_submit(row, f"[router] Message from the controller: {text}")
+        typed, diagnostic = backend_fault_state(outcome), outcome.get("diagnostic")
+        if outcome["result"] in (DEFINITELY_NOT_SENT, "refused"):
+            db.execute("DELETE FROM message WHERE id = ?", (message_id,))
+            persist_input_fault(db, args.dispatch, "nudge", typed, diagnostic, outcome.get("category"))
+            if outcome["result"] == "refused":
+                mark_backend_reported(db, row)
+            raise backend_failure(outcome, "the message")
+        if outcome["result"] == UNCERTAIN:
+            persist_input_fault(db, args.dispatch, "nudge", typed, diagnostic, outcome.get("category"))
+            raise backend_failure(outcome, "the message")
+        clear_input_fault(db, args.dispatch)
+        emit({"nudged": args.dispatch, "message": message_id})
 
 
 def _current_attempt(db, dispatch_id):
@@ -2062,8 +2110,9 @@ def cmd_reconcile(args):
         if event is None:
             db.execute("ROLLBACK")
             raise SystemExit(f"no lifecycle audit {args.audit} for dispatch {args.dispatch}")
-        if event["owner_generation"] is not None and (
-                current_owner is None or current_owner["generation"] != event["owner_generation"]):
+        # Historical operation generation is evidence, not current authority.
+        # A scoped operation still needs a real, valid current scope owner.
+        if event["owner_generation"] is not None and current_owner is None:
             db.execute("ROLLBACK")
             raise SystemExit(json.dumps({"error": "stale_controller_owner", "operation": "reconcile",
                                          "scope": row["scope"], "generation": event["owner_generation"]},
@@ -2088,7 +2137,8 @@ def cmd_reconcile(args):
         else:
             state = "unknown"
         finish_lifecycle_event(db, event["id"], args.result,
-                               f"reconciled by {args.actor}: {args.evidence}", args.actor, args.evidence)
+                               f"reconciled by {args.actor}: {args.evidence}", args.actor, args.evidence,
+                               resolution_generation=current_owner["generation"] if current_owner else None)
         if args.result == "accepted" and event["operation"] in ("create", "handoff", "resume"):
             db.execute("DELETE FROM fault_event WHERE dispatch = ? AND operation IN ('create', 'launch') "
                        "AND category = 'unknown'", (args.dispatch,))
@@ -2560,7 +2610,8 @@ def cmd_resume(args):
     session = session_name(args.dispatch)
     override = db.execute("SELECT id FROM lifecycle_event WHERE dispatch = ? AND operation = 'resume' "
                           "AND result = 'accepted' AND to_attempt = ? AND resolution_evidence IS NOT NULL "
-                          "AND consumed_at IS NULL AND (owner_generation IS NULL OR owner_generation = ?) "
+                          "AND consumed_at IS NULL AND (COALESCE(resolution_owner_generation, owner_generation) IS NULL "
+                          "OR COALESCE(resolution_owner_generation, owner_generation) = ?) "
                           "ORDER BY id DESC LIMIT 1",
                           (args.dispatch, row["current_attempt"], owner_generation)).fetchone()
     inspection = ({"result": "accepted", "alive": False, "confirmedAbsent": True}
@@ -2624,7 +2675,8 @@ def cmd_resume(args):
                                (args.dispatch, now["current_round"], now["current_attempt"])).fetchone()
         override = db.execute("SELECT id FROM lifecycle_event WHERE dispatch = ? AND operation = 'resume' "
                               "AND result = 'accepted' AND to_attempt = ? AND resolution_evidence IS NOT NULL "
-                              "AND consumed_at IS NULL AND (owner_generation IS NULL OR owner_generation = ?) "
+                              "AND consumed_at IS NULL AND (COALESCE(resolution_owner_generation, owner_generation) IS NULL "
+                              "OR COALESCE(resolution_owner_generation, owner_generation) = ?) "
                               "ORDER BY id DESC LIMIT 1",
                               (args.dispatch, now["current_attempt"], locked_generation)).fetchone()
         locked_inspection = ({"result": "accepted", "alive": False, "confirmedAbsent": True}
@@ -3409,6 +3461,7 @@ def main(argv):
     p.add_argument("--reason", required=True, help="why external delivery was confirmed")
     p.add_argument("--evidence", required=True, help="external receipt/token or verification reference")
     p.add_argument("--body-hash", required=True, help="SHA-256 of the canonical stored message body")
+    p.add_argument("--owner-token")
     p.set_defaults(func=cmd_resolve)
     p = sub.add_parser("reply")
     p.add_argument("message", type=int)

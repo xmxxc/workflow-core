@@ -56,6 +56,8 @@ class BundledBackend:
             snapshot = runtime.read_json(handle['snapshot'])
             if any(snapshot.get(key) != handle.get(key) for key in ('generation', 'unit', 'nonce', 'attempt')):
                 return None
+            if handle.get('capabilityHash') and not runtime.capability_matches(handle, snapshot):
+                return None
             return snapshot
         except (OSError, ValueError, KeyError, TypeError):
             return None
@@ -65,7 +67,9 @@ class BundledBackend:
         if not snapshot:
             return outcome('uncertain', 'bundled runtime identity is pending; inspect launch snapshot; do not replay')
         if snapshot.get('state') in ('closed', 'exited', 'faulted') and snapshot.get('cleanup') == 'confirmed':
-            return outcome('accepted', alive=False, owned=True, confirmedAbsent=True, snapshot=snapshot)
+            if runtime.confirmed_cleanup(handle, snapshot):
+                return outcome('accepted', alive=False, owned=True, confirmedAbsent=True, snapshot=snapshot)
+            return outcome('uncertain', 'bundled cleanup receipt cannot be authenticated; explicit reconciliation required')
         if not all(snapshot.get(key) for key in ('service', 'kernel', 'endpoint')):
             return outcome('uncertain', 'bundled service identity is incomplete; do not restart or replay')
         service = snapshot['service']
@@ -73,6 +77,14 @@ class BundledBackend:
         if probe['state'] != 'alive' or probe['identity'] != service['creation']:
             return outcome('uncertain', 'bundled service ended or changed; await guardian cleanup evidence; do not replay')
         return outcome('accepted', snapshot=snapshot)
+
+    def _completed_observation(self, handle):
+        # Exactly one fresh read-only observation after a transport/preflight
+        # race. No RPC, wait, trace inference or destructive retry occurs here.
+        snapshot = self._snapshot(handle)
+        if snapshot and runtime.confirmed_cleanup(handle, snapshot):
+            return outcome('accepted', alive=False, owned=True, confirmedAbsent=True)
+        return None
 
     def _call(self, dispatch, op, **data):
         handle = self._handle(dispatch)
@@ -115,9 +127,12 @@ class BundledBackend:
         host_launch.write_private(host_spec, {'argv': argv, 'env': extra_env, 'cwd': str(cwd), 'receipt': str(receipt)})
         host_launch.write_private(receipt, {'category': 'unknown', 'diagnostic': 'bundled host startup not confirmed'})
         handle['receipt'] = str(receipt)
-        spec = {**handle, 'host_spec': str(host_spec), 'token': uuid.uuid4().hex + uuid.uuid4().hex, 'binary': binary,
+        token = uuid.uuid4().hex + uuid.uuid4().hex
+        handle['capabilityHash'] = runtime.capability_digest(token)
+        spec = {**handle, 'host_spec': str(host_spec), 'token': token, 'binary': binary,
                 'argv': [sys.executable, str(router.PROGRAM), '_host-run', str(host_spec)],
-                'env': extra_env, 'cwd': str(cwd), 'cgroup_root': root}
+                'env': extra_env, 'cwd': str(cwd), 'cgroup_root': root,
+                'diagnostics': os.environ.get('WFC_BUNDLED_DIAGNOSTICS') == '1'}
         host_launch.write_private(spec_path, spec)
         self._save(dispatch_id, handle)
         try:
@@ -178,10 +193,11 @@ class BundledBackend:
             return outcome('accepted', alive=False, owned=True, confirmedAbsent=True)
         observed = self._observe(handle)
         if observed['result'] != 'accepted' or observed.get('confirmedAbsent'):
-            return {key: value for key, value in observed.items() if key != 'snapshot'}
+            fresh = self._completed_observation(handle) if observed['result'] != 'accepted' else None
+            return fresh or {key: value for key, value in observed.items() if key != 'snapshot'}
         result = runtime.call(observed['snapshot'], op='read')
         if result['result'] != 'accepted':
-            return {**result, 'result': 'uncertain'}
+            return self._completed_observation(handle) or {**result, 'result': 'uncertain'}
         # Parent exit remains online until the runtime confirms whole-container
         # cleanup, so close cannot skip living descendants.
         return outcome('accepted', alive=True, owned=True, workerExited=result['data'].get('exit') is not None)
@@ -247,6 +263,8 @@ class BundledBackend:
             return outcome('completed')
         result = self._call(dispatch_id, 'close')
         if result['result'] != 'completed':
+            if result['result'] in ('uncertain', 'definitely-not-sent') and self._completed_observation(handle):
+                return outcome('completed', 'authenticated cleanup receipt confirms this execution is empty')
             return result
         # A close acknowledgement is issued only after containment is empty.
         return outcome('completed')

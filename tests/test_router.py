@@ -3923,5 +3923,251 @@ class MultiSignalContract(unittest.TestCase):
         self.assertEqual(view["signals"]["fault"]["category"], "permission_required")
         self.assertFalse(view["signals"]["hostActive"])
 
+
+class OwnerLifecycleFences(unittest.TestCase):
+    """Public CLI regressions for reviewed ownership/lifecycle boundaries."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+        self.scope = 's-reviewed-fences'
+        self.owner = self.env.json('owner', 'acquire', '--scope', self.scope, '--owner', 'first')
+        self.dispatch = self.env.dispatch('claude', extra_args=(
+            '--scope', self.scope, '--owner-token', self.owner['token']))
+
+    def credential(self, owner=None):
+        return {'WFC_OWNER_TOKEN': (owner or self.owner)['token'],
+                'WFC_CONTROLLER_TOKEN': (owner or self.owner)['token']}
+
+    def status(self):
+        return self.env.json('status', '--dispatch', self.dispatch)['dispatches'][0]
+
+    def takeover(self):
+        return self.env.json('owner', 'takeover', '--scope', self.scope, '--owner', 'next')
+
+    def inputs(self):
+        return [call for call in self.env.host_calls() if call[:2] in (['tmux', 'paste-buffer'], ['tmux', 'send-keys'])]
+
+    def question(self):
+        result = self.env.run('ask', 'controlled question', '--attempt', self.status()['attempt'],
+                              dispatch=self.dispatch, env=self.credential())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)['message']
+
+    def waiting_reply(self, question, change):
+        lock = os.open(self.env.state / ('input-' + self.dispatch + '.lock'), os.O_RDWR | os.O_CREAT, 0o600)
+        process = None
+        try:
+            wfc_platform.acquire_lock(lock)
+            process = subprocess.Popen([sys.executable, str(ROUTER), 'reply', str(question), 'reviewed answer'],
+                                       env=self.env.router_env(env=self.credential()),
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            deadline = time.monotonic() + 5
+            claimed = False
+            while time.monotonic() < deadline:
+                with sqlite3.connect(self.env.state / 'router.db') as db:
+                    claimed = db.execute("SELECT 1 FROM message WHERE dispatch=? AND type='reply'", (self.dispatch,)).fetchone()
+                if claimed:
+                    break
+                time.sleep(.01)
+            self.assertTrue(claimed, 'reply never committed its intent before waiting')
+            change()
+            os.close(lock)
+            lock = None
+            stdout, stderr = process.communicate(timeout=15)
+            return process.returncode, stdout, stderr
+        finally:
+            if lock is not None:
+                os.close(lock)
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.communicate()
+
+    def test_waiting_reply_rechecks_owner_and_releases_only_its_unapplied_claim(self):
+        question = self.question()
+        before = self.inputs()
+        next_owner = []
+        code, _, error = self.waiting_reply(question, lambda: next_owner.append(self.takeover()))
+        self.assertNotEqual(code, 0)
+        self.assertIn('stale_controller_owner', error)
+        self.assertEqual(self.inputs(), before)
+        self.assertFalse(any(m['type'] == 'reply' for m in self.status()['messages']))
+        sent = self.env.run('reply', str(question), 'current answer', env=self.credential(next_owner[0]))
+        self.assertEqual(sent.returncode, 0, sent.stderr)
+        self.assertEqual(len([m for m in self.status()['messages'] if m['type'] == 'reply']), 1)
+
+    def test_waiting_reply_rechecks_writable_attempt(self):
+        question = self.question()
+        before = self.inputs()
+        def fence():
+            # Model a recovered durable fence while the CLI is waiting; no backend effect.
+            with sqlite3.connect(self.env.state / 'router.db') as db:
+                db.execute("UPDATE dispatch_round SET state='unknown' WHERE dispatch=?", (self.dispatch,))
+        code, _, error = self.waiting_reply(question, fence)
+        self.assertNotEqual(code, 0)
+        self.assertIn('no longer accepted', error)
+        self.assertEqual(self.inputs(), before)
+        self.assertFalse(any(m['type'] == 'reply' for m in self.status()['messages']))
+
+    def uncertain_interrupt(self):
+        interrupted = self.env.json('interrupt', self.dispatch, env={**self.credential(), 'FAKE_FAIL': 'send-keys'})
+        self.assertEqual(interrupted['result'], 'uncertain')
+        return self.status()['audit'][-1]['id']
+
+    def test_nudge_requires_reconciliation_and_a_writable_attempt(self):
+        audit = self.uncertain_interrupt()
+        before = self.inputs()
+        refused = self.env.run('nudge', self.dispatch, '--text', 'must not arrive', env=self.credential())
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('lifecycle_reconcile_required', refused.stderr)
+        self.assertEqual(self.inputs(), before)
+        self.env.json('reconcile', self.dispatch, str(audit), '--result', 'unknown', '--actor', 'operator',
+                      '--evidence', 'interrupt not confirmed', env=self.credential())
+        still_fenced = self.env.run('nudge', self.dispatch, '--text', 'still must not arrive', env=self.credential())
+        self.assertNotEqual(still_fenced.returncode, 0)
+        self.assertIn('not writable', still_fenced.stderr)
+        self.assertEqual(self.inputs(), before)
+        self.assertFalse(any(m['type'] == 'nudge' for m in self.status()['messages']))
+        self.env.end_session(self.dispatch)
+        self.env.json('resume', self.dispatch, env=self.credential())
+        eligible = self.env.run('nudge', self.dispatch, '--text', 'eligible now', env=self.credential())
+        self.assertEqual(eligible.returncode, 0, eligible.stderr)
+
+    def test_nudge_checks_pending_audit_even_if_round_appears_running(self):
+        self.uncertain_interrupt()
+        with sqlite3.connect(self.env.state / 'router.db') as db:
+            db.execute("UPDATE dispatch_round SET state='running' WHERE dispatch=?", (self.dispatch,))
+        before = self.inputs()
+        refused = self.env.run('nudge', self.dispatch, '--text', 'must not arrive', env=self.credential())
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('lifecycle_reconcile_required', refused.stderr)
+        self.assertEqual(self.inputs(), before)
+
+    def test_resolve_fences_mutation_and_duplicate_before_audit_changes(self):
+        message = self.question()
+        with sqlite3.connect(self.env.state / 'router.db') as db:
+            # Controlled external-delivery uncertainty, as in independent public probe.
+            db.execute("UPDATE message SET state='unknown', delivered=0 WHERE id=?", (message,))
+            digest = db.execute('SELECT body_hash FROM message WHERE id=?', (message,)).fetchone()[0]
+        args = ('resolve', str(message), '--actor', 'operator', '--reason', 'verified delivery',
+                '--evidence', 'controlled external receipt', '--body-hash', digest)
+        current = self.takeover()
+        before = next(m for m in self.status()['messages'] if m['id'] == message)
+        rejected = self.env.run(*args, env=self.credential())
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn('stale_controller_owner', rejected.stderr)
+        self.assertEqual(next(m for m in self.status()['messages'] if m['id'] == message), before)
+        accepted = self.env.json(*args, '--owner-token', current['token'])
+        self.assertEqual(accepted['state'], 'received')
+        wrong_digest = list(args)
+        wrong_digest[-1] = '0' * 64
+        refused_digest = self.env.run(*wrong_digest, env=self.credential(current))
+        self.assertNotEqual(refused_digest.returncode, 0)
+        self.assertIn('conflicts', refused_digest.stderr)
+        stale_duplicate = self.env.run(*args, env=self.credential())
+        self.assertNotEqual(stale_duplicate.returncode, 0)
+        self.assertIn('stale_controller_owner', stale_duplicate.stderr)
+        duplicate = self.env.json(*args, env=self.credential(current))
+        self.assertTrue(duplicate['duplicate'])
+        self.assertEqual(duplicate['statusVersion'], accepted['statusVersion'])
+        with sqlite3.connect(self.env.state / 'router.db') as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM message_resolution WHERE message=?', (message,)).fetchone()[0], 1)
+        wrong_scope = self.env.json('owner', 'acquire', '--scope', 'another-scope', '--owner', 'unrelated')
+        refused = self.env.run(*args, env=self.credential(wrong_scope))
+        self.assertIn('stale_controller_owner', refused.stderr)
+        expired = self.env.json('owner', 'takeover', '--scope', self.scope, '--owner', 'expired', '--lease', '-1')
+        self.assertIn('stale_controller_owner', self.env.run(*args, env=self.credential(expired)).stderr)
+
+    def test_current_owner_reconciles_real_earlier_generation_audit(self):
+        audit_id = self.uncertain_interrupt()
+        with sqlite3.connect(self.env.state / 'router.db') as db:
+            generation = db.execute('SELECT owner_generation FROM lifecycle_event WHERE id=?', (audit_id,)).fetchone()[0]
+        self.assertEqual(generation, self.owner['generation'])
+        current = self.takeover()
+        args = ('reconcile', self.dispatch, str(audit_id), '--result', 'unknown', '--actor', 'new-operator',
+                '--evidence', 'controlled old interrupt outcome')
+        stale = self.env.run(*args, env=self.credential())
+        self.assertIn('stale_controller_owner', stale.stderr)
+        resolved = self.env.run(*args, env=self.credential(current))
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        self.assertEqual(json.loads(resolved.stdout)['result'], 'unknown')
+        with sqlite3.connect(self.env.state / 'router.db') as db:
+            original, resolver = db.execute('SELECT owner_generation, resolution_owner_generation FROM lifecycle_event WHERE id=?',
+                                            (audit_id,)).fetchone()
+        self.assertEqual(original, generation)
+        self.assertEqual(resolver, current['generation'])
+        self.assertTrue(self.env.json(*args, env=self.credential(current))['duplicate'])
+        self.assertIn('stale_controller_owner', self.env.run(*args, env=self.credential()).stderr)
+
+    def test_current_owner_reconciled_resume_proof_is_consumed_once(self):
+        self.env.end_session(self.dispatch)
+        fake = self.env.bin / 'tmux'
+        fake.write_text(fake.read_text() + (
+            "if sys.argv[1] == 'new-session' and os.environ.get('FAKE_KILL_PARENT'):\n"
+            "    import signal; os.kill(os.getppid(), signal.SIGKILL)\n"))
+        crashed = self.env.run('resume', self.dispatch, env={**self.credential(), 'FAKE_KILL_PARENT': '1'})
+        self.assertEqual(crashed.returncode, -signal.SIGKILL)
+        event = self.status()['audit'][-1]
+        self.assertEqual((event['operation'], event['result'], event['ownerGeneration']),
+                         ('resume', 'pending', self.owner['generation']))
+        # The operator confirms this fixture-owned previous writer is absent.
+        self.env.end_session(self.dispatch)
+        current = self.takeover()
+        self.env.json('reconcile', self.dispatch, str(event['id']), '--result', 'accepted',
+                      '--actor', 'new-operator', '--evidence', 'controlled previous writer confirmed absent',
+                      env=self.credential(current))
+        resumed = self.env.json('resume', self.dispatch, env=self.credential(current))
+        self.assertEqual(resumed['result'], 'accepted')
+        preserved = next(audit for audit in self.status()['audit'] if audit['id'] == event['id'])
+        self.assertEqual(preserved['ownerGeneration'], self.owner['generation'])
+        self.assertEqual(preserved['resolution']['ownerGeneration'], current['generation'])
+        self.assertTrue(preserved['resolution']['consumedAt'])
+        self.assertNotEqual(self.status()['attempt'], event['attempt'])
+
+
+    def test_submission_fences_its_scope_without_holding_the_global_database_writer(self):
+        question = self.question()
+        other_owner = self.env.json('owner', 'acquire', '--scope', 'unrelated-worker', '--owner', 'other')
+        other = self.env.dispatch('claude', extra_args=('--scope', 'unrelated-worker', '--owner-token', other_owner['token']))
+        ready = self.env.bin.parent / 'paste-blocked'
+        release = self.env.bin.parent / 'paste-release'
+        fake = self.env.bin / 'tmux'
+        fake.write_text(fake.read_text() + (
+            "if sys.argv[1] == 'send-keys' and '-l' in sys.argv and os.environ.get('FAKE_BLOCK_INPUT'):\n"
+            "    from pathlib import Path\n"
+            "    Path(os.environ['FAKE_BLOCK_READY']).write_text('blocked')\n"
+            "    while not Path(os.environ['FAKE_BLOCK_RELEASE']).exists(): time.sleep(.01)\n"))
+        sender = subprocess.Popen([sys.executable, str(ROUTER), 'reply', str(question), 'controlled blocked input'],
+                                  env=self.env.router_env(env={**self.credential(), 'FAKE_BLOCK_INPUT': '1',
+                                      'FAKE_BLOCK_READY': str(ready), 'FAKE_BLOCK_RELEASE': str(release)}),
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        takeover = None
+        try:
+            deadline = time.monotonic() + 5
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertTrue(ready.exists(), 'controlled paste never reached its blocking point')
+            takeover = subprocess.Popen([sys.executable, str(ROUTER), 'owner', 'takeover', '--scope', self.scope],
+                                        env=self.env.router_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            # An unrelated worker must be able to report while that input is stalled.
+            callback = self.env.run('ask', 'unrelated callback', dispatch=other,
+                                    env=self.credential(other_owner), timeout=2)
+            self.assertEqual(callback.returncode, 0, callback.stderr)
+            self.assertIsNone(takeover.poll(), 'takeover committed while an authorized input was in flight')
+            release.touch()
+            _, error = sender.communicate(timeout=15)
+            self.assertEqual(sender.returncode, 0, error)
+            output, error = takeover.communicate(timeout=15)
+            self.assertEqual(takeover.returncode, 0, error)
+            self.assertGreater(json.loads(output)['generation'], self.owner['generation'])
+        finally:
+            release.touch()
+            for process in (sender, takeover):
+                if process is not None:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate()
+
+
 if __name__ == "__main__":
     unittest.main()
