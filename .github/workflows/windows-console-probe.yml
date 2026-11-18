@@ -48,13 +48,15 @@ jobs:
           (root / 'artifacts/runner.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
           # This temporary helper is not uploaded. Only explicit logs/events/results are artifacts.
           (root / 'capture.py').write_text(r'''
-          import json, os, shutil, subprocess, sys
+          import json, os, shutil, subprocess, sys, unittest
           from pathlib import Path
           ROOT = Path(os.environ['RUNNER_TEMP']) / 'wfc35-console-probe'
           ART = ROOT / 'artifacts'
           WORKSPACE = Path(os.environ['GITHUB_WORKSPACE'])
           PROBE = WORKSPACE / 'tools/windows_console_probe.py'
           LIMIT = 1024 * 1024
+          sys.path.insert(0, str(WORKSPACE))
+          from tools.windows_console_probe import exception_fields
 
           def save_log(label, text):
               data = text.encode('utf-8', errors='replace')
@@ -92,6 +94,28 @@ jobs:
                   end.get('cleanup') == 'owned_job_empty' and end.get('watchdog_shutdown') == 'joined' and
                   'watchdog_failed' not in (end.get('watchdog_outcome') or []))
 
+          class SanitizedNativeResult(unittest.TextTestResult):
+              def __init__(self, *args, **kwargs):
+                  super().__init__(*args, **kwargs)
+                  self.sanitized_failures = []
+              def _exc_info_to_string(self, err, test):
+                  # Categorize types without formatting exceptions, args, locals or tracebacks.
+                  if issubclass(err[0], subprocess.TimeoutExpired):
+                      category, approved_type = 'timeout', 'TimeoutExpired'
+                  elif issubclass(err[0], AssertionError):
+                      category, approved_type = 'assertion', 'AssertionError'
+                  elif issubclass(err[0], OSError):
+                      category, approved_type = 'os_error', 'OSError'
+                  else:
+                      category, approved_type = 'test_error', 'Exception'
+                  fields = exception_fields(err[1])
+                  failure = dict(category=category, exception_type=approved_type,
+                      errno=fields['errno'], winerror=fields['winerror'])
+                  self.sanitized_failures.append(failure)
+                  return json.dumps(failure, sort_keys=True)
+              def addSkip(self, test, reason):
+                  super().addSkip(test, 'capability_unavailable')
+
           def run_stage(stage):
               if stage not in ('observer-selftest', 'idle', 'rpc-fixture', 'queue-fixture'):
                   raise ValueError('unsupported fixture stage')
@@ -111,6 +135,8 @@ jobs:
               result = collect(run_dir, stage, process.returncode, timed_out)
               passed = log_ok and process.returncode == 0 and clean(result, 'completed')
               result['step_exit_code'] = 0 if passed else (process.returncode or 1)
+              if stage == 'observer-selftest' and not passed:
+                  result['next_action'] = 'STOP_PROBE_EXPANSION_PRESERVE_EVIDENCE'
               (ART / stage / 'result.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
               if stage == 'observer-selftest':
                   path = ART / 'runner.json'
@@ -120,6 +146,30 @@ jobs:
               # A failed/headless calibration is a failed measurement, never a skip/pass.
               return result['step_exit_code']
           ''', encoding='utf-8')
+
+      - name: Native file-only snapshot contracts (no windows)
+        run: |
+          import io, json, os, runpy, sys, unittest
+          from pathlib import Path
+          capture = runpy.run_path(str(Path(os.environ['RUNNER_TEMP']) / 'wfc35-console-probe/capture.py'))
+          sys.path[:0] = [str(Path(os.environ['GITHUB_WORKSPACE']) / 'tests'), os.environ['GITHUB_WORKSPACE']]
+          import test_windows_console_probe as tests
+          cases = [tests.NativeProbe('test_members_reader_allows_atomic_replacement'),
+              tests.NativeProbe('test_members_reader_repeated_atomic_replacements')]
+          log = io.StringIO()
+          outcome = unittest.TextTestRunner(stream=log, verbosity=2, failfast=True,
+              resultclass=capture['SanitizedNativeResult']).run(unittest.TestSuite(cases))
+          passed = outcome.wasSuccessful() and outcome.testsRun == 2 and not outcome.skipped
+          code = 0 if passed else 1
+          log_ok = capture['save_log']('native-file-contract', log.getvalue() + '\nactual_exit_code=' + str(code) + '\n')
+          if not log_ok:
+              code = 1
+          result = dict(actual_exit_code=code, tests_run=outcome.testsRun, skipped=len(outcome.skipped),
+              sanitized_failures=outcome.sanitized_failures,
+              case_results={label: getattr(case, 'file_outcomes', []) for label, case in zip(('single', 'repeated'), cases)},
+              next_action='CALIBRATION_ALLOWED' if code == 0 else 'STOP_PROBE_EXPANSION_PRESERVE_EVIDENCE')
+          (capture['ART'] / 'native-file-contract.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
+          raise SystemExit(code)
 
       - name: Public observer calibration (six seconds)
         run: |
@@ -158,39 +208,17 @@ jobs:
                   cases[root] = (label, process)
                   return process
 
-          class SanitizedNativeResult(unittest.TextTestResult):
-              def __init__(self, *args, **kwargs):
-                  super().__init__(*args, **kwargs)
-                  self.sanitized_failures = []
-              def _exc_info_to_string(self, err, test):
-                  # Categorize types without formatting exceptions, args, locals or tracebacks.
-                  if issubclass(err[0], subprocess.TimeoutExpired):
-                      category, approved_type = 'timeout', 'TimeoutExpired'
-                  elif issubclass(err[0], AssertionError):
-                      category, approved_type = 'assertion', 'AssertionError'
-                  elif issubclass(err[0], OSError):
-                      category, approved_type = 'os_error', 'OSError'
-                  else:
-                      category, approved_type = 'test_error', 'Exception'
-                  failure = dict(category=category, exception_type=approved_type)
-                  self.sanitized_failures.append(failure)
-                  return json.dumps(failure, sort_keys=True)
-              def addSkip(self, test, reason):
-                  super().addSkip(test, 'capability_unavailable')
-
           # Capture only sanitized events before the reviewed test deletes its temporary dirs.
-          # Sharing differential first, then unchanged STOP/deadline; public calibration already ran.
+          # Existing STOP/deadline only; file contracts and public calibration already passed.
           tests.tempfile.TemporaryDirectory = CapturedTemporaryDirectory
           log = io.StringIO()
           try:
-              suite = unittest.TestSuite([
-                  RecordedNativeProbe('test_members_reader_allows_atomic_replacement'),
-                  RecordedNativeProbe('test_stop_and_deadline_kill_owned_job')])
+              suite = unittest.TestSuite([RecordedNativeProbe('test_stop_and_deadline_kill_owned_job')])
               outcome = unittest.TextTestRunner(stream=log, verbosity=2,
-                  failfast=True, resultclass=SanitizedNativeResult).run(suite)
+                  failfast=True, resultclass=capture['SanitizedNativeResult']).run(suite)
           finally:
               tests.tempfile.TemporaryDirectory = original_temp
-          passed = outcome.wasSuccessful() and outcome.testsRun == 2 and not outcome.skipped
+          passed = outcome.wasSuccessful() and outcome.testsRun == 1 and not outcome.skipped
           passed = passed and set(results) == {'native-STOP', 'native-deadline'}
           for label, reason in (('native-STOP', 'STOP'), ('native-deadline', 'deadline')):
               result = results.get(label, {})

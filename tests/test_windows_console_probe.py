@@ -1,5 +1,6 @@
 """Safety/fixture checks for the issue #35 diagnostic tool, not a console regression test."""
 import importlib.util
+from contextlib import contextmanager, ExitStack
 import json
 import os
 from pathlib import Path
@@ -171,36 +172,151 @@ class NativeProbe(unittest.TestCase):
             self.assertEqual(child.wait(timeout=10), 0, probe.read_events(root))
             self.assertTrue(probe.positive_control_seen(self.assert_clean(root)))
 
+    @contextmanager
+    def file_operation(self, operation, generation=None, reader_generation=None):
+        record = dict(operation=operation, outcome='pending')
+        if generation is not None:
+            record['generation'] = generation
+        if reader_generation is not None:
+            record['reader_generation'] = reader_generation
+        self.file_outcomes.append(record)
+        try:
+            yield record
+        except Exception as error:
+            record.update(outcome='failed', **probe.exception_fields(error))
+            raise
+        else:
+            if record['outcome'] == 'pending':
+                record['outcome'] = 'passed'
+
+    @contextmanager
+    def file_scratch(self):
+        with self.file_operation('scratch_create'):
+            temporary = tempfile.TemporaryDirectory(prefix='wfc35-sharing-')
+        try:
+            yield Path(temporary.name)
+        finally:
+            with self.file_operation('scratch_cleanup'):
+                temporary.cleanup()
+
     def test_members_reader_allows_atomic_replacement(self):
-        # Ordinary Python opens are the retained old-reader red control on Windows.
-        with tempfile.TemporaryDirectory(prefix='wfc35-sharing-') as directory:
-            root = Path(directory)
+        self.file_outcomes = []
+        with self.file_scratch() as root:
             member, temporary = root / 'members.json', root / 'members.next'
             old, new = [dict(pid=1, creation='windows:1')], [dict(pid=2, creation='windows:2')]
-            member.write_text(json.dumps(old))
-            temporary.write_text(json.dumps(new))
-            with member.open() as ordinary:
-                with self.assertRaises(PermissionError):
-                    os.replace(temporary, member)
-                self.assertEqual(json.load(ordinary), old)
-                self.assertEqual(json.loads(member.read_text()), old)
-            os.replace(temporary, member)  # closure releases the old-reader restriction
-            self.assertEqual(json.loads(member.read_text()), new)
-            member.write_text(json.dumps(old))
-            temporary.write_text(json.dumps(new))
-            with probe.open_members_snapshot(root) as retained:
-                retained_fd = retained.fileno()
-                self.assertFalse(os.get_inheritable(retained_fd))
+            with self.file_operation('snapshot_write'):
+                member.write_text(json.dumps(old))
+                temporary.write_text(json.dumps(new))
+            with ExitStack() as handles:
+                ordinary = None
+                try:
+                    with self.file_operation('ordinary_open'):
+                        ordinary = handles.enter_context(member.open())
+                    with self.file_operation('ordinary_replace') as record:
+                        with self.assertRaises(PermissionError) as denied:
+                            os.replace(temporary, member)
+                        record.update(outcome='refused', **probe.exception_fields(denied.exception))
+                    with self.file_operation('ordinary_read'):
+                        contents = ordinary.read()
+                    with self.file_operation('ordinary_content'):
+                        self.assertEqual(json.loads(contents), old)
+                    with self.file_operation('ordinary_target_read'):
+                        contents = member.read_text()
+                    with self.file_operation('ordinary_target_content'):
+                        self.assertEqual(json.loads(contents), old)
+                finally:
+                    if ordinary is not None:
+                        with self.file_operation('ordinary_close'):
+                            handles.close()
+            with self.file_operation('ordinary_closed'):
+                self.assertTrue(ordinary.closed)
+            with self.file_operation('closed_reader_replace'):
                 os.replace(temporary, member)
-                self.assertEqual(json.load(retained), old)
-                with probe.open_members_snapshot(root) as latest:
-                    latest_fd = latest.fileno()
-                    self.assertFalse(os.get_inheritable(latest_fd))
-                    self.assertEqual(json.load(latest), new)
+            with self.file_operation('closed_reader_read'):
+                contents = member.read_text()
+            with self.file_operation('closed_reader_content'):
+                self.assertEqual(json.loads(contents), new)
+            with self.file_operation('snapshot_write'):
+                member.write_text(json.dumps(old))
+                temporary.write_text(json.dumps(new))
+            with ExitStack() as handles:
+                retained = None
+                try:
+                    with self.file_operation('shared_open'):
+                        retained = handles.enter_context(probe.open_members_snapshot(root))
+                        retained_fd = retained.fileno()
+                    with self.file_operation('shared_noninherit'):
+                        self.assertFalse(os.get_inheritable(retained_fd))
+                    with self.file_operation('shared_replace'):
+                        os.replace(temporary, member)
+                    with self.file_operation('shared_read'):
+                        contents = retained.read()
+                    with self.file_operation('shared_content'):
+                        self.assertEqual(json.loads(contents), old)
+                    with ExitStack() as latest_handles:
+                        latest = None
+                        try:
+                            with self.file_operation('latest_open'):
+                                latest = latest_handles.enter_context(probe.open_members_snapshot(root))
+                                latest_fd = latest.fileno()
+                            with self.file_operation('latest_noninherit'):
+                                self.assertFalse(os.get_inheritable(latest_fd))
+                            with self.file_operation('latest_read'):
+                                contents = latest.read()
+                            with self.file_operation('latest_content'):
+                                self.assertEqual(json.loads(contents), new)
+                        finally:
+                            if latest is not None:
+                                with self.file_operation('latest_close'):
+                                    latest_handles.close()
+                    with self.file_operation('latest_closed'):
+                        with self.assertRaises(OSError):
+                            os.fstat(latest_fd)
+                finally:
+                    if retained is not None:
+                        with self.file_operation('shared_close'):
+                            handles.close()
+            with self.file_operation('shared_closed'):
                 with self.assertRaises(OSError):
-                    os.fstat(latest_fd)
-            with self.assertRaises(OSError):
-                os.fstat(retained_fd)
+                    os.fstat(retained_fd)
+
+    def test_members_reader_repeated_atomic_replacements(self):
+        self.file_outcomes = []
+        with self.file_scratch() as root:
+            member, temporary = root / 'members.json', root / 'members.next'
+            with self.file_operation('snapshot_write', 0):
+                member.write_text(json.dumps([dict(generation=0)]))
+            retained, handles = [], ExitStack()
+            try:
+                # Four snapshots, three replacements; all earlier readers remain open.
+                for generation in range(4):
+                    with self.file_operation('shared_open', generation):
+                        reader = handles.enter_context(probe.open_members_snapshot(root))
+                        retained.append((reader, reader.fileno(), generation))
+                    with self.file_operation('shared_noninherit', generation):
+                        self.assertFalse(os.get_inheritable(reader.fileno()))
+                    with self.file_operation('shared_read', generation):
+                        contents = reader.read()
+                    with self.file_operation('shared_content', generation):
+                        self.assertEqual(json.loads(contents), [dict(generation=generation)])
+                    if generation < 3:
+                        with self.file_operation('next_write', generation + 1):
+                            temporary.write_text(json.dumps([dict(generation=generation + 1)]))
+                        with self.file_operation('shared_replace', generation + 1):
+                            os.replace(temporary, member)
+                        for previous, _, previous_generation in retained:
+                            with self.file_operation('retained_read', generation + 1, previous_generation):
+                                previous.seek(0)
+                                contents = previous.read()
+                            with self.file_operation('retained_content', generation + 1, previous_generation):
+                                self.assertEqual(json.loads(contents), [dict(generation=previous_generation)])
+            finally:
+                with self.file_operation('shared_close'):
+                    handles.close()
+            for _, fd, generation in retained:
+                with self.file_operation('shared_closed', generation):
+                    with self.assertRaises(OSError):
+                        os.fstat(fd)
 
     def test_stop_and_deadline_kill_owned_job(self):
         for trigger in ('STOP', 'deadline'):
@@ -218,6 +334,259 @@ class NativeProbe(unittest.TestCase):
                     if child.poll() is None:
                         child.kill()  # supervisor only; kill-on-close must contain its job
                         child.wait(timeout=1)
+
+class FileContractWorkflowRegressions(unittest.TestCase):
+    @staticmethod
+    def workflow_step(name):
+        import textwrap
+        workflow = (ROOT / '.github/workflows/windows-console-probe.yml').read_text()
+        body = workflow.split('      - name: ' + name + '\n        run: |\n', 1)[1]
+        return textwrap.dedent(body.split('\n      - name:', 1)[0].split('\n      # Default success()', 1)[0])
+
+    def test_file_contract_records_and_closes_every_retained_reader_on_posix(self):
+        if os.name == 'nt':
+            self.skipTest('POSIX control only; not Windows sharing evidence')
+        from unittest.mock import patch
+        original_temp, original_replace = tempfile.TemporaryDirectory, os.replace
+        directories, calls = [], []
+        def temporary(*args, **kwargs):
+            result = original_temp(*args, **kwargs)
+            directories.append(Path(result.name))
+            return result
+        def replace(*args):
+            calls.append(True)
+            if len(calls) == 1:
+                error = PermissionError(13, 'R12_PRIVATE_MESSAGE', 'R12_PRIVATE_PATH')
+                error.winerror = 5
+                raise error  # simulate only the Windows ordinary-reader red control
+            return original_replace(*args)
+        single = NativeProbe('test_members_reader_allows_atomic_replacement')
+        repeated = NativeProbe('test_members_reader_repeated_atomic_replacements')
+        with patch.object(tempfile, 'TemporaryDirectory', temporary), patch.object(os, 'replace', replace):
+            single.test_members_reader_allows_atomic_replacement()
+            repeated.test_members_reader_repeated_atomic_replacements()
+        self.assertTrue(directories)
+        self.assertTrue(all(not p.exists() for p in directories))
+        self.assertEqual(len([r for r in repeated.file_outcomes if r['operation']=='shared_replace']), 3)
+        self.assertEqual(len([r for r in repeated.file_outcomes if r['operation']=='shared_closed']), 4)
+        self.assertEqual(len([r for r in repeated.file_outcomes if r['operation']=='retained_content']), 6)
+        operations = {r['operation'] for r in single.file_outcomes}
+        self.assertTrue({'ordinary_open','ordinary_read','ordinary_replace','ordinary_content',
+                         'shared_open','shared_read','shared_replace','shared_content',
+                         'latest_open','latest_read','latest_content','scratch_cleanup'} <= operations)
+        denied = next(r for r in single.file_outcomes if r['outcome']=='refused')
+        self.assertEqual((denied['category'], denied['errno'], denied['winerror']), ('PermissionError',13,5))
+        self.assertTrue(all(r['outcome'] in ('passed','refused') for r in single.file_outcomes + repeated.file_outcomes))
+        self.assertNotIn('R12_PRIVATE', json.dumps(single.file_outcomes + repeated.file_outcomes))
+
+    def run_file_step(self, mode):
+        import contextlib
+        import io
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        calls, hooks = [], []
+        class HookError(PermissionError):
+            def __getattribute__(self, name):
+                if name in ('errno','winerror','__class__'):
+                    hooks.append(name)
+                    print('R12_PRIVATE_HOOK')
+                return super().__getattribute__(name)
+            def __str__(self):
+                hooks.append('str')
+                return 'R12_PRIVATE_FORMAT'
+            __repr__ = __str__
+        class Simulated(NativeProbe):
+            __unittest_skip__ = mode == 'skip'
+            __unittest_skip_why__ = 'R12_PRIVATE_SKIP_REASON'
+            def test_members_reader_allows_atomic_replacement(self):
+                self.file_outcomes = []
+                calls.append('single')
+                with self.file_operation('shared_replace'):
+                    if mode == 'failure':
+                        error = PermissionError(13, 'R12_PRIVATE_MESSAGE', 'R12_PRIVATE_PATH')
+                        error.winerror = 5
+                        raise error
+                    if mode == 'hooks':
+                        raise HookError(13, 'R12_PRIVATE_MESSAGE')
+            def test_members_reader_repeated_atomic_replacements(self):
+                self.file_outcomes = []
+                calls.append('repeated')
+                with self.file_operation('shared_content'):
+                    pass
+        with tempfile.TemporaryDirectory(prefix='wfc35-workflow-') as directory:
+            output = io.StringIO()
+            with patch.dict(os.environ, RUNNER_TEMP=directory, GITHUB_WORKSPACE=str(ROOT), GITHUB_SHA='fixture'), \
+                    patch.dict(sys.modules, {'test_windows_console_probe':sys.modules[__name__]}), \
+                    patch.object(sys.modules[__name__], 'NativeProbe', Simulated), contextlib.redirect_stdout(output):
+                exec(compile(self.workflow_step('Prepare isolated capture and runner limits'), '<prepare>', 'exec'), {})
+                with self.assertRaises(SystemExit) as ended:
+                    exec(compile(self.workflow_step('Native file-only snapshot contracts (no windows)'), '<file-only>', 'exec'), {})
+                artifact = Path(directory) / 'wfc35-console-probe/artifacts/native-file-contract.json'
+                result = json.loads(artifact.read_text())
+                self.assertEqual(ended.exception.code, result['actual_exit_code'])
+                if mode == 'pass':
+                    import runpy
+                    capture = runpy.run_path(str(Path(directory) / 'wfc35-console-probe/capture.py'))
+                    def collect(run_dir, label, code, timed_out):
+                        (capture['ART'] / label).mkdir()
+                        return dict(actual_exit_code=code, timed_out=False, supervisor=dict(reason='probe_error',
+                            cleanup='owned_job_empty', watchdog_shutdown='joined', watchdog_outcome=[]))
+                    with patch.object(capture['run_stage'].__globals__['subprocess'], 'Popen',
+                                      return_value=SimpleNamespace(returncode=2, communicate=lambda **kw: ('',None))), \
+                            patch.dict(capture['run_stage'].__globals__, collect=collect):
+                        self.assertEqual(capture['run_stage']('observer-selftest'), 2)
+                    calibration = json.loads((capture['ART'] / 'observer-selftest/result.json').read_text())
+                    self.assertEqual(calibration['next_action'], 'STOP_PROBE_EXPANSION_PRESERVE_EVIDENCE')
+            recorded = output.getvalue() + '\n'.join(p.read_text() for p in Path(directory).rglob('*') if p.is_file())
+            self.assertNotIn('R12_PRIVATE', recorded)
+        self.assertEqual(hooks, [])
+        return result, calls
+
+    def test_workflow_pass_allows_calibration_and_calibration_failure_sets_STOP(self):
+        result, calls = self.run_file_step('pass')
+        self.assertEqual((result['actual_exit_code'], result['tests_run'], result['skipped']), (0,2,0))
+        self.assertEqual(result['next_action'], 'CALIBRATION_ALLOWED')
+        self.assertEqual(calls, ['single','repeated'])
+        workflow = (ROOT / '.github/workflows/windows-console-probe.yml').read_text()
+        names = ('Native file-only snapshot contracts (no windows)', 'Public observer calibration (six seconds)',
+                 'Native STOP and deadline with verified job cleanup', 'Idle relay fixture (six seconds)',
+                 'Owned RPC fixture (six seconds)', 'Single queue fixture (six seconds)')
+        positions = [workflow.index('      - name: ' + name) for name in names]
+        self.assertEqual(positions, sorted(positions))
+        for name in names:
+            block = workflow.split('      - name: ' + name,1)[1].split('\n      - name:',1)[0]
+            self.assertNotIn('        if:', block)  # default success gate, no bypass
+
+    def test_workflow_failure_is_failfast_and_preserves_fixed_operation_and_codes(self):
+        result, calls = self.run_file_step('failure')
+        self.assertEqual((result['actual_exit_code'], result['tests_run']), (1,1))
+        self.assertEqual(calls, ['single'])
+        record = result['case_results']['single'][0]
+        self.assertEqual((record['operation'],record['outcome'],record['category'],record['errno'],record['winerror']),
+                         ('shared_replace','failed','PermissionError',13,5))
+        self.assertEqual(result['case_results']['repeated'], [])
+        self.assertEqual(result['next_action'], 'STOP_PROBE_EXPANSION_PRESERVE_EVIDENCE')
+
+    def test_workflow_hook_exceptions_and_capability_skips_cannot_be_green(self):
+        for mode in ('hooks','skip'):
+            with self.subTest(mode=mode):
+                result, calls = self.run_file_step(mode)
+                self.assertEqual(result['actual_exit_code'], 1)
+                self.assertEqual(result['next_action'], 'STOP_PROBE_EXPANSION_PRESERVE_EVIDENCE')
+                if mode == 'skip':
+                    self.assertEqual((result['tests_run'], result['skipped'], calls), (2,2,[]))
+                else:
+                    self.assertEqual((result['tests_run'], calls), (1,['single']))
+                    record = result['case_results']['single'][0]
+                    self.assertEqual((record['category'],record['errno'],record['winerror']), ('Exception',None,None))
+
+
+class FileCloseTelemetryRegressions(unittest.TestCase):
+    def injected_workflow(self, target, close_fault=False):
+        if os.name == 'nt':
+            self.skipTest('POSIX injection control; not Windows sharing evidence')
+        import contextlib
+        import io
+        from unittest.mock import patch
+        original_open, original_temp, original_replace = Path.open, tempfile.TemporaryDirectory, os.replace
+        opened, directories, replacements = [], [], []
+        class TrackedStream:
+            def __init__(self, stream):
+                self.stream, self.fd, self.closes = stream, stream.fileno(), 0
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                self.closes += 1
+                self.stream.close()
+        def fault(winerror=5):
+            error = PermissionError(13, 'R13_PRIVATE_MESSAGE', 'R13_PRIVATE_PATH')
+            error.winerror = winerror
+            return error
+        class Injected(NativeProbe):
+            __unittest_skip__ = False
+            @contextmanager
+            def file_operation(self, operation, *args, **kwargs):
+                with super().file_operation(operation, *args, **kwargs) as record:
+                    if operation == target and not target.endswith('_close'):
+                        raise fault()
+                    yield record
+                    # Raise after the real close, so injected API failure cannot leak a test fd.
+                    if operation == target or (close_fault and operation == 'shared_close'):
+                        raise fault(32 if close_fault else 5)
+        def tracked_open(path, *args, **kwargs):
+            stream = original_open(path, *args, **kwargs)
+            if path.name == 'members.json':
+                stream = TrackedStream(stream)
+                opened.append(stream)
+            return stream
+        def tracked_temp(*args, **kwargs):
+            result = original_temp(*args, **kwargs)
+            if kwargs.get('prefix') == 'wfc35-sharing-':
+                directories.append(Path(result.name))
+            return result
+        def replace(*args):
+            replacements.append(True)
+            if len(replacements) == 1:
+                raise fault()  # Windows ordinary-reader refusal only; later POSIX replacements are real
+            return original_replace(*args)
+        output = io.StringIO()
+        with original_temp(prefix='wfc35-close-workflow-') as directory:
+            with patch.dict(os.environ, RUNNER_TEMP=directory, GITHUB_WORKSPACE=str(ROOT), GITHUB_SHA='fixture'), \
+                    patch.dict(sys.modules, {'test_windows_console_probe':sys.modules[__name__]}), \
+                    patch.object(sys.modules[__name__], 'NativeProbe', Injected), patch.object(Path, 'open', tracked_open), \
+                    patch.object(tempfile, 'TemporaryDirectory', tracked_temp), patch.object(os, 'replace', replace), \
+                    contextlib.redirect_stdout(output):
+                exec(compile(FileContractWorkflowRegressions.workflow_step('Prepare isolated capture and runner limits'), '<prepare>', 'exec'), {})
+                with self.assertRaises(SystemExit) as ended:
+                    exec(compile(FileContractWorkflowRegressions.workflow_step('Native file-only snapshot contracts (no windows)'), '<file-only>', 'exec'), {})
+            result = json.loads((Path(directory) / 'wfc35-console-probe/artifacts/native-file-contract.json').read_text())
+            self.assertEqual((ended.exception.code, result['actual_exit_code'], result['tests_run']), (1,1,1))
+            self.assertEqual(result['case_results']['repeated'], [])
+            self.assertEqual(result['next_action'], 'STOP_PROBE_EXPANSION_PRESERVE_EVIDENCE')
+            records = result['case_results']['single']
+            failure = next(r for r in records if r['operation'] == target and r['outcome'] == 'failed')
+            self.assertEqual((failure['category'],failure['errno'],failure['winerror']), ('PermissionError',13,5))
+            self.assertEqual(records[-1], dict(operation='scratch_cleanup',outcome='passed'))
+            self.assertTrue(opened)
+            self.assertTrue(all(stream.closed and stream.closes == 1 for stream in opened))
+            for stream in opened:
+                with self.assertRaises(OSError):
+                    os.fstat(stream.fd)
+            self.assertTrue(directories and all(not p.exists() for p in directories))
+            recorded = output.getvalue() + '\n'.join(p.read_text() for p in Path(directory).rglob('*') if p.is_file())
+            self.assertNotIn('R13_PRIVATE', recorded)
+        closes = [r for r in records if r['operation'] in ('ordinary_close','shared_close','latest_close')]
+        expected = ['ordinary_close'] if target.startswith('ordinary_') else ['ordinary_close','shared_close']
+        if target.startswith('latest_'):
+            expected = ['ordinary_close','latest_close','shared_close']
+        if target.endswith('_open'):
+            expected.remove(target.replace('_open','_close'))
+        self.assertEqual([r['operation'] for r in closes], expected)
+        for record in closes:
+            failed = record['operation'] == target or (close_fault and record['operation'] == 'shared_close')
+            self.assertEqual(record['outcome'], 'failed' if failed else 'passed')
+            if failed:
+                self.assertEqual((record['category'],record['errno'],record['winerror']),
+                                 ('PermissionError',13,32 if close_fault else 5))
+        if close_fault:
+            self.assertTrue(any(r['operation']=='shared_read' and r['outcome']=='failed' for r in records))
+            self.assertTrue(any(r['winerror']==32 for r in result['sanitized_failures']))
+        return result
+
+    def test_failure_unwind_records_each_entered_reader_close(self):
+        for target in ('ordinary_read','shared_replace','shared_read','latest_read','latest_content','latest_close'):
+            with self.subTest(target=target):
+                self.injected_workflow(target)
+        with self.subTest(target='shared_read_then_close_failure'):
+            self.injected_workflow('shared_read', close_fault=True)
+
+    def test_open_failure_does_not_invent_a_close(self):
+        for target in ('ordinary_open','shared_open','latest_open'):
+            with self.subTest(target=target):
+                self.injected_workflow(target)
+
 
 class MembersReaderRegressions(unittest.TestCase):
     def windows_reader(self, root, handle=0x123456789, conversion_error=False, stream_error=False):
