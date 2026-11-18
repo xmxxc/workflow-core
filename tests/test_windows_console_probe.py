@@ -171,6 +171,37 @@ class NativeProbe(unittest.TestCase):
             self.assertEqual(child.wait(timeout=10), 0, probe.read_events(root))
             self.assertTrue(probe.positive_control_seen(self.assert_clean(root)))
 
+    def test_members_reader_allows_atomic_replacement(self):
+        # Ordinary Python opens are the retained old-reader red control on Windows.
+        with tempfile.TemporaryDirectory(prefix='wfc35-sharing-') as directory:
+            root = Path(directory)
+            member, temporary = root / 'members.json', root / 'members.next'
+            old, new = [dict(pid=1, creation='windows:1')], [dict(pid=2, creation='windows:2')]
+            member.write_text(json.dumps(old))
+            temporary.write_text(json.dumps(new))
+            with member.open() as ordinary:
+                with self.assertRaises(PermissionError):
+                    os.replace(temporary, member)
+                self.assertEqual(json.load(ordinary), old)
+                self.assertEqual(json.loads(member.read_text()), old)
+            os.replace(temporary, member)  # closure releases the old-reader restriction
+            self.assertEqual(json.loads(member.read_text()), new)
+            member.write_text(json.dumps(old))
+            temporary.write_text(json.dumps(new))
+            with probe.open_members_snapshot(root) as retained:
+                retained_fd = retained.fileno()
+                self.assertFalse(os.get_inheritable(retained_fd))
+                os.replace(temporary, member)
+                self.assertEqual(json.load(retained), old)
+                with probe.open_members_snapshot(root) as latest:
+                    latest_fd = latest.fileno()
+                    self.assertFalse(os.get_inheritable(latest_fd))
+                    self.assertEqual(json.load(latest), new)
+                with self.assertRaises(OSError):
+                    os.fstat(latest_fd)
+            with self.assertRaises(OSError):
+                os.fstat(retained_fd)
+
     def test_stop_and_deadline_kill_owned_job(self):
         for trigger in ('STOP', 'deadline'):
             with self.subTest(trigger=trigger), tempfile.TemporaryDirectory(prefix='wfc35-') as directory:
@@ -187,6 +218,109 @@ class NativeProbe(unittest.TestCase):
                     if child.poll() is None:
                         child.kill()  # supervisor only; kill-on-close must contain its job
                         child.wait(timeout=1)
+
+class MembersReaderRegressions(unittest.TestCase):
+    def windows_reader(self, root, handle=0x123456789, conversion_error=False, stream_error=False):
+        """Mock only Windows ABI/CRT ownership; actual text reads use a fresh real fd."""
+        from contextlib import ExitStack
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        calls, descriptors = [], []
+        class OS:
+            name = 'nt'
+            O_BINARY, O_NOINHERIT = 0x8000, 0x80
+            def __getattr__(self, key):
+                return getattr(os, key)
+        kernel = SimpleNamespace(CreateFileW=Mock(return_value=handle), CloseHandle=Mock(return_value=True))
+        def convert(value, flags):
+            calls.append((value, flags))
+            if conversion_error:
+                raise PermissionError(13, 'conversion sentinel')
+            fd = os.open(root / 'members.json', os.O_RDONLY)
+            descriptors.append(fd)
+            return fd
+        stack = ExitStack()
+        stack.enter_context(patch.object(probe, 'os', OS()))
+        stack.enter_context(patch.object(probe.C, 'WinDLL', Mock(return_value=kernel), create=True))
+        stack.enter_context(patch.dict(sys.modules, msvcrt=SimpleNamespace(open_osfhandle=convert)))
+        if stream_error:
+            stack.enter_context(patch.object(probe, 'open', Mock(side_effect=ValueError('stream sentinel')), create=True))
+        return stack, kernel, calls, descriptors
+
+    def test_windows_binding_and_success_close_transferred_fd(self):
+        from ctypes import wintypes as W
+        with tempfile.TemporaryDirectory(prefix='wfc35-reader-') as directory:
+            root = Path(directory)
+            (root / 'members.json').write_text('[{"pid": 7}]')
+            stack, kernel, calls, descriptors = self.windows_reader(root)
+            with stack:
+                with probe.open_members_snapshot(root) as reader:
+                    self.assertEqual(json.load(reader), [dict(pid=7)])
+                    self.assertFalse(os.get_inheritable(reader.fileno()))
+                kernel.CreateFileW.assert_called_once_with(str(root / 'members.json'), 0x80000000, 7, None, 3, 0x80, None)
+                self.assertEqual(kernel.CreateFileW.argtypes, [W.LPCWSTR, W.DWORD, W.DWORD, probe.C.c_void_p, W.DWORD, W.DWORD, W.HANDLE])
+                self.assertIs(kernel.CreateFileW.restype, W.HANDLE)
+                self.assertEqual(kernel.CloseHandle.argtypes, [W.HANDLE])
+                self.assertEqual(calls, [(0x123456789, os.O_RDONLY | 0x8000 | 0x80)])
+                kernel.CloseHandle.assert_not_called()  # successful CRT conversion owns the HANDLE
+            with self.assertRaises(OSError):
+                os.fstat(descriptors[0])
+
+    def test_conversion_failure_closes_native_handle_once(self):
+        with tempfile.TemporaryDirectory(prefix='wfc35-reader-') as directory:
+            stack, kernel, calls, descriptors = self.windows_reader(Path(directory), conversion_error=True)
+            with stack, self.assertRaises(PermissionError):
+                with probe.open_members_snapshot(Path(directory)):
+                    self.fail('conversion unexpectedly succeeded')
+            kernel.CloseHandle.assert_called_once_with(0x123456789)
+            self.assertEqual(descriptors, [])
+
+    def test_invalid_native_handle_is_not_converted_or_closed(self):
+        from unittest.mock import Mock, patch
+        with tempfile.TemporaryDirectory(prefix='wfc35-reader-') as directory:
+            stack, kernel, calls, descriptors = self.windows_reader(Path(directory), handle=probe.C.c_void_p(-1).value)
+            with stack, patch.object(probe.C, 'get_last_error', lambda: 5, create=True), \
+                    patch.object(probe.C, 'WinError', Mock(return_value=PermissionError(13, 'native-open sentinel')), create=True) as error, \
+                    self.assertRaises(PermissionError):
+                with probe.open_members_snapshot(Path(directory)):
+                    self.fail('invalid native handle accepted')
+            error.assert_called_once_with(5)
+            kernel.CloseHandle.assert_not_called()
+            self.assertEqual((calls, descriptors), ([], []))
+
+    def test_stream_and_read_failures_close_transferred_fd(self):
+        from unittest.mock import patch
+        for failure in ('stream', 'read', 'parse'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory(prefix='wfc35-reader-') as directory:
+                root = Path(directory)
+                (root / 'members.json').write_text('invalid JSON')
+                stack, kernel, calls, descriptors = self.windows_reader(root, stream_error=failure == 'stream')
+                with stack, self.assertRaises((ValueError, OSError)):
+                    with probe.open_members_snapshot(root) as reader:
+                        if failure == 'read':
+                            with patch.object(reader, 'read', side_effect=PermissionError(13, 'read sentinel')):
+                                json.load(reader)
+                        else:
+                            json.load(reader)
+                kernel.CloseHandle.assert_not_called()
+                with self.assertRaises(OSError):
+                    os.fstat(descriptors[0])
+
+    def test_posix_reader_retains_default_text_and_error_behavior(self):
+        if os.name == 'nt':
+            self.skipTest('POSIX branch only')
+        with tempfile.TemporaryDirectory(prefix='wfc35-reader-') as directory:
+            root = Path(directory)
+            member = root / 'members.json'
+            member.write_text('[\n{"pid": 9}\n]')
+            with probe.open_members_snapshot(root) as reader:
+                self.assertEqual(reader.read(), member.read_text())
+            self.assertTrue(reader.closed)
+            member.unlink()
+            with self.assertRaises(FileNotFoundError):
+                with probe.open_members_snapshot(root):
+                    self.fail('missing snapshot unexpectedly opened')
+
 
 class ReviewRegressions(unittest.TestCase):
     """Deterministic versions of independent review S1/S2/S3; no native API calls."""

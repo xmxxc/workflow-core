@@ -509,6 +509,39 @@ def observer_pin(native, job, process, retained, cache):
     return 'alive', pin, {}
 
 
+@contextmanager
+def open_members_snapshot(root):
+    """Read only this probe's snapshot without blocking its atomic Windows replacement."""
+    path = root / 'members.json'
+    if os.name != 'nt':
+        with path.open() as stream:
+            yield stream
+        return
+    import msvcrt
+    from ctypes import wintypes as W
+    kernel = C.WinDLL('kernel32', use_last_error=True)
+    kernel.CreateFileW.argtypes = [W.LPCWSTR, W.DWORD, W.DWORD, C.c_void_p, W.DWORD, W.DWORD, W.HANDLE]
+    kernel.CreateFileW.restype = W.HANDLE
+    kernel.CloseHandle.argtypes, kernel.CloseHandle.restype = [W.HANDLE], W.BOOL
+    # GENERIC_READ, SHARE_READ|WRITE|DELETE, noninherited, OPEN_EXISTING, normal file.
+    handle = kernel.CreateFileW(str(path), 0x80000000, 7, None, 3, 0x80, None)
+    if handle == C.c_void_p(-1).value:
+        raise C.WinError(C.get_last_error())
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY | os.O_NOINHERIT)
+    except BaseException:
+        if not kernel.CloseHandle(handle):
+            raise C.WinError(C.get_last_error())
+        raise
+    # Conversion transfers HANDLE ownership to fd. The text wrapper borrows fd;
+    # this finally closes fd/HANDLE exactly once, even on wrapper creation/read failure.
+    try:
+        with open(fd, 'r', closefd=False) as stream:
+            yield stream
+    finally:
+        os.close(fd)
+
+
 def observe(root, stage):
     native, seen = Native(), set()
     def record(samples):
@@ -530,7 +563,8 @@ def observe(root, stage):
         cache = {}
         while not stop_reason(root / 'STOP', deadline):
             try:
-                candidates = json.loads((root / 'members.json').read_text())
+                with open_members_snapshot(root) as snapshot:
+                    candidates = json.loads(snapshot.read())
             except (OSError, ValueError):
                 time.sleep(.02)
                 continue

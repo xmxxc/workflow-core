@@ -179,16 +179,18 @@ jobs:
                   super().addSkip(test, 'capability_unavailable')
 
           # Capture only sanitized events before the reviewed test deletes its temporary dirs.
-          # Execute the existing STOP/deadline method only; public calibration already ran.
+          # Sharing differential first, then unchanged STOP/deadline; public calibration already ran.
           tests.tempfile.TemporaryDirectory = CapturedTemporaryDirectory
           log = io.StringIO()
           try:
-              suite = unittest.TestSuite([RecordedNativeProbe('test_stop_and_deadline_kill_owned_job')])
+              suite = unittest.TestSuite([
+                  RecordedNativeProbe('test_members_reader_allows_atomic_replacement'),
+                  RecordedNativeProbe('test_stop_and_deadline_kill_owned_job')])
               outcome = unittest.TextTestRunner(stream=log, verbosity=2,
                   failfast=True, resultclass=SanitizedNativeResult).run(suite)
           finally:
               tests.tempfile.TemporaryDirectory = original_temp
-          passed = outcome.wasSuccessful() and outcome.testsRun == 1 and not outcome.skipped
+          passed = outcome.wasSuccessful() and outcome.testsRun == 2 and not outcome.skipped
           passed = passed and set(results) == {'native-STOP', 'native-deadline'}
           for label, reason in (('native-STOP', 'STOP'), ('native-deadline', 'deadline')):
               result = results.get(label, {})
