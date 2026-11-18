@@ -1295,9 +1295,10 @@ for _host, _text, _ in INPUT_BOX_PLACEHOLDERS:
     _PLACEHOLDERS.setdefault(_host, set()).add("".join(_text.split()))
 
 
-def codex_input_box(screen):
+def codex_input_box(screen, *, require_complete=False):
     """What Codex's input box holds (an InputBox): EMPTY_BOX when it shows a known placeholder, None
-    when the screen shows no box we can tell apart.
+    when the screen shows no box we can tell apart. With require_complete, either scroll marker
+    in the recognized box also gives None, before markers are removed from the visible text.
     Codex 0.167.0 draws the box as the last paragraph that starts with `›` at the left edge, its
     further lines indented by two spaces, then (usually after a blank line) a footer of one or two
     indented lines joined by ` · ` (model, cwd; shortcuts). A tall box scrolls and shows ↑ or ↓ at
@@ -1318,6 +1319,8 @@ def codex_input_box(screen):
             below.insert(0, box.pop())
     footer = [line for line in below if line]
     if not 1 <= len(footer) <= 2 or not all(line.startswith("  ") and " · " in line for line in footer):
+        return None
+    if require_complete and any(_BOX_SCROLL.search(line) for line in box):
         return None
     box[0] = box[0][1:]
     text = " ".join(_BOX_SCROLL.sub("", line).strip() for line in box)
