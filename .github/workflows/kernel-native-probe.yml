@@ -1,0 +1,38 @@
+name: Extracted kernel native Windows probe
+on:
+  push:
+    branches: [experiment/bundled-kernel-rc4]
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: herdrdev/herdr
+          ref: ee5bfb5041bb3e4a49d591c72308aae3c81ecdde
+          path: upstream
+          persist-credentials: false
+      - uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943
+        with:
+          version: 0.16.0
+      - name: Build pinned standalone kernel
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.96.1 --profile minimal
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python experiments/herdr-kernel-prototype/prepare.py --source upstream --scratch prepared
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo +1.96.1 build --manifest-path prepared/Cargo.toml --release --locked
+      - name: Test copied executable from a separate directory
+        shell: pwsh
+        run: |
+          $trial = New-Item -ItemType Directory "$env:RUNNER_TEMP/Extracted Kernel"
+          Copy-Item prepared/target/release/herdr-kernel-prototype.exe "$trial/wfc-pty.exe"
+          python experiments/herdr-kernel-prototype/native_probe.py "$trial/wfc-pty.exe"
