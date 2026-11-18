@@ -339,54 +339,166 @@ time.sleep(60)
             self.assertEqual(herdr_backend.helper(payload)['result'],'accepted')
         self.assertEqual(self.cli('close',dispatch)['result'],'completed')
 
-    def test_initial_prefill_and_concurrent_nudge_do_not_mix(self):
-        gate = self.root / 'draw-composer'
-        self.host.write_text(r'''import os,subprocess,sys,textwrap,time
+    def prefill_release(self, sync, name, value):
+        temporary = sync / (name + '.tmp')
+        temporary.write_text(json.dumps(value), encoding='utf-8')
+        os.replace(temporary, sync / name)
+
+    def prefill_marker(self, sync, name, clients, timeout=15):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            path = sync / name
+            if path.exists():
+                return json.loads(path.read_text(encoding='utf-8'))
+            if any(child.poll() not in (None, 0) for child in clients):
+                break
+            time.sleep(.01)
+        self.fail('prefill synchronization failed: ' + json.dumps({
+            'waiting_for': name, 'markers': sorted(p.name for p in sync.iterdir()),
+            'clients': [{'pid': p.pid, 'exit': p.poll()} for p in clients]}))
+
+    def stop_prefill_clients(self, sync, clients):
+        self.prefill_release(sync, 'abort', {})
+        errors = []
+        evidence = []
+        for child in reversed(clients):
+            try:
+                try:
+                    out, err = child.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    # Windows clients joined the existing owned Job before their run gate.
+                    if getattr(self, 'server_job', None) is not None:
+                        try:
+                            self.stop_server()
+                        except Exception as error:
+                            errors.append({'pid': child.pid, 'job_error': repr(error)})
+                    if child.poll() is None:
+                        child.kill()
+                    out, err = child.communicate(timeout=10)
+                    errors.append({'pid': child.pid, 'error': 'forced CLI cleanup required'})
+                evidence.append({'pid': child.pid, 'exit': child.returncode,
+                                 'stdout': out[-1000:], 'stderr': err[-1000:]})
+            except Exception as error:
+                errors.append({'pid': child.pid, 'error': repr(error)})
+            finally:
+                for stream in (child.stdout, child.stderr):
+                    stream.close()
+        print('[herdr-prefill-clients] ' + json.dumps(evidence), file=sys.stderr)
+        self.assertFalse(errors, 'prefill client cleanup failed: ' + json.dumps(errors))
+
+    def prefill_fixture(self):
+        sync = self.root / ('prefill-' + uuid.uuid4().hex)
+        sync.mkdir()
+        clients = []
+        self.addCleanup(self.stop_prefill_clients, sync, clients)
+        (self.root / 'prefill_control.py').write_text(r"""import json,os,time
 from pathlib import Path
-deadline=time.monotonic()+8
-while not Path(GATE).exists() and time.monotonic()<deadline:time.sleep(.01)
-if not Path(GATE).exists():raise TimeoutError('composer gate was not released')
+root=Path(os.environ['WFC_PREFILL_SYNC'])
+def mark(name,value):
+    temporary=root/(name+'.tmp')
+    temporary.write_text(json.dumps(value),encoding='utf-8')
+    os.replace(temporary,root/name)
+def wait_for(name,timeout):
+    deadline=time.monotonic()+timeout
+    while time.monotonic()<deadline:
+        if (root/'abort').exists():raise RuntimeError('controlled prefill aborted: '+name)
+        if (root/name).exists():return json.loads((root/name).read_text(encoding='utf-8'))
+        time.sleep(.01)
+    raise TimeoutError('controlled prefill gate expired: '+name)
+""", encoding='utf-8')
+        cli = self.root / 'prefill_cli.py'
+        cli.write_text(r"""import os,sys,zipfile
+from pathlib import Path
+program=Path(sys.argv[1]).resolve();role=sys.argv[2]
+sys.path.insert(0,str(program) if zipfile.is_zipfile(program) else str(program.parent))
+import wfc,router,wfc_platform
+from prefill_control import mark,wait_for
+mark(role+'-ready',{'pid':os.getpid(),'program':str(program),'router':router.__file__})
+argv=wait_for('run-'+role,30)['argv']
+OriginalInputLock=router.input_lock
+class ObservedInputLock(OriginalInputLock):
+    def __enter__(self):
+        target=(router.state_dir()/('input-'+argv[1]+'.lock')) if role=='nudge' else None
+        if not self.path.name.startswith('input-d-') or (target is not None and self.path!=target):
+            return super().__enter__()
+        original=wfc_platform.acquire_lock
+        def observed(fd,timeout=30):
+            identity={'path':str(self.path),'device':os.fstat(fd).st_dev,'inode':os.fstat(fd).st_ino}
+            try:original(fd,timeout=.01)
+            except TimeoutError:mark('nudge-blocked',identity)
+            else:raise AssertionError('nudge did not contend with dispatch input lock')
+            return original(fd,timeout=timeout)
+        if role=='nudge':wfc_platform.acquire_lock=observed
+        try:result=super().__enter__()
+        finally:wfc_platform.acquire_lock=original
+        mark(role+'-acquired',{'path':str(self.path),'device':os.fstat(self.fd).st_dev,'inode':os.fstat(self.fd).st_ino})
+        return result
+router.input_lock=ObservedInputLock
+sys.exit(wfc.main(argv))
+""", encoding='utf-8')
+        self.host.write_text(r"""import os,subprocess,sys,textwrap
+from prefill_control import mark,wait_for
 text=sys.argv[sys.argv.index('--prompt')+1]
+attempt=text.split('--attempt ')[1].split()[0]
+mark('host-waiting',{'dispatch':os.environ['WFC_DISPATCH'],'attempt':attempt,'pid':os.getpid()})
+wait_for('draw-composer',8)
 for line in textwrap.wrap(text,64):print('┃  '+line,flush=True)
 print('┃\n┃  Build · controlled OpenCode\n╹'+'▀'*70,flush=True)
-line=sys.stdin.readline()
-if line.strip():raise RuntimeError('nudge mixed into initial prompt')
-subprocess.run([sys.executable,PROGRAM,'ask','INITIAL_PROMPT_SUBMITTED',
-                '--attempt',text.split('--attempt ')[1].split()[0]],check=True)
-time.sleep(60)
-'''.replace('PROGRAM',repr(str(PROGRAM))).replace('GATE',repr(str(gate))),encoding='utf-8')
-        self.launch.write_text(json.dumps({'hosts':{'opencode':{'command':[str(self.host)],
-                                      'runtime':[sys.executable,'-u']}}}),encoding='utf-8')
-        child = subprocess.Popen([sys.executable,str(PROGRAM),'dispatch','--backend','herdr',
-                                  '--herdr-endpoint',self.endpoint,'--host','opencode','--task',str(self.task),
-                                  '--cwd',str(self.root),'--report',str(self.report),'--launch-config',str(self.launch)],
-                                 env=self.env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding='utf-8')
-        nudge = None
-        try:
-            deadline = time.monotonic()+5
-            while time.monotonic()<deadline:
-                rows = self.cli('status')['dispatches']
-                if rows and rows[0].get('backendHandle',{}).get('state')=='active':break
-                time.sleep(.02)
-            self.assertTrue(rows)
-            self.assertEqual(rows[0].get('backendHandle',{}).get('state'),'active')
-            dispatch = rows[0]['dispatch']
-            nudge = subprocess.Popen([sys.executable,str(PROGRAM),'nudge',dispatch,'--text','concurrent input'],
-                                     env=self.env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding='utf-8')
-            time.sleep(.4)
-            gate.touch()
-            out,err=child.communicate(timeout=15)
-            self.assertEqual(child.returncode,0,err)
-            _,err=nudge.communicate(timeout=15)
-            self.assertEqual(nudge.returncode,0,err)
-            messages=self.cli('wait','--timeout','1')['messages']
-            self.assertTrue(any(m.get('question')=='INITIAL_PROMPT_SUBMITTED' for m in messages),messages)
-            self.assertEqual(self.cli('close',dispatch)['result'],'completed')
-        finally:
-            for process in (child,nudge):
-                if process is not None and process.poll() is None:
-                    process.kill()
-                    process.communicate()
+lines=[sys.stdin.readline().rstrip('\r\n')]
+mark('host-inputs',{'lines':lines})
+if lines[0]:raise RuntimeError('nudge mixed into initial prompt')
+subprocess.run([sys.executable,PROGRAM,'ask','INITIAL_PROMPT_SUBMITTED','--attempt',attempt],check=True)
+for line in sys.stdin:
+    lines.append(line.rstrip('\r\n'))
+    mark('host-inputs',{'lines':lines})
+    mark('nudge-applied',{})
+""".replace('PROGRAM', repr(str(PROGRAM))), encoding='utf-8')
+        self.launch.write_text(json.dumps({'hosts': {'opencode': {'command': [str(self.host)],
+            'runtime': [sys.executable, '-u'], 'env': {'WFC_PREFILL_SYNC': str(sync)}}}}), encoding='utf-8')
+        return sync, clients, cli
+
+    def prefill_client(self, sync, clients, cli, role):
+        child = subprocess.Popen([sys.executable, str(cli), str(PROGRAM), role],
+                                 env={**self.env, 'WFC_PREFILL_SYNC': str(sync)},
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
+        clients.append(child)  # Cleanup is already registered, including on assignment/startup failure.
+        if getattr(self, 'server_job', None) is not None:
+            self.server_job.attach(child.pid)
+        return child
+
+    def test_initial_prefill_and_concurrent_nudge_do_not_mix(self):
+        sync, clients, cli = self.prefill_fixture()
+        nudge = self.prefill_client(sync, clients, cli, 'nudge')
+        self.prefill_marker(sync, 'nudge-ready', clients)
+        child = self.prefill_client(sync, clients, cli, 'dispatch')
+        self.prefill_marker(sync, 'dispatch-ready', clients)
+        self.prefill_release(sync, 'run-dispatch', {'argv': ['dispatch', '--backend', 'herdr',
+            '--herdr-endpoint', self.endpoint, '--host', 'opencode', '--task', str(self.task),
+            '--cwd', str(self.root), '--report', str(self.report), '--launch-config', str(self.launch)]})
+        waiting = self.prefill_marker(sync, 'host-waiting', clients)
+        dispatch = waiting['dispatch']
+        held = self.prefill_marker(sync, 'dispatch-acquired', clients)
+        self.prefill_release(sync, 'run-nudge', {'argv': ['nudge', dispatch, '--text', 'concurrent input']})
+        blocked = self.prefill_marker(sync, 'nudge-blocked', clients)
+        self.assertEqual(blocked, held)
+        self.assertIsNone(child.poll())
+        self.assertIsNone(nudge.poll())
+        self.assertFalse((sync / 'nudge-acquired').exists())
+        self.prefill_release(sync, 'draw-composer', {})
+        out, err = child.communicate(timeout=15)
+        self.assertEqual(child.returncode, 0, err)
+        self.assertEqual(json.loads(out)['dispatch'], dispatch)
+        _, err = nudge.communicate(timeout=15)
+        self.assertEqual(nudge.returncode, 0, err)
+        self.prefill_marker(sync, 'nudge-applied', clients)
+        view = self.cli('status', '--dispatch', dispatch)['dispatches'][0]
+        self.assertEqual(view['backendHandle']['state'], 'active')
+        self.assertEqual(view['attempt'], waiting['attempt'])
+        messages = self.cli('wait', '--timeout', '1')['messages']
+        self.assertEqual(sum(m.get('question') == 'INITIAL_PROMPT_SUBMITTED' for m in messages), 1, messages)
+        self.assertEqual(self.cli('close', dispatch)['result'], 'completed')
+        applied = self.prefill_marker(sync, 'host-inputs', clients)
+        self.assertEqual(applied['lines'], ['', '[router] Message from the controller: concurrent input'])
 
     def test_create_read_and_close_use_owned_persistent_unit(self):
         dispatch = self.dispatch()

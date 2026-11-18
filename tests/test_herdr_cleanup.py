@@ -16,6 +16,130 @@ from unittest.mock import Mock, patch
 import test_herdr
 
 
+class PrefillSynchronization(unittest.TestCase):
+    def fixture(self):
+        tmp = tempfile.TemporaryDirectory(prefix='controlled prefill ')
+        self.addCleanup(tmp.cleanup)
+        case = test_herdr.HerdrContract('test_initial_prefill_and_concurrent_nudge_do_not_mix')
+        case.root = Path(tmp.name)
+        case.host = case.root / 'host.py'
+        case.launch = case.root / 'launch.json'
+        case.task = case.root / 'task.md'
+        case.report = case.root / 'report.md'
+        case.endpoint = 'controlled-not-a-service'
+        case.env = {**os.environ, 'WFC_STATE': str(case.root / 'state')}
+        case.server_job = None
+        self.addCleanup(case.doCleanups)
+        return case
+
+    def test_failed_startup_still_reaps_an_already_exited_cli(self):
+        case = self.fixture()
+        child = Mock()
+        child.pid = 123
+        child.returncode = 0
+        child.poll.return_value = 0
+        child.communicate.return_value = ('', '')
+        case.cli = Mock(side_effect=RuntimeError('controlled startup failure'))
+        case.prefill_marker = Mock(side_effect=RuntimeError('controlled startup failure'))
+        with patch.object(test_herdr.subprocess, 'Popen', return_value=child):
+            with self.assertRaisesRegex(RuntimeError, 'controlled startup failure'):
+                case.test_initial_prefill_and_concurrent_nudge_do_not_mix()
+            self.assertTrue(case.doCleanups())
+        child.communicate.assert_called()
+        child.stdout.close.assert_called()
+        child.stderr.close.assert_called()
+
+    def test_staged_clients_observe_real_lock_contention_before_release(self):
+        case = self.fixture()
+        sync, clients, cli = case.prefill_fixture()
+        program = case.root / 'controlled_program'
+        program.mkdir()
+        controlled = program / 'wfc.py'
+        controlled.write_text('''import json,router
+from prefill_control import mark,wait_for
+class owner_lock(router.input_lock):
+    def __init__(self,scope):self.path=router.state_dir()/('owner-'+scope+'.lock')
+def main(argv):
+    router.state_dir().mkdir(parents=True,exist_ok=True)
+    with router.input_lock('d-controlled'):
+        if argv[0]=='dispatch':
+            mark('host-waiting',{'dispatch':'d-controlled'})
+            wait_for('draw-composer',8)
+        else:
+            with owner_lock('controlled'):mark('controlled-nudge-applied',{})
+    print(json.dumps({'operation':argv[0]}))
+    return 0
+''', encoding='utf-8')
+        case.env['PYTHONPATH'] = str(test_herdr.ROOT)
+        with patch.object(test_herdr, 'PROGRAM', controlled):
+            nudge = case.prefill_client(sync, clients, cli, 'nudge')
+            case.prefill_marker(sync, 'nudge-ready', clients)
+            dispatch = case.prefill_client(sync, clients, cli, 'dispatch')
+            case.prefill_marker(sync, 'dispatch-ready', clients)
+            case.prefill_release(sync, 'run-dispatch', {'argv': ['dispatch']})
+            case.prefill_marker(sync, 'host-waiting', clients)
+            held = case.prefill_marker(sync, 'dispatch-acquired', clients)
+            case.prefill_release(sync, 'run-nudge', {'argv': ['nudge', 'd-controlled']})
+            self.assertEqual(case.prefill_marker(sync, 'nudge-blocked', clients), held)
+            self.assertIsNone(dispatch.poll())
+            self.assertIsNone(nudge.poll())
+            self.assertFalse((sync / 'nudge-acquired').exists())
+            case.prefill_release(sync, 'draw-composer', {})
+            for child in (dispatch, nudge):
+                out, err = child.communicate(timeout=5)
+                self.assertEqual(child.returncode, 0, err)
+                self.assertIn(json.loads(out)['operation'], ('dispatch', 'nudge'))
+            case.prefill_marker(sync, 'controlled-nudge-applied', clients)
+
+    def test_aborted_gates_reap_both_staged_clients_and_close_pipes(self):
+        case = self.fixture()
+        sync, clients, cli = case.prefill_fixture()
+        for role in ('nudge', 'dispatch'):
+            case.prefill_client(sync, clients, cli, role)
+            case.prefill_marker(sync, role + '-ready', clients)
+        self.assertTrue(case.doCleanups())
+        for child in clients:
+            self.assertEqual(child.returncode, 1)
+            self.assertTrue(child.stdout.closed)
+            self.assertTrue(child.stderr.closed)
+
+    def test_failed_job_cleanup_still_reaps_cli_and_surfaces_both_errors(self):
+        case = self.fixture()
+        sync = case.root / 'failed-cleanup'
+        sync.mkdir()
+        child = Mock(pid=123, returncode=1)
+        child.poll.return_value = None
+        child.communicate.side_effect = [subprocess.TimeoutExpired('controlled', 10), ('', '')]
+        case.server_job = Mock()
+        case.stop_server = Mock(side_effect=AssertionError('Job did not empty'))
+        with self.assertRaisesRegex(AssertionError, 'Job did not empty'):
+            case.stop_prefill_clients(sync, [child])
+        child.kill.assert_called_once_with()
+        self.assertEqual(child.communicate.call_count, 2)
+        child.stdout.close.assert_called_once_with()
+        child.stderr.close.assert_called_once_with()
+
+    def test_controlled_host_records_blank_prefill_and_one_separate_nudge(self):
+        case = self.fixture()
+        callback = case.root / 'controlled_callback.py'
+        callback.write_text('raise SystemExit(0)\n', encoding='utf-8')
+        with patch.object(test_herdr, 'PROGRAM', callback):
+            sync, clients, _ = case.prefill_fixture()
+        child = subprocess.Popen([sys.executable, '-u', str(case.host), '--prompt', 'controlled --attempt a-test'],
+                                 env={**case.env, 'WFC_PREFILL_SYNC': str(sync), 'WFC_DISPATCH': 'd-test'},
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 text=True, encoding='utf-8')
+        clients.append(child)
+        waiting = case.prefill_marker(sync, 'host-waiting', clients)
+        self.assertEqual(waiting['attempt'], 'a-test')
+        case.prefill_release(sync, 'draw-composer', {})
+        line = '[router] Message from the controller: concurrent input'
+        out, err = child.communicate(input='\n' + line + '\n', timeout=5)
+        self.assertEqual(child.returncode, 0, err)
+        self.assertIn('Build · controlled OpenCode\n', out)
+        self.assertEqual(case.prefill_marker(sync, 'host-inputs', clients)['lines'], ['', line])
+
+
 class OwnedWindowsDescendant:
     """Retain a read-only handle to one creation identity across Job cleanup."""
     def __init__(self, identity):
