@@ -8,25 +8,40 @@ import sys
 import tempfile
 import time
 
-MARKER = '复验路径-中文-42'
+MARKER = '复验路径-中文-42' + (' xyz-123456789' * 130) + ' ATTEMPT-TAIL'
 HERE = Path(__file__).resolve()
 
 
 def child(mode, destination):
     api = ctypes.windll.kernel32
-    before = api.GetConsoleCP()
-    if mode == 'fd-utf8':
-        assert api.SetConsoleCP(65001)
+    import ctypes.wintypes as wt
+    api.GetStdHandle.restype = wt.HANDLE
+    handle = wt.HANDLE(api.GetStdHandle(-10))
+    flags = wt.DWORD()
+    assert api.GetConsoleMode(handle, ctypes.byref(flags))
+    if mode == 'raw-wide':
+        assert api.SetConsoleMode(handle, (flags.value & ~7) | 0x200)
+        sys.stdout.write('\x1b[?2004h')
+        sys.stdout.flush()
     destination.with_suffix('.ready').touch()
-    if mode == 'wide':
-        line = sys.stdin.readline().strip()
-        raw = None
+    if mode == 'raw-wide':
+        chunks = []
+        while True:
+            chars = ctypes.create_unicode_buffer(1024)
+            count = wt.DWORD()
+            assert api.ReadConsoleW(handle, chars, len(chars), ctypes.byref(count), None)
+            text = chars[:count.value]
+            chunks.append(text)
+            if '\r' in text or '\n' in text:
+                break
+        line = ''.join(chunks)
     else:
-        data = os.read(0, 4096)
-        raw = data.hex()
-        line = data.decode('utf-8', errors='replace').strip()
-    destination.write_text(json.dumps(dict(mode=mode, before=before, after=api.GetConsoleCP(),
-                                           chars=line, raw=raw)), encoding='utf-8')
+        line = sys.stdin.readline()
+    normalized = line.rstrip('\r\n').removeprefix('\x1b[200~').removesuffix('\x1b[201~')
+    row = dict(mode=mode, expected=len(MARKER), received=len(normalized),
+               exact=normalized == MARKER, raw_length=len(line),
+               head=repr(line[:24]), tail=repr(line[-55:]))
+    destination.write_text(json.dumps(row), encoding='utf-8')
 
 
 def wait(path):
@@ -53,7 +68,8 @@ def exercise(binary, mode, destination):
                           argv=[sys.executable, '-u', str(HERE), '--child', mode, str(destination)])
             scope['nonce'] = launch['nonce']
             wait(destination.with_suffix('.ready'))
-            call('input', text=MARKER + '\r')
+            call('input', text='\x1b[200~' + MARKER + '\x1b[201~' if mode != 'plain' else MARKER)
+            call('input', text='\r')
             wait(destination)
             assert call('close')['closed']
             svc.stdin.close()
@@ -69,11 +85,10 @@ if __name__ == '__main__':
     else:
         with tempfile.TemporaryDirectory() as tmp:
             rows = []
-            for mode in ['fd', 'wide', 'fd-utf8']:
+            for mode in ['plain', 'cooked-bracket', 'raw-wide']:
                 dest = Path(tmp) / (mode + '.json')
                 exercise(Path(sys.argv[1]).resolve(), mode, dest)
                 row = json.loads(dest.read_text())
-                row['exact'] = row['chars'] == MARKER
                 rows.append(row)
             Path('native-text-result.json').write_text(json.dumps(rows, indent=2))
             print(json.dumps(rows))
