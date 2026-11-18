@@ -4169,5 +4169,139 @@ class OwnerLifecycleFences(unittest.TestCase):
                     process.communicate()
 
 
+    def test_continue_serializes_takeover_through_preliminary_read_and_task_input(self):
+        self.env.report.write_text('controlled completed round')
+        self.env.json('done', '--report', str(self.env.report), '--attempt', self.status()['attempt'],
+                      dispatch=self.dispatch, env=self.credential())
+        task = self.env.task.with_name('controlled-next.md')
+        task.write_text('controlled next task')
+        report = self.env.report.with_name('controlled-next.md')
+        ready, release = (self.env.bin.parent / name for name in ('capture-ready', 'capture-release'))
+        observed = self.env.bin.parent / 'input-generations.jsonl'
+        fake = self.env.bin / 'tmux'
+        fake.write_text(fake.read_text() + (
+            "if sys.argv[1] == 'capture-pane' and os.environ.get('FAKE_BLOCK_CAPTURE'):\n"
+            "    from pathlib import Path\n"
+            "    Path(os.environ['FAKE_CAPTURE_READY']).touch()\n"
+            "    while not Path(os.environ['FAKE_CAPTURE_RELEASE']).exists(): time.sleep(.01)\n"
+            "if sys.argv[1] == 'send-keys' and '-l' in sys.argv and os.environ.get('FAKE_INPUT_GENERATIONS'):\n"
+            "    import sqlite3\n"
+            "    with sqlite3.connect(os.path.join(os.environ['WFC_STATE'], 'router.db')) as db:\n"
+            "        generation = db.execute('SELECT generation FROM controller_owner WHERE scope=?', (os.environ['FAKE_OWNER_SCOPE'],)).fetchone()[0]\n"
+            "    open(os.environ['FAKE_INPUT_GENERATIONS'], 'a').write(json.dumps(generation) + '\\n')\n"))
+        sender = subprocess.Popen([sys.executable, str(ROUTER), 'continue', self.dispatch, '--task', str(task),
+                                   '--report', str(report)], env=self.env.router_env(env={**self.credential(),
+                                       'FAKE_BLOCK_CAPTURE': '1', 'FAKE_CAPTURE_READY': str(ready),
+                                       'FAKE_CAPTURE_RELEASE': str(release), 'FAKE_INPUT_GENERATIONS': str(observed),
+                                       'FAKE_OWNER_SCOPE': self.scope}),
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        takeover = None
+        try:
+            deadline = time.monotonic() + 5
+            while not ready.exists() and time.monotonic() < deadline: time.sleep(.01)
+            self.assertTrue(ready.exists(), 'continue never reached preliminary terminal read')
+            self.assertFalse(observed.exists(), 'task input preceded the controlled read')
+            takeover = subprocess.Popen([sys.executable, str(ROUTER), 'owner', 'takeover', '--scope', self.scope],
+                                        env=self.env.router_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            committed_while_blocked = False
+            try:
+                takeover.communicate(timeout=.5)
+                committed_while_blocked = True
+            except subprocess.TimeoutExpired:
+                pass
+            # No SQLite writer may be retained while the terminal read is stalled.
+            other = self.env.dispatch('claude', extra_args=('--scope', 'unrelated-continue-scope'))
+            callback = self.env.run('ask', 'unrelated callback', dispatch=other, timeout=2)
+            self.assertEqual(callback.returncode, 0, callback.stderr)
+            release.touch()
+            _, error = sender.communicate(timeout=15)
+            self.assertEqual(sender.returncode, 0, error)
+            output, error = takeover.communicate(timeout=15)
+            self.assertEqual(takeover.returncode, 0, error)
+            self.assertFalse(committed_while_blocked, 'takeover committed before old-owner task submission finished')
+            self.assertEqual([json.loads(line) for line in observed.read_text().splitlines()], [self.owner['generation']])
+            self.assertGreater(json.loads(output)['generation'], self.owner['generation'])
+            self.assertEqual(self.status()['round'], 2)
+        finally:
+            release.touch()
+            for process in (sender, takeover):
+                if process is not None:
+                    if process.poll() is None: process.kill()
+                    process.communicate()
+
+
+    def test_waiting_continue_revalidates_owner_before_claiming_a_round(self):
+        self.env.report.write_text('controlled completed round')
+        self.env.json('done', '--report', str(self.env.report), '--attempt', self.status()['attempt'],
+                      dispatch=self.dispatch, env=self.credential())
+        task, report = self.env.task.with_name('next.md'), self.env.report.with_name('next.md')
+        task.write_text('controlled next task')
+        before = self.inputs()
+        lock = os.open(self.env.state / ('input-' + self.dispatch + '.lock'), os.O_RDWR | os.O_CREAT, 0o600)
+        sender = None
+        try:
+            wfc_platform.acquire_lock(lock)
+            sender = subprocess.Popen([sys.executable, str(ROUTER), 'continue', self.dispatch, '--task', str(task),
+                                       '--report', str(report)], env=self.env.router_env(env=self.credential()),
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.takeover()
+            os.close(lock)
+            lock = None
+            _, error = sender.communicate(timeout=15)
+            self.assertNotEqual(sender.returncode, 0)
+            self.assertIn('stale_controller_owner', error)
+            self.assertEqual(self.inputs(), before)
+            current = self.status()
+            self.assertEqual(current['round'], 1)
+            self.assertEqual(current['report'], str(self.env.report))
+            self.assertFalse(any(m['type'] == 'continue' for m in current['messages']))
+        finally:
+            if lock is not None: os.close(lock)
+            if sender is not None:
+                if sender.poll() is None: sender.kill()
+                sender.communicate()
+
+    def check_reply_lock_timeout(self, kind):
+        import hashlib
+        question = self.question()
+        other = self.env.json('ask', 'different controlled question', '--attempt', self.status()['attempt'],
+                              dispatch=self.dispatch, env=self.credential())['message']
+        self.env.json('reply', str(other), 'previous applied answer', env=self.credential())
+        [other_claim] = [m for m in self.status()['messages'] if m['type'] == 'reply']
+        before = self.inputs()
+        name = ('input-' + self.dispatch if kind == 'input' else
+                'owner-' + hashlib.sha256(self.scope.encode()).hexdigest()) + '.lock'
+        lock = os.open(self.env.state / name, os.O_RDWR | os.O_CREAT, 0o600)
+        process = None
+        try:
+            wfc_platform.acquire_lock(lock)
+            process = subprocess.Popen([sys.executable, str(ROUTER), 'reply', str(question), 'known unsent answer'],
+                                       env=self.env.router_env(env=self.credential()),
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            # Exercise the real platform lock's 30-second deadline through the public CLI.
+            _, error = process.communicate(timeout=36)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn('input_lock_timeout' if kind == 'input' else 'controller_owner_lock_timeout', error)
+            self.assertEqual(self.inputs(), before)
+            claims = [m for m in self.status()['messages'] if m['type'] == 'reply']
+            self.assertEqual(claims, [other_claim], 'only the timed-out invocation may release its own unsent claim')
+        finally:
+            os.close(lock)
+            if process is not None:
+                if process.poll() is None: process.kill()
+                process.communicate()
+        retry = self.env.run('reply', str(question), 'retry after timeout', env=self.credential())
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        claims = [m for m in self.status()['messages'] if m['type'] == 'reply']
+        self.assertEqual(len(claims), 2)
+        self.assertEqual(next(m for m in claims if m['id'] == other_claim['id']), other_claim)
+
+    def test_input_lock_timeout_releases_only_this_known_unsent_reply_claim(self):
+        self.check_reply_lock_timeout('input')
+
+    def test_scope_lock_timeout_releases_only_this_known_unsent_reply_claim(self):
+        self.check_reply_lock_timeout('owner')
+
+
 if __name__ == "__main__":
     unittest.main()

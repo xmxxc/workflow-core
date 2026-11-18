@@ -101,3 +101,5 @@ while True:
                 print('DONE ' + json.dumps(done), flush=True)
         elif 'Message from the controller' in text:
             print('NUDGE_RECEIVED', flush=True)
+        elif '[router] New task for you' in text and MODE == 'record-only':
+            Path(str(EVIDENCE) + '.continued').write_text(text, encoding='utf-8')

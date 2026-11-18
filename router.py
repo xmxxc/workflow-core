@@ -1767,36 +1767,42 @@ def cmd_reply(args):
         db.execute("ROLLBACK")
         raise SystemExit(f"question {question['id']} was already answered")
     reply_id = post(db, question["dispatch"], "worker", "reply", {"to": question["id"], "answer": answer})
+    claim_uid = db.execute("SELECT message_uid FROM message WHERE id = ?", (reply_id,)).fetchone()[0]
     db.execute("COMMIT")
-    with input_lock(question["dispatch"]):
-        with owner_lock(owner_scope(db, question["dispatch"])):
-            input_started = time.time()
-            db.execute("BEGIN IMMEDIATE")
-            try:
+    submission_started = False
+    try:
+        with input_lock(question["dispatch"]):
+            with owner_lock(owner_scope(db, question["dispatch"])):
+                input_started = time.time()
+                db.execute("BEGIN IMMEDIATE")
                 dispatch_row = db.execute("SELECT * FROM dispatch WHERE id = ?", (question["dispatch"],)).fetchone()
                 require_owner(db, dispatch_row["scope"], owner_token(args), "reply")
                 if not question_is_writable(db, question):
                     raise SystemExit(f"question {args.message} belongs to an attempt that is no longer accepted")
                 require_no_unresolved_lifecycle(db, question["dispatch"])
-            except SystemExit:
-                # This process knows it has not crossed the backend boundary. Release
-                # only its own intent; an uncertain/applied input claim is never removed.
-                db.execute("DELETE FROM message WHERE id = ?", (reply_id,))
                 db.execute("COMMIT")
-                raise
-            db.execute("COMMIT")
-            outcome = backend_submit(dispatch_row, f"[router] Answer to question {question['id']}: {answer}")
-            if outcome["result"] in (DEFINITELY_NOT_SENT, "refused"):
-                db.execute("DELETE FROM message WHERE id = ?", (reply_id,))
-                state = backend_fault_state(outcome)
-                persist_input_fault(db, question["dispatch"], "reply", state, outcome.get("diagnostic"), outcome.get("category"))
-                if outcome["result"] == "refused":
-                    mark_backend_reported(db, dispatch_row)
-                raise backend_failure(outcome, f"answer to question {question['id']}")
-            if outcome["result"] == UNCERTAIN:
-                persist_input_fault(db, question["dispatch"], "reply", backend_fault_state(outcome), outcome.get("diagnostic"), outcome.get("category"))
-                raise backend_failure(outcome, f"answer to question {question['id']}")  # the claim stays
-            clear_input_fault(db, question["dispatch"], input_started)
+                submission_started = True
+                outcome = backend_submit(dispatch_row, f"[router] Answer to question {question['id']}: {answer}")
+                if outcome["result"] in (DEFINITELY_NOT_SENT, "refused"):
+                    db.execute("DELETE FROM message WHERE id = ?", (reply_id,))
+                    state = backend_fault_state(outcome)
+                    persist_input_fault(db, question["dispatch"], "reply", state, outcome.get("diagnostic"), outcome.get("category"))
+                    if outcome["result"] == "refused":
+                        mark_backend_reported(db, dispatch_row)
+                    raise backend_failure(outcome, f"answer to question {question['id']}")
+                if outcome["result"] == UNCERTAIN:
+                    persist_input_fault(db, question["dispatch"], "reply", backend_fault_state(outcome), outcome.get("diagnostic"), outcome.get("category"))
+                    raise backend_failure(outcome, f"answer to question {question['id']}")  # the claim stays
+                clear_input_fault(db, question["dispatch"], input_started)
+    except BaseException:
+        if not submission_started:
+            # Lock acquisition and validation cannot have reached the backend.
+            # Keep any other invocation's claim, including an applied/uncertain one.
+            if db.in_transaction:
+                db.execute("ROLLBACK")
+            db.execute("DELETE FROM message WHERE id = ? AND message_uid = ? AND dispatch = ? AND type = 'reply'",
+                       (reply_id, claim_uid, question["dispatch"]))
+        raise
     emit({"replied": question["id"], "dispatch": question["dispatch"]})
 
 
@@ -1819,57 +1825,59 @@ def cmd_continue(args):
         raise SystemExit(inspection.get("diagnostic") or f"backend inspect returned {inspection['result']}")
     if not inspection.get("alive", False):
         raise SystemExit("execution backend reports the worker is not running; resume it instead")
-    # Claim the next round under the write lock, re-checking that the current one is done, so two
-    # concurrent `continue`s cannot both type a task. Recording first also keeps the new task's
-    # `done` above its `continue`.
-    db.execute("BEGIN IMMEDIATE")
-    require_owner(db, row["scope"], owner_token(args), "continue")
-    require_no_unresolved_lifecycle(db, args.dispatch)
-    if watched(db, args.dispatch) or not done_current_task(db, args.dispatch):
-        db.execute("ROLLBACK")
-        raise SystemExit(f"dispatch {args.dispatch} has not done its current task yet")
-    refuse_used_report(db, args.dispatch, report)
-    # What this claim replaces, read under the same lock: a failed send restores exactly this.
-    previous = db.execute("SELECT task, report, current_round, current_attempt FROM dispatch WHERE id = ?", (args.dispatch,)).fetchone()
-    identity = db.execute("SELECT scope, role, current_round FROM dispatch WHERE id = ?", (args.dispatch,)).fetchone()
-    next_round, attempt = identity["current_round"] + 1, "a-" + uuid.uuid4().hex[:12]
-    message_id = post(db, args.dispatch, "worker", "continue", {"task": str(task), "report": str(report),
-        "scope": identity["scope"], "role": identity["role"], "round": next_round, "attempt": attempt})
-    db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, created) VALUES (?, ?, ?, ?, ?, ?)",
-               (args.dispatch, next_round, attempt, str(task), str(report), time.time()))
-    db.execute("UPDATE dispatch SET task = ?, report = ?, current_round = ?, current_attempt = ? WHERE id = ?",
-               (str(task), str(report), next_round, attempt, args.dispatch))
-    db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
-    db.execute("COMMIT")
-    brief = worker_brief(args.dispatch, task, report, opening="[router] New task for you", attempt=attempt)
-    outcome = backend_submit(row, brief)
-    typed, diagnostic = backend_fault_state(outcome), outcome.get("diagnostic")
-    if outcome["result"] in (DEFINITELY_NOT_SENT, "refused"):
-        why = str(backend_failure(outcome, "the next task"))
-        # Undo the claim only while it is still the latest round event and its task is still the
-        # current one: a `resume` may have taken the new round over in between.
+    with owner_lock(row["scope"]):
+        # Claim the next round under the write lock, re-checking that the current one is done, so two
+        # concurrent `continue`s cannot both type a task. Recording first also keeps the new task's
+        # `done` above its `continue`.
         db.execute("BEGIN IMMEDIATE")
-        if outcome["result"] == "refused":
-            mark_backend_reported(db, row)
-        current = db.execute("SELECT task, report FROM dispatch WHERE id = ?", (args.dispatch,)).fetchone()
-        if round_mark(db, args.dispatch) == message_id and (current["task"], current["report"]) == (str(task), str(report)):
-            db.execute("DELETE FROM message WHERE id = ?", (message_id,))
-            db.execute("DELETE FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
-                       (args.dispatch, next_round, attempt))
-            db.execute("UPDATE dispatch SET task = ?, report = ?, current_round = ?, current_attempt = ? WHERE id = ?",
-                       (previous["task"], previous["report"], previous["current_round"], previous["current_attempt"], args.dispatch))
+        row = db.execute("SELECT * FROM dispatch WHERE id = ?", (args.dispatch,)).fetchone()
+        require_owner(db, row["scope"], owner_token(args), "continue")
+        require_no_unresolved_lifecycle(db, args.dispatch)
+        if watched(db, args.dispatch) or not done_current_task(db, args.dispatch):
+            db.execute("ROLLBACK")
+            raise SystemExit(f"dispatch {args.dispatch} has not done its current task yet")
+        refuse_used_report(db, args.dispatch, report)
+        # What this claim replaces, read under the same lock: a failed send restores exactly this.
+        previous = db.execute("SELECT task, report, current_round, current_attempt FROM dispatch WHERE id = ?", (args.dispatch,)).fetchone()
+        identity = db.execute("SELECT scope, role, current_round FROM dispatch WHERE id = ?", (args.dispatch,)).fetchone()
+        next_round, attempt = identity["current_round"] + 1, "a-" + uuid.uuid4().hex[:12]
+        message_id = post(db, args.dispatch, "worker", "continue", {"task": str(task), "report": str(report),
+            "scope": identity["scope"], "role": identity["role"], "round": next_round, "attempt": attempt})
+        db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, created) VALUES (?, ?, ?, ?, ?, ?)",
+                   (args.dispatch, next_round, attempt, str(task), str(report), time.time()))
+        db.execute("UPDATE dispatch SET task = ?, report = ?, current_round = ?, current_attempt = ? WHERE id = ?",
+                   (str(task), str(report), next_round, attempt, args.dispatch))
+        db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
+        db.execute("COMMIT")
+        brief = worker_brief(args.dispatch, task, report, opening="[router] New task for you", attempt=attempt)
+        outcome = backend_submit(row, brief)
+        typed, diagnostic = backend_fault_state(outcome), outcome.get("diagnostic")
+        if outcome["result"] in (DEFINITELY_NOT_SENT, "refused"):
+            why = str(backend_failure(outcome, "the next task"))
+            # Undo the claim only while it is still the latest round event and its task is still the
+            # current one: a `resume` may have taken the new round over in between.
+            db.execute("BEGIN IMMEDIATE")
+            if outcome["result"] == "refused":
+                mark_backend_reported(db, row)
+            current = db.execute("SELECT task, report FROM dispatch WHERE id = ?", (args.dispatch,)).fetchone()
+            if round_mark(db, args.dispatch) == message_id and (current["task"], current["report"]) == (str(task), str(report)):
+                db.execute("DELETE FROM message WHERE id = ?", (message_id,))
+                db.execute("DELETE FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
+                           (args.dispatch, next_round, attempt))
+                db.execute("UPDATE dispatch SET task = ?, report = ?, current_round = ?, current_attempt = ? WHERE id = ?",
+                           (previous["task"], previous["report"], previous["current_round"], previous["current_attempt"], args.dispatch))
+                db.execute("COMMIT")
+                persist_input_fault(db, args.dispatch, "continue", typed, diagnostic, outcome.get("category"))
+                raise SystemExit(why)
             db.execute("COMMIT")
             persist_input_fault(db, args.dispatch, "continue", typed, diagnostic, outcome.get("category"))
-            raise SystemExit(why)
-        db.execute("COMMIT")
-        persist_input_fault(db, args.dispatch, "continue", typed, diagnostic, outcome.get("category"))
-        raise SystemExit(f"{why}. But dispatch {args.dispatch} moved on meanwhile (a resume took the round over); "
-                         f"its current state is kept")
-    if outcome["result"] == UNCERTAIN:
-        persist_input_fault(db, args.dispatch, "continue", typed, diagnostic, outcome.get("category"))
-        raise backend_failure(outcome, "the next task")
-    clear_input_fault(db, args.dispatch)
-    emit({"continued": args.dispatch, "message": message_id})
+            raise SystemExit(f"{why}. But dispatch {args.dispatch} moved on meanwhile (a resume took the round over); "
+                             f"its current state is kept")
+        if outcome["result"] == UNCERTAIN:
+            persist_input_fault(db, args.dispatch, "continue", typed, diagnostic, outcome.get("category"))
+            raise backend_failure(outcome, "the next task")
+        clear_input_fault(db, args.dispatch)
+        emit({"continued": args.dispatch, "message": message_id})
 
 
 @holding_input_lock

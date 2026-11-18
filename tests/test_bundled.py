@@ -187,6 +187,38 @@ class BundledNative(unittest.TestCase):
         self.assertEqual(self.cli('close', dispatch)['result'], 'completed')
         self.assertFalse(self.status(dispatch)['backendAlive'])
 
+    def test_continue_reuses_owned_execution_and_accepts_new_round_reply(self):
+        value = self.dispatch('record-only')
+        dispatch = value['dispatch']
+        handle = self.handle(dispatch)
+        question = self.question()
+        self.cli('reply', str(question['id']), 'finish initial round')
+        applied = Path(str(self.evidence) + '.applied')
+        self.until(lambda: applied.exists())
+        self.env['WFC_DISPATCH'] = dispatch
+        self.report.write_text('controlled completed round', encoding='utf-8')
+        self.cli('done', '--report', str(self.report), '--attempt', value['attempt'])
+        task, report = self.root / 'next task.md', self.root / 'next report.md'
+        task.write_text('controlled next round', encoding='utf-8')
+        continued = self.cli('continue', dispatch, '--task', str(task), '--report', str(report))
+        self.assertEqual(continued['continued'], dispatch)
+        marker = Path(str(self.evidence) + '.continued')
+        self.until(lambda: marker.exists())
+        status = self.status(dispatch)
+        self.assertEqual(status['round'], 2)
+        self.assertNotEqual(status['attempt'], value['attempt'])
+        self.assertIn(str(task), marker.read_text(encoding='utf-8'))
+        self.assertIn(status['attempt'], marker.read_text(encoding='utf-8'))
+        second = self.handle(dispatch)
+        self.assertEqual((second['generation'], second['service'], second['kernel']),
+                         (handle['generation'], handle['service'], handle['kernel']))
+        question = self.cli('ask', 'controlled next-round question', '--attempt', status['attempt'])
+        self.cli('reply', str(question['message']), 'new round answer')
+        self.until(lambda: applied.read_text() == 'once\nonce\n')
+        replies = [m for m in self.status(dispatch)['messages'] if m['type'] == 'reply']
+        self.assertEqual(len(replies), 2)
+        self.assertEqual(self.cli('close', dispatch)['result'], 'completed')
+
     def test_wrong_nonce_and_generation_cannot_input_or_close(self):
         import bundled_runtime
         value = self.dispatch()
