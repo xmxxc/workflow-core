@@ -1,0 +1,235 @@
+name: Windows console probe (isolated runner)
+
+on:
+  pull_request:
+    branches: [release/v0.4.6]
+    paths:
+      - .github/workflows/windows-console-probe.yml
+      - tools/windows_console_probe.py
+      - tests/test_windows_console_probe.py
+      - docs/verification/windows-console-35.md
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    if: github.head_ref == 'codex/windows-console-35' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: windows-latest
+    timeout-minutes: 3
+    env:
+      PYTHONUTF8: "1"
+    defaults:
+      run:
+        # Python preserves native return codes without a PowerShell/Tee pipeline.
+        shell: python
+        working-directory: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: "3.12"
+
+      - name: Prepare isolated capture and runner limits
+        run: |
+          import hashlib, json, os, platform
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'wfc35-console-probe'
+          root.mkdir(exist_ok=False)
+          (root / 'artifacts').mkdir()
+          workspace = Path(os.environ['GITHUB_WORKSPACE'])
+          metadata = dict(os=platform.system(), release=platform.release(), version=platform.version(),
+              python=platform.python_version(), checkout_sha=os.environ['GITHUB_SHA'],
+              probe_sha256=hashlib.sha256((workspace / 'tools/windows_console_probe.py').read_bytes()).hexdigest(),
+              observer_capability='not_verified', user_desktop_verified=False,
+              windows_11_desktop_verified=False, root_cause='UNPROVEN')
+          (root / 'artifacts/runner.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
+          # This temporary helper is not uploaded. Only explicit logs/events/results are artifacts.
+          (root / 'capture.py').write_text(r'''
+          import json, os, shutil, subprocess, sys
+          from pathlib import Path
+          ROOT = Path(os.environ['RUNNER_TEMP']) / 'wfc35-console-probe'
+          ART = ROOT / 'artifacts'
+          WORKSPACE = Path(os.environ['GITHUB_WORKSPACE'])
+          PROBE = WORKSPACE / 'tools/windows_console_probe.py'
+          LIMIT = 1024 * 1024
+
+          def save_log(label, text):
+              data = text.encode('utf-8', errors='replace')
+              (ART / (label + '.log')).write_bytes(data[:LIMIT])
+              print(text[:LIMIT], flush=True)
+              return len(data) <= LIMIT
+
+          def collect(run_dir, label, exit_code, timed_out=False):
+              target = ART / label
+              target.mkdir(exist_ok=False)
+              ends = []
+              files = sorted(run_dir.glob('events-*.jsonl'))
+              if len(files) > 128:
+                  raise RuntimeError('event file count exceeds capture limit')
+              for path in files:
+                  if path.is_symlink() or path.stat().st_size > LIMIT:
+                      raise RuntimeError('event file exceeds capture policy')
+                  shutil.copyfile(path, target / path.name)
+                  for line in path.read_text(encoding='utf-8').splitlines():
+                      try:
+                          event = json.loads(line)
+                      except ValueError:
+                          continue  # interrupted final records cannot prove cleanup
+                      if event.get('event') == 'supervisor_end':
+                          ends.append({key: event.get(key) for key in
+                              ('reason', 'cleanup', 'observer_returncode', 'watchdog_shutdown', 'watchdog_outcome')})
+              end = ends[0] if len(ends) == 1 else {}
+              result = dict(actual_exit_code=exit_code, timed_out=timed_out, supervisor=end)
+              (target / 'result.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
+              return result
+
+          def clean(result, reason):
+              end = result['supervisor']
+              return (not result['timed_out'] and end.get('reason') == reason and
+                  end.get('cleanup') == 'owned_job_empty' and end.get('watchdog_shutdown') == 'joined' and
+                  'watchdog_failed' not in (end.get('watchdog_outcome') or []))
+
+          def run_stage(stage):
+              if stage not in ('observer-selftest', 'idle', 'rpc-fixture', 'queue-fixture'):
+                  raise ValueError('unsupported fixture stage')
+              run_dir = ROOT / ('run-' + stage)  # probe creates each fresh directory
+              process = subprocess.Popen([sys.executable, str(PROBE), '--stage', stage,
+                  '--seconds', '6', '--run-dir', str(run_dir)], cwd=WORKSPACE,
+                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace')
+              timed_out = False
+              try:
+                  output, _ = process.communicate(timeout=12)
+              except subprocess.TimeoutExpired:
+                  timed_out = True
+                  process.kill()  # retained supervisor handle; its outer job kills on close
+                  output, _ = process.communicate(timeout=2)
+              log_ok = save_log(stage, output + '\nactual_exit_code=' + str(process.returncode) +
+                  ' timed_out=' + str(timed_out) + '\n')
+              result = collect(run_dir, stage, process.returncode, timed_out)
+              passed = log_ok and process.returncode == 0 and clean(result, 'completed')
+              result['step_exit_code'] = 0 if passed else (process.returncode or 1)
+              (ART / stage / 'result.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
+              if stage == 'observer-selftest':
+                  path = ART / 'runner.json'
+                  metadata = json.loads(path.read_text(encoding='utf-8'))
+                  metadata['observer_capability'] = 'positive_control_window_flag_matched' if passed else 'not_verified'
+                  path.write_text(json.dumps(metadata, indent=2), encoding='utf-8')
+              # A failed/headless calibration is a failed measurement, never a skip/pass.
+              return result['step_exit_code']
+          ''', encoding='utf-8')
+
+      - name: Public observer calibration (six seconds)
+        run: |
+          import os, runpy
+          from pathlib import Path
+          capture = runpy.run_path(str(Path(os.environ['RUNNER_TEMP']) / 'wfc35-console-probe/capture.py'))
+          raise SystemExit(capture['run_stage']('observer-selftest'))
+
+      - name: Native STOP and deadline with verified job cleanup
+        run: |
+          import io, json, os, runpy, subprocess, sys, tempfile, unittest
+          from pathlib import Path
+          capture = runpy.run_path(str(Path(os.environ['RUNNER_TEMP']) / 'wfc35-console-probe/capture.py'))
+          sys.path[:0] = [str(Path(os.environ['GITHUB_WORKSPACE']) / 'tests'), os.environ['GITHUB_WORKSPACE']]
+          import test_windows_console_probe as tests
+          cases, results = {}, {}
+          original_temp = tempfile.TemporaryDirectory
+          unit_root = capture['ROOT'] / 'unit-temp'
+          unit_root.mkdir()
+
+          class CapturedTemporaryDirectory(original_temp):
+              def __init__(self, *args, **kwargs):
+                  super().__init__(*args, dir=unit_root, **kwargs)
+              def cleanup(self):
+                  try:
+                      for run_dir, (label, process) in cases.items():
+                          if run_dir.parent == Path(self.name) and label not in results:
+                              results[label] = capture['collect'](run_dir, label, process.returncode)
+                  finally:
+                      super().cleanup()
+
+          class RecordedNativeProbe(tests.NativeProbe):
+              def invoke(self, root, *extra):
+                  process = super().invoke(root, *extra)
+                  label = 'native-deadline' if extra == ('--seconds', '1') else 'native-STOP'
+                  cases[root] = (label, process)
+                  return process
+
+          class SanitizedNativeResult(unittest.TextTestResult):
+              def __init__(self, *args, **kwargs):
+                  super().__init__(*args, **kwargs)
+                  self.sanitized_failures = []
+              def _exc_info_to_string(self, err, test):
+                  # Categorize types without formatting exceptions, args, locals or tracebacks.
+                  if issubclass(err[0], subprocess.TimeoutExpired):
+                      category, approved_type = 'timeout', 'TimeoutExpired'
+                  elif issubclass(err[0], AssertionError):
+                      category, approved_type = 'assertion', 'AssertionError'
+                  elif issubclass(err[0], OSError):
+                      category, approved_type = 'os_error', 'OSError'
+                  else:
+                      category, approved_type = 'test_error', 'Exception'
+                  failure = dict(category=category, exception_type=approved_type)
+                  self.sanitized_failures.append(failure)
+                  return json.dumps(failure, sort_keys=True)
+              def addSkip(self, test, reason):
+                  super().addSkip(test, 'capability_unavailable')
+
+          # Capture only sanitized events before the reviewed test deletes its temporary dirs.
+          # Execute the existing STOP/deadline method only; public calibration already ran.
+          tests.tempfile.TemporaryDirectory = CapturedTemporaryDirectory
+          log = io.StringIO()
+          try:
+              suite = unittest.TestSuite([RecordedNativeProbe('test_stop_and_deadline_kill_owned_job')])
+              outcome = unittest.TextTestRunner(stream=log, verbosity=2,
+                  failfast=True, resultclass=SanitizedNativeResult).run(suite)
+          finally:
+              tests.tempfile.TemporaryDirectory = original_temp
+          passed = outcome.wasSuccessful() and outcome.testsRun == 1 and not outcome.skipped
+          passed = passed and set(results) == {'native-STOP', 'native-deadline'}
+          for label, reason in (('native-STOP', 'STOP'), ('native-deadline', 'deadline')):
+              result = results.get(label, {})
+              passed = passed and result.get('actual_exit_code') == 2 and capture['clean'](result, reason)
+          code = 0 if passed else 1
+          log_ok = capture['save_log']('native-stop-deadline', log.getvalue() + '\nactual_exit_code=' + str(code) + '\n')
+          if not log_ok:
+              code = 1
+          (capture['ART'] / 'native-stop-deadline.json').write_text(json.dumps(dict(
+              actual_exit_code=code, tests_run=outcome.testsRun, skipped=len(outcome.skipped),
+              sanitized_failures=outcome.sanitized_failures,
+              case_results=results), indent=2), encoding='utf-8')
+          raise SystemExit(code)
+
+      # Default success() gating prevents each subsequent phase after any earlier failure.
+      - name: Idle relay fixture (six seconds)
+        run: |
+          import os, runpy
+          from pathlib import Path
+          capture = runpy.run_path(str(Path(os.environ['RUNNER_TEMP']) / 'wfc35-console-probe/capture.py'))
+          raise SystemExit(capture['run_stage']('idle'))
+      - name: Owned RPC fixture (six seconds)
+        run: |
+          import os, runpy
+          from pathlib import Path
+          capture = runpy.run_path(str(Path(os.environ['RUNNER_TEMP']) / 'wfc35-console-probe/capture.py'))
+          raise SystemExit(capture['run_stage']('rpc-fixture'))
+      - name: Single queue fixture (six seconds)
+        run: |
+          import os, runpy
+          from pathlib import Path
+          capture = runpy.run_path(str(Path(os.environ['RUNNER_TEMP']) / 'wfc35-console-probe/capture.py'))
+          raise SystemExit(capture['run_stage']('queue-fixture'))
+
+      # CI/service-session window flags do not verify a visible user desktop or Windows 11.
+      # The job timeout is an escape hatch, not immediate STOP or root-cause evidence.
+      - name: Retain bounded sanitized diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-console-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/wfc35-console-probe/artifacts/
+          retention-days: 7
+          if-no-files-found: warn
