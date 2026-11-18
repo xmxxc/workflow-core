@@ -190,6 +190,7 @@ wfc ask "<question>" --options a,b
 - **`wait`** blocks until a worker message arrives (`done`, a question, `blocked`, `stalled` or `exited`) and exits with code 3 on timeout. `--stall-after` (default 300) is how many seconds a worker's screen may stay unchanged before it is reported `stalled`.
 - **`relay`** is the `wait` of a Codex or OpenCode controller: it pushes messages into the controller session instead. `--detach` runs it in a new session with output to `$WFC_STATE/relay.log` and prints its pid and log path; `--for <seconds>` stops it after that long (by default it runs on).
   - `--codex`, run from inside the Codex controller, takes the thread from `$CODEX_THREAD_ID`. `--codex-thread <uuid>` names a thread instead. Both are checked before relay starts; see [Codex thread check](#codex-thread-check).
+  - `--scope <scope>` limits delivery and watchdog checks to that scope, including with `--detach`. An unowned scope needs no token. A claimed scope requires its current, unexpired token through `--owner-token`, `$WFC_CONTROLLER_TOKEN`, or `$WFC_OWNER_TOKEN`.
   - `--opencode-url` and `--opencode-session` deliver over OpenCode's `prompt_async` HTTP API; the OpenCode controller must be started with `--port`.
 
 ### Inspecting

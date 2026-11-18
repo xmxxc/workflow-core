@@ -13,6 +13,9 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+import wfc_platform
 
 ROUTER = Path(__file__).resolve().parent.parent / "router.py"
 
@@ -1081,6 +1084,179 @@ class CodexRelay(unittest.TestCase):
         [call] = self.queued()
         self.assertIn('"type": "done"', call[call.index("--message") + 1])
 
+
+
+class ScopedDetachedCodexRelay(unittest.TestCase):
+    """Exercise the original CLI and real child, with an isolated Codex queue recorder."""
+
+    THREAD = CodexRelay.THREAD
+    SCOPE = "detached-scope"
+
+    def setUp(self):
+        clean_env = patch.dict(os.environ)
+        clean_env.start()
+        self.addCleanup(clean_env.stop)
+        for key in ("WFC_CONTROLLER_TOKEN", "WFC_OWNER_TOKEN"):
+            os.environ.pop(key, None)
+        self.env = Env()
+        self.addCleanup(self.env.close)
+        self.env.codex_controller(self.THREAD)
+        self.env.report.write_text("# scoped detached report\n")
+
+    def relay(self, *args, seconds="2", env=None):
+        return self.env.run("relay", "--codex", "--scope", self.SCOPE,
+                            "--stall-after", "180", "--for", seconds, "--detach", *args,
+                            env={"CODEX_THREAD_ID": self.THREAD, **(env or {})})
+
+    def queued(self):
+        return [c for c in self.env.host_calls() if c[:2] == ["codex", "queue"]]
+
+    def until(self, predicate, timeout=5):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            value = predicate()
+            if value:
+                return value
+            time.sleep(0.05)
+        self.fail("detached relay did not reach the expected state")
+
+    def start(self, *args, **kwargs):
+        result = self.relay(*args, **kwargs)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        started = json.loads(result.stdout)
+        pid = started["pid"]
+        identity = wfc_platform.process_identity(pid)
+
+        def stop_child():
+            if not started.get("exited") and identity and wfc_platform.process_identity(pid) == identity:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+
+        self.addCleanup(stop_child)
+        self.until(lambda: any(w["pid"] == pid and w["kind"] == "relay"
+                               for w in self.env.json("status")["waiters"]))
+        os.kill(pid, 0)
+        self.assertNotEqual(os.getsid(pid), os.getsid(0))
+        return started
+
+    def finished(self, started):
+        # A detached child cannot be waitpid'ed by this test. Observe its actual exit,
+        # including an exited zombie awaiting the system reaper, rather than just its PID.
+        def exited():
+            state = subprocess.run(["ps", "-o", "stat=", "-p", str(started["pid"])],
+                                   capture_output=True, text=True).stdout.strip()
+            return not state or state.startswith("Z")
+
+        self.until(exited, timeout=8)
+        started["exited"] = True
+        self.assertEqual(self.env.json("status")["waiters"], [])
+        return Path(started["log"]).read_text()
+
+    def messages(self, dispatch):
+        return self.env.json("status", "--dispatch", dispatch)["dispatches"][0]["messages"]
+
+    def assert_envelope(self, before):
+        [call] = self.queued()
+        expected = {key: value for key, value in before.items() if key not in ("at", "to", "delivered")}
+        version = before["statusVersion"] + 1
+        expected.update(state="unknown", statusVersion=version, delivery="pending",
+                        deliveryAttempt=f"relay:{before['messageId']}:{version}")
+        self.assertEqual(call, ["codex", "queue", "--thread", self.THREAD, "--message",
+                               "[router] Messages for the controller: " + json.dumps({"messages": [expected]},
+                                                                                   ensure_ascii=False),
+                               "--resume"])
+
+    def test_unowned_scope_without_token_delivers_only_its_exact_envelope(self):
+        dispatch = self.env.dispatch(extra_args=("--scope", self.SCOPE))
+        other = self.env.dispatch(extra_args=("--scope", "other-scope"))
+        self.env.json("done", "--report", str(self.env.report), dispatch=other)
+        unrelated = self.env.dispatch(extra_args=("--scope", "other-scope"))
+        self.env.end_session(unrelated)  # a scoped relay must not scan this worker either
+        started = self.start()
+        # The original launcher has returned; only its real detached child can deliver this.
+        receipt = self.env.json("done", "--report", str(self.env.report), dispatch=dispatch)
+        [before] = self.messages(dispatch)
+        before.update(state=receipt["state"], statusVersion=receipt["statusVersion"])
+        self.until(self.queued)
+        self.assertNotIn("Traceback", self.finished(started))
+        self.assert_envelope(before)
+        self.assertEqual(self.messages(dispatch)[0]["state"], "received")
+        self.assertEqual(self.messages(other)[0]["state"], "unsent")
+        self.assertEqual(self.messages(unrelated), [])
+        ack = self.env.json("ack", before["messageId"])
+        self.assertEqual(ack["state"], "processed")
+
+    def test_claimed_scope_accepts_explicit_and_environment_tokens(self):
+        for source in ("argument", "WFC_CONTROLLER_TOKEN", "WFC_OWNER_TOKEN"):
+            with self.subTest(source=source):
+                owner = self.env.json("owner", "takeover", "--scope", self.SCOPE, "--lease", "60")
+                token = owner["token"]
+                dispatch = self.env.dispatch(extra_args=("--scope", self.SCOPE, "--owner-token", token))
+                args = ("--owner-token", token) if source == "argument" else ()
+                env = {} if source == "argument" else {source: token}
+                # An explicit credential must also override a stale environment credential.
+                if source == "argument":
+                    env = {"WFC_CONTROLLER_TOKEN": "stale-test-token"}
+                started = self.start(*args, seconds="1.5", env=env)
+                self.env.json("done", "--report", str(self.env.report), "--owner-token", token,
+                              dispatch=dispatch)
+                self.until(lambda: self.messages(dispatch)[0]["state"] == "received")
+                self.assertNotIn("stale_controller_owner", self.finished(started))
+                self.assertEqual(self.env.json("ack", self.messages(dispatch)[0]["messageId"],
+                                               "--owner-token", token)["state"], "processed")
+        self.assertEqual(len(self.queued()), 3)
+
+    def test_claimed_scope_refuses_missing_stale_and_expired_credentials_before_launch(self):
+        first = self.env.json("owner", "acquire", "--scope", self.SCOPE)
+        dispatch = self.env.dispatch(extra_args=("--scope", self.SCOPE, "--owner-token", first["token"]))
+        self.env.end_session(dispatch)
+        second = self.env.json("owner", "takeover", "--scope", self.SCOPE)
+        cases = [((), {}), (("--owner-token", first["token"]), {}),
+                 ((), {"WFC_CONTROLLER_TOKEN": first["token"]}),
+                 ((), {"WFC_OWNER_TOKEN": first["token"]})]
+        for args, env in cases:
+            result = self.relay(*args, env=env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(json.loads(result.stderr)["error"], "stale_controller_owner")
+            self.assertEqual(result.stdout, "")
+        expired = self.env.json("owner", "takeover", "--scope", self.SCOPE, "--lease", "-1")
+        result = self.relay("--owner-token", expired["token"])
+        self.assertFalse(json.loads(result.stderr)["active"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        unscoped = self.env.run("relay", "--codex", "--detach", env={"CODEX_THREAD_ID": self.THREAD})
+        self.assertEqual(json.loads(unscoped.stderr)["error"], "controller_owner_required")
+        self.assertNotEqual(second["token"], first["token"])
+        self.assertEqual(self.queued(), [])
+        self.assertEqual(self.messages(dispatch), [])  # no watchdog side effects
+        self.assertEqual(self.env.json("status")["waiters"], [])
+        self.assertFalse((self.env.state / "relay.log").exists())
+
+    def test_running_child_is_fenced_after_takeover(self):
+        first = self.env.json("owner", "acquire", "--scope", self.SCOPE)
+        dispatch = self.env.dispatch(extra_args=("--scope", self.SCOPE, "--owner-token", first["token"]))
+        started = self.start("--owner-token", first["token"], seconds="4")
+        second = self.env.json("owner", "takeover", "--scope", self.SCOPE)
+        self.env.json("done", "--report", str(self.env.report), "--owner-token", second["token"],
+                      dispatch=dispatch)
+        self.assertIn("stale_controller_owner", self.finished(started))
+        self.assertEqual(self.queued(), [])
+        self.assertEqual(self.messages(dispatch)[0]["state"], "unsent")
+
+    def test_unknown_delivery_is_not_replayed_by_a_new_detached_child(self):
+        dispatch = self.env.dispatch(extra_args=("--scope", self.SCOPE))
+        self.env.json("done", "--report", str(self.env.report), dispatch=dispatch)
+        [before] = self.messages(dispatch)
+        started = self.start(seconds="0.5", env={"FAKE_FAIL": "queue"})
+        self.assertIn("uncertain", self.finished(started))
+        self.assert_envelope(before)
+        self.assertEqual(self.messages(dispatch)[0]["state"], "unknown")
+        self.finished(self.start(seconds="0.5"))
+        self.assertEqual(len(self.queued()), 1)
+        self.assertEqual(self.messages(dispatch)[0]["state"], "unknown")
+        self.assertEqual(self.env.json("wait", "--scope", self.SCOPE, "--timeout", "0")["messages"], [])
 
 
 class CodexRelayThread(unittest.TestCase):

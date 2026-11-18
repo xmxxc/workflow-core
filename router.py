@@ -3210,8 +3210,10 @@ def cmd_relay(args):
         # A Codex controller's shell may end its background jobs; run in a new session instead.
         log = state_dir() / "relay.log"
         state_dir().mkdir(parents=True, exist_ok=True)
+        token = owner_token(args)
         argv = ["relay", *target_args, "--stall-after", str(args.stall_after),
-                *( ["--scope", args.scope, "--owner-token", owner_token(args)] if args.scope else []),
+                *(["--scope", args.scope] if args.scope else []),
+                *(["--owner-token", token] if token else []),
                 *(["--for", str(args.for_seconds)] if args.for_seconds else [])]
         with open(log, "a", encoding="utf-8") as out:
             child = subprocess.Popen([sys.executable, str(PROGRAM), *argv], stdin=subprocess.DEVNULL,
