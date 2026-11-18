@@ -31,6 +31,7 @@ jobs:
           cp docs/herdr-backend.md docs/host-launch.md docs/windows-core.md dist/windows/
           cp docs/verification/windows-opencode-release.md dist/windows/OPENCode-Windows.md
           cp docs/verification/windows-close-rc3.md dist/windows/CLOSE-Windows.md
+          cp docs/verification/windows-codex-rc4.md dist/windows/CODEX-Windows.md
           git rev-parse HEAD > dist/windows/COMMIT.txt
           python - <<'PYZIP'
           import os, zipfile
