@@ -1,0 +1,410 @@
+"""Safety/fixture checks for the issue #35 diagnostic tool, not a console regression test."""
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import socket
+import sys
+import tempfile
+import threading
+import time
+import unittest
+
+ROOT = Path(__file__).resolve().parent.parent
+SPEC = importlib.util.spec_from_file_location('console_probe', ROOT / 'tools/windows_console_probe.py')
+probe = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(probe)
+
+
+class ProbeSafety(unittest.TestCase):
+    def test_observer_verdict_requires_exact_visible_window_and_creation_identity(self):
+        owner = dict(pid=123, creation='windows:1', image='conhost.exe')
+        control = dict(event='positive_control', hwnd=456, owner=owner)
+        observed = dict(event='console_association', hwnd=456, owner=owner, visible=True, attached_owned_pid_present=True)
+        self.assertTrue(probe.positive_control_seen([control, observed]))
+        for change in (dict(hwnd=457), dict(visible=False), dict(attached_owned_pid_present=False),
+                       dict(owner={**owner, 'creation': 'windows:2'})):
+            bad = {**observed, **change}
+            self.assertFalse(probe.positive_control_seen([control, bad]))
+        self.assertFalse(probe.positive_control_seen([]))
+        self.assertFalse(probe.positive_control_seen([control]))
+
+    def test_watchdog_stops_real_owned_child_despite_blocked_sampler(self):
+        # Deliberately block this thread. The independent watchdog must still kill its child.
+        for trigger in ('STOP', 'deadline'):
+            with self.subTest(trigger=trigger), tempfile.TemporaryDirectory(prefix='wfc35-') as directory:
+                root = Path(directory)
+                owned = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(5)'])
+                sentinel = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(5)'])
+                timer = None
+                finished, watcher, outcome = probe.start_watchdog(root / 'STOP',
+                    time.monotonic() + (.12 if trigger == 'deadline' else 2), owned.kill)
+                try:
+                    if trigger == 'STOP':
+                        timer = threading.Timer(.06, lambda: (root / 'STOP').touch())
+                        timer.start()
+                    time.sleep(.3)  # represents a stuck window sampler or RPC
+                    self.assertIsNotNone(owned.poll())
+                    self.assertIsNone(sentinel.poll())
+                    self.assertEqual(outcome, [trigger])
+                finally:
+                    finished.set()
+                    watcher.join(timeout=1)
+                    if timer:
+                        timer.join(timeout=1)
+                    for child in (owned, sentinel):
+                        if child.poll() is None:
+                            child.kill()
+                        child.wait(timeout=1)
+
+    def test_normal_completion_cancels_watchdog(self):
+        with tempfile.TemporaryDirectory(prefix='wfc35-') as directory:
+            called = []
+            finished, watcher, outcome = probe.start_watchdog(Path(directory) / 'STOP', time.monotonic() + .1,
+                                                              lambda: called.append(True))
+            finished.set()
+            watcher.join(timeout=1)
+            self.assertEqual((called, outcome), ([], []))
+            self.assertFalse(watcher.is_alive())
+
+    def test_environment_drops_inherited_credentials_and_state(self):
+        from unittest.mock import patch
+        root = Path('/scratch/fixture')
+        with patch.dict(os.environ, dict(OPENAI_API_KEY='SECRET', WFC_STATE='/user/state',
+            HERDR_SOCKET_PATH='user-service', HERDR_CONFIG_PATH='/user/config', CODEX_THREAD_ID='user-thread')):
+            env = probe.isolated_env(root)
+        self.assertNotIn('OPENAI_API_KEY', env)
+        self.assertNotIn('CODEX_THREAD_ID', env)
+        self.assertNotIn('CODEX_HOME', env)
+        self.assertNotEqual(env['HERDR_SOCKET_PATH'], 'user-service')
+        self.assertEqual(env['HERDR_SOCKET_PATH'], env['WFC_HERDR_ENDPOINT'])
+        self.assertEqual(env['HERDR_CONFIG_PATH'], str(root / 'herdr.toml'))
+        self.assertEqual(env['WFC_STATE'], str(root / 'state'))
+        for kind in ('CONFIG', 'STATE', 'DATA', 'CACHE'):
+            self.assertEqual(Path(env['XDG_' + kind + '_HOME']).parent, root)
+
+    @unittest.skipIf(os.name == 'nt', 'Linux refusal contract')
+    def test_linux_public_entry_refuses_before_creating_state(self):
+        with tempfile.TemporaryDirectory(prefix='wfc35-') as directory:
+            root = Path(directory) / 'new'
+            result = subprocess.run([sys.executable, str(ROOT / 'tools/windows_console_probe.py'),
+                '--stage', 'idle', '--run-dir', str(root)], capture_output=True, timeout=2)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b'native Windows is required', result.stderr)
+            self.assertFalse(root.exists())
+
+
+@unittest.skipUnless(sys.platform.startswith('linux'), 'portable fixture seam checks use Linux sockets')
+class LinuxFixtures(unittest.TestCase):
+    def test_actual_source_seams_without_console_claim(self):
+        for stage, expected in (('idle', 'relay_finished'), ('rpc-fixture', 'rpc_result'),
+                                ('queue-fixture', 'queue_result')):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory(prefix='wfc35-') as directory:
+                root = Path(directory)
+                if stage == 'rpc-fixture':
+                    try:
+                        with socket.socket(socket.AF_UNIX) as check:
+                            check.bind(str(root / 'capability.sock'))
+                    except OSError:
+                        self.skipTest('sandbox denies AF_UNIX fixture server; accepted RPC NOT validated')
+                env = probe.isolated_env(root)
+                (root / 'herdr.toml').write_text('[terminal]\ndefault_shell="/bin/sh"\n')
+                result = subprocess.run([sys.executable, str(ROOT / 'tools/windows_console_probe.py'),
+                    '--internal', 'subject', '--stage', stage, '--run-dir', str(root)], env=env,
+                    capture_output=True, timeout=9)
+                events = probe.read_events(root)
+                self.assertEqual(result.returncode, 0, events)
+                records = [e for e in events if e['event'] == expected]
+                self.assertEqual(len(records), 1, events)
+                if stage == 'idle':
+                    self.assertEqual(records[0]['waiter_count'], 0)
+                    relay = next(e for e in events if e['event'] == 'detached_relay')
+                    current = probe.wfc_platform.process_probe(relay['pid'])
+                    self.assertTrue(current['state'] == 'exited' or current['identity'] != relay['creation'])
+                elif stage == 'rpc-fixture':
+                    self.assertEqual((records[0]['result'], records[0]['alive'], records[0]['owned']),
+                                     ('accepted', True, True))
+                else:
+                    self.assertEqual((records[0]['result'], records[0]['launches']), ('delivered', 1))
+                    self.assertEqual(sum(e['event'] == 'queue_fixture_entered' for e in events), 1)
+                forbidden = ('commandline', 'title', 'environment', 'SECRET', 'params', 'fixture-thread')
+                serialized = json.dumps(events)
+                self.assertFalse(any(term in serialized for term in forbidden))
+
+    def test_real_rpc_helper_unavailable_endpoint_fails_safely(self):
+        with tempfile.TemporaryDirectory(prefix='wfc35-') as directory:
+            root = Path(directory)
+            env = probe.isolated_env(root)
+            payload = dict(endpoint=env['HERDR_SOCKET_PATH'], method='session.snapshot', params={})
+            command = "import herdr_backend,json,sys; print(json.dumps(herdr_backend.rpc(sys.argv[1],json.loads(sys.argv[2]))))"
+            result = subprocess.run([sys.executable, '-c', command, str(ROOT / 'router.py'), json.dumps(payload)],
+                cwd=ROOT, env=env, capture_output=True, timeout=4)
+            self.assertEqual(result.returncode, 0)
+            outcome = json.loads(result.stdout)
+            self.assertIn((outcome['result'], outcome['category']),
+                          (('definitely-not-sent', 'herdr_unavailable'), ('refused', 'herdr_ownership')))
+
+
+@unittest.skipUnless(os.name == 'nt', 'native Windows interactive runner required; not Linux evidence')
+class NativeProbe(unittest.TestCase):
+    def invoke(self, root, *extra):
+        return subprocess.Popen([sys.executable, str(ROOT / 'tools/windows_console_probe.py'),
+            '--stage', 'observer-selftest', '--run-dir', str(root), *extra],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def assert_clean(self, root):
+        events = probe.read_events(root)
+        self.assertTrue(any(e['event'] == 'supervisor_end' and e['cleanup'] == 'owned_job_empty' for e in events), events)
+        for event in events:
+            process = event.get('process') if event['event'] == 'process_observed' else None
+            if process:
+                current = probe.wfc_platform.process_probe(process['pid'])
+                self.assertTrue(current['state'] == 'exited' or
+                                (current['state'] == 'alive' and current['identity'] != process['creation']), current)
+        return events
+
+    def test_visible_positive_control_and_job_cleanup(self):
+        with tempfile.TemporaryDirectory(prefix='wfc35-') as directory:
+            root = Path(directory) / 'positive'
+            child = self.invoke(root)
+            self.assertEqual(child.wait(timeout=10), 0, probe.read_events(root))
+            self.assertTrue(probe.positive_control_seen(self.assert_clean(root)))
+
+    def test_stop_and_deadline_kill_owned_job(self):
+        for trigger in ('STOP', 'deadline'):
+            with self.subTest(trigger=trigger), tempfile.TemporaryDirectory(prefix='wfc35-') as directory:
+                root = Path(directory) / 'bounded'
+                child = self.invoke(root, '--seconds', '1' if trigger == 'deadline' else '6')
+                try:
+                    if trigger == 'STOP':
+                        self.assertTrue(probe.wait_file(root / 'observer-ready', root / 'STOP', time.monotonic() + 2))
+                        (root / 'STOP').touch()
+                    self.assertEqual(child.wait(timeout=9), 2)
+                    events = self.assert_clean(root)
+                    self.assertTrue(any(e['event'] == 'supervisor_end' and e['reason'] == trigger for e in events), events)
+                finally:
+                    if child.poll() is None:
+                        child.kill()  # supervisor only; kill-on-close must contain its job
+                        child.wait(timeout=1)
+
+class ReviewRegressions(unittest.TestCase):
+    """Deterministic versions of independent review S1/S2/S3; no native API calls."""
+    class Child:
+        def __init__(self, code):
+            self.returncode = code
+        def poll(self):
+            return self.returncode
+        def wait(self, timeout):
+            return self.returncode
+
+    def fake_native(self, foreign=False):
+        from contextlib import contextmanager
+        from types import SimpleNamespace
+        class Fake:
+            job_name = 'fixture-job'
+            def __init__(self):
+                self.terminated = False
+                self.k = SimpleNamespace(TerminateJobObject=self.terminate, CloseHandle=lambda h: True)
+            def check(self, value):
+                assert value
+                return value
+            def terminate(self, *args):
+                self.terminated = True
+                return True
+            def job(self, observe_only=False):
+                return 789 if observe_only else 123
+            def duplicate_job(self, job):
+                return 456
+            def members(self, job):
+                return [321] if foreign and not self.terminated else []
+            def process(self, pid):
+                return dict(pid=321, creation='windows:999', image='unrelated.exe')
+            def parents(self):
+                return {}
+            @contextmanager
+            def owned_process(self, job, pid, expected=None):
+                yield None  # the numeric candidate is an outside-job replacement
+        return Fake()
+
+    def run_supervisor(self, root, native, observer_code=None):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        class OS:
+            name = 'nt'
+            def __getattr__(self, key):
+                return getattr(os, key)
+        def spawn(root, role, *args):
+            (root / 'observer-ready').touch()
+            return self.Child(observer_code if role == 'observer' else 0)
+        with patch.object(probe, 'os', OS()), patch.object(probe, 'Native', lambda: native), \
+                patch.object(probe, 'isolated_env', lambda root: {}), patch.object(probe, 'spawn', spawn):
+            return probe.supervise(SimpleNamespace(run_dir=root, stage='idle', seconds=6))
+
+    def test_outside_job_replacement_is_not_published(self):
+        with tempfile.TemporaryDirectory(prefix='wfc35-r2-') as directory:
+            root = Path(directory) / 'run'
+            self.run_supervisor(root, self.fake_native(foreign=True))
+            events = probe.read_events(root)
+            self.assertFalse(any(e['event'] == 'process_observed' for e in events), events)
+            self.assertTrue(any(e['event'] == 'membership_identity_gap' for e in events), events)
+            self.assertNotIn('unrelated.exe', json.dumps(events))
+            self.assertNotIn('windows:999', (root / 'members.json').read_text())
+
+    def test_observer_does_not_attach_to_outside_job_replacement(self):
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory(prefix='wfc35-r2-') as directory:
+            root = Path(directory)
+            native, calls = self.fake_native(), []
+            native.k.FreeConsole = lambda: True
+            native.windows = lambda owned: []
+            native.console = lambda process, *args: calls.append(process) or dict(event='console_unavailable')
+            native.observation_job = lambda root: 123
+            (root / 'members.json').write_text(json.dumps([native.process(321)]))
+            with patch.object(probe, 'Native', lambda: native), \
+                    patch.object(probe.time, 'sleep', lambda _: (root / 'STOP').touch()):
+                probe.observe(root, 'idle')
+            self.assertEqual(calls, [])
+            events = probe.read_events(root)
+            self.assertTrue(any(e['event'] == 'membership_identity_gap' for e in events), events)
+            self.assertNotIn('unrelated.exe', json.dumps(events))
+
+    def test_observer_failure_dominates_same_iteration_phase_success(self):
+        with tempfile.TemporaryDirectory(prefix='wfc35-r2-') as directory:
+            root = Path(directory) / 'run'
+            code = self.run_supervisor(root, self.fake_native(), observer_code=2)
+            self.assertEqual(code, 2)
+            end = next(e for e in probe.read_events(root) if e['event'] == 'supervisor_end')
+            self.assertEqual(end['reason'], 'observer_failed')
+            self.assertEqual(end['observer_returncode'], 2)
+            self.assertEqual(end['cleanup'], 'owned_job_empty')
+
+    def test_cancelled_inflight_reason_cannot_terminate_after_close(self):
+        from unittest.mock import patch
+        entered, release = threading.Event(), threading.Event()
+        operations = []
+        def delayed_reason(*args):
+            entered.set()
+            if not release.wait(2):
+                raise RuntimeError('test synchronization failed')
+            return 'deadline'
+        with patch.object(probe, 'stop_reason', delayed_reason):
+            finished, watcher, outcome = probe.start_watchdog(Path('/unused'), 0,
+                lambda: operations.append('terminate'))
+            try:
+                self.assertTrue(entered.wait(1))
+                finished.set()
+                watcher.join(timeout=.03)
+                self.assertTrue(watcher.is_alive())
+                operations.append('close')
+            finally:
+                release.set()
+                watcher.join(timeout=1)
+        self.assertFalse(watcher.is_alive())
+        self.assertEqual(operations, ['close'])
+        self.assertEqual(outcome, [])
+
+    def test_native_gate_rejects_reuse_before_image_query_or_attachment(self):
+        import ctypes as C
+        from types import SimpleNamespace
+        for case in ('outside', 'unknown', 'exited', 'wrong_creation', 'owned'):
+            with self.subTest(case=case):
+                calls, closed = [], []
+                native = object.__new__(probe.Native)
+                native.W = SimpleNamespace(BOOL=C.c_int)
+                def member(handle, job, result):
+                    self.assertEqual((handle, job), (555, 123))
+                    C.cast(result, C.POINTER(C.c_int))[0] = case != 'outside'
+                    return case != 'unknown'
+                native.k = SimpleNamespace(OpenProcess=lambda *a: 555, IsProcessInJob=member,
+                    WaitForSingleObject=lambda *a: 0 if case == 'exited' else 258,
+                    CloseHandle=lambda h: closed.append(h),
+                    AttachConsole=lambda pid: calls.append('attach') or False)
+                native.identity = lambda h: 'windows:999' if case == 'wrong_creation' else 'windows:1'
+                process = dict(pid=321, creation='windows:1', image='owned.exe')
+                def metadata(handle, pid):
+                    self.assertFalse(closed)
+                    calls.append('image')
+                    return process
+                native.metadata = metadata
+                with native.owned_process(123, 321, process) as pin:
+                    self.assertFalse(closed)
+                    if pin:
+                        native.console(pin[1], pin[0])
+                self.assertEqual(calls, ['image', 'attach'] if case == 'owned' else [])
+                self.assertEqual(closed, [555])
+
+    def test_unresolved_callback_retains_its_own_handle_and_cannot_report_success(self):
+        from unittest.mock import patch
+        native, operations, closed = self.fake_native(), [], set()
+        entered, release = threading.Event(), threading.Event()
+        original_start, watched = probe.start_watchdog, []
+        def terminate(handle, code):
+            self.assertNotIn(handle, closed)
+            operations.append(('terminate_start', handle))
+            if handle == 456:
+                entered.set()
+                if not release.wait(3):
+                    raise RuntimeError('test synchronization failed')
+                self.assertNotIn(handle, closed)
+            native.terminated = True
+            operations.append(('terminate_end', handle))
+            return True
+        def close(handle):
+            self.assertNotIn(handle, closed)
+            operations.append(('close', handle))
+            closed.add(handle)
+            return True
+        native.k.TerminateJobObject, native.k.CloseHandle = terminate, close
+        def start(stop, deadline, callback, *args):
+            result = original_start(stop, 0, callback, *args)
+            watched.append(result)
+            self.assertTrue(entered.wait(1))
+            return result
+        try:
+            with tempfile.TemporaryDirectory(prefix='wfc35-r2-') as directory, \
+                    patch.object(probe, 'start_watchdog', start):
+                root = Path(directory) / 'run'
+                before = time.monotonic()
+                code = self.run_supervisor(root, native)
+                self.assertLess(time.monotonic() - before, 2)
+                self.assertEqual(code, 2)
+                end = next(e for e in probe.read_events(root) if e['event'] == 'supervisor_end')
+                self.assertEqual(end['reason'], 'watchdog_shutdown_unresolved')
+                self.assertEqual(end['watchdog_shutdown'], 'unresolved')
+                self.assertIn(123, closed)
+                self.assertNotIn(456, closed)
+        finally:
+            release.set()
+            for finished, thread, outcome in watched:
+                finished.set()
+                thread.join(timeout=1)
+                self.assertFalse(thread.is_alive())
+        self.assertIn(456, closed)
+        self.assertLess(operations.index(('terminate_start', 456)), operations.index(('close', 123)))
+        self.assertLess(operations.index(('terminate_end', 456)), operations.index(('close', 456)))
+
+    def test_watchdog_failure_overrides_completed_phase(self):
+        from unittest.mock import patch
+        native = self.fake_native()
+        original_start = probe.start_watchdog
+        def start(stop, deadline, callback, *args):
+            def fail():
+                raise RuntimeError('controlled callback failure')
+            result = original_start(stop, 0, fail, *args)
+            result[1].join(timeout=1)
+            self.assertFalse(result[1].is_alive())
+            return result
+        with tempfile.TemporaryDirectory(prefix='wfc35-r2-') as directory, \
+                patch.object(probe, 'start_watchdog', start):
+            root = Path(directory) / 'run'
+            self.assertEqual(self.run_supervisor(root, native), 2)
+            end = next(e for e in probe.read_events(root) if e['event'] == 'supervisor_end')
+            self.assertEqual(end['reason'], 'watchdog_failed')
+            self.assertEqual(end['watchdog_shutdown'], 'joined')
+            self.assertEqual(end['cleanup'], 'owned_job_empty')
+
+
+if __name__ == '__main__':
+    unittest.main()
