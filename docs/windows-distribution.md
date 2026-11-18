@@ -1,10 +1,10 @@
 # Windows 便携分发与验收
 
-这是 #10 的 Windows 预发布测试版，版本为 0.4.7-rc.3。它包含 PR #29 的 #28 修复：关闭执行会话时保留已完成轮次及回执。复测命令见随包的 `CLOSE-Windows.md`。[rc.2 实测记录](https://github.com/xmxxc/workflow-core/blob/b361b9e0e2447063515a57cb23e466f414cbf102/docs/verification/windows-opencode-rc2-20261115.md)已验证原生 Windows 上的 OpenCode 自动首派、问答、完成、同会话 resume、continue 和 300.011 秒 relay；rc.3 的关闭修复仍待实机复验。默认后端仍为 tmux；Windows 派发显式选择 `--backend herdr`。
+这是 #10 的 Windows 预发布测试版，版本为 0.4.7-rc.4。它包含 #30 的 Codex 回复提交修复和 #31 的 scoped detached relay 修复；短复测见随包的 `CODEX-Windows.md`（[源码版](verification/windows-codex-rc4.md)）。原生 Windows 固定候选的无人值守 Codex A 与 owner 接替后完成 D 仍待验收。[rc.2 实测记录](https://github.com/xmxxc/workflow-core/blob/b361b9e0e2447063515a57cb23e466f414cbf102/docs/verification/windows-opencode-rc2-20261115.md)记录 OpenCode 自动首派、问答、完成、同会话 resume、continue 和 300.011 秒 relay。包内保留 `OPENCode-Windows.md` 与 `CLOSE-Windows.md` 的历史步骤，重测时将其包路径和版本检查改为 rc.4。默认后端仍为 tmux；Windows 派发显式选择 `--backend herdr`。
 
 ## 下载
 
-从 [v0.4.7-rc.3 发布页](https://github.com/xmxxc/workflow-core/releases/tag/v0.4.7-rc.3) 下载 `wfc-v0.4.7-rc.3-windows-x64.zip`，解压后在目录内使用 `wfc.cmd`。`SHA256SUMS` 提供校验和；此 ZIP 包含 WFC Python payload 与启动入口，依赖按下文单独安装。
+从 [v0.4.7-rc.4 发布页](https://github.com/xmxxc/workflow-core/releases/tag/v0.4.7-rc.4) 下载 `wfc-v0.4.7-rc.4-windows-x64.zip`，解压后在目录内使用 `wfc.cmd`。`SHA256SUMS` 提供校验和，`COMMIT.txt` 记录构建源码；此 ZIP 包含 WFC Python payload 与启动入口，依赖按下文单独安装。
 
 ## 安装与启动
 
@@ -28,13 +28,22 @@ cmd 对应入口：
 
 目录包含同源 `wfc.pyz`、`wfc.cmd` 和 LICENSE。wrapper 使用 PATH 上的 `python`，不修改全局 PATH 或 shell 配置。也可直接用指定解释器 `C:\Python312\python.exe C:\Tools\WFC\wfc.pyz --version`，路径有空格时按当前 shell 引用。Python payload 的 CLI 和内部子进程始终使用 argv；shell wrapper 的调用参数仍受 cmd/PowerShell 自身语法约束。
 
-Herdr 使用与 WFC 相同的本地 endpoint。启动服务后在另一个终端派发：
+每项实测必须同时隔离 Herdr endpoint、配置和状态，以及 WFC 状态；只换 pipe 名仍可能共享默认布局。以下在专用 PowerShell 内运行（替换实际安装路径），Herdr 以子进程继承这些进程级变量：
 
 ```powershell
-$env:HERDR_SOCKET_PATH = 'wfc-local'
-herdr server
-# 另一个终端：
-& 'C:\Tools\WFC candidate\wfc.cmd' dispatch --backend herdr --herdr-endpoint wfc-local --host codex --task 'C:\Work\任务.md' --cwd 'C:\Work' --report 'C:\Work\reports\报告.md' --launch-config 'C:\Work\launch.json'
+$work = Join-Path $env:TEMP ('wfc-local-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force $work | Out-Null
+$env:HERDR_SOCKET_PATH = Split-Path $work -Leaf
+$env:HERDR_CONFIG_PATH = "$work\herdr.toml"
+$env:XDG_CONFIG_HOME = "$work\config"
+$env:XDG_STATE_HOME = "$work\herdr-state"
+$env:XDG_DATA_HOME = "$work\data"
+$env:XDG_CACHE_HOME = "$work\cache"
+$env:WFC_STATE = "$work\wfc-state"
+'[terminal]', 'default_shell = "cmd.exe"' | Set-Content -Encoding ascii $env:HERDR_CONFIG_PATH
+$server = Start-Process -FilePath 'D:\Tools\herdr.exe' -ArgumentList 'server' -PassThru
+# 待服务就绪后；task/report/cwd/launch.json 使用实际绝对路径：
+& 'C:\Tools\WFC candidate\wfc.cmd' dispatch --backend herdr --herdr-endpoint $env:HERDR_SOCKET_PATH --host codex --task 'C:\Work\任务.md' --cwd 'C:\Work' --report 'C:\Work\reports\报告.md' --launch-config 'C:\Work\launch.json'
 ```
 
 [Herdr 后端说明](herdr-backend.md) 包含归属、超时、恢复和权限边界。[启动配置](host-launch.md) 包含 Node/JS argv 配置。npm `codex.cmd` 不能作为直接宿主执行入口，配置实际 JS 脚本和 Node exe。不要用 CI 的测试下载工具作为依赖安装器；它只管理隔离的校验固定版本测试 fixture。
