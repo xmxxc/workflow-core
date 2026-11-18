@@ -48,6 +48,8 @@ jobs:
           python -m unittest discover -s tests -p test_platform.py -v
           python -m unittest discover -s tests -p test_backend.py -v
           python -m unittest discover -s tests -p test_distribution.py -v
+      - name: Native Herdr fixture Job cleanup
+        run: python -m unittest discover -s tests -p test_herdr_cleanup.py -v
       - name: Build and inspect native zipapp
         run: |
           python build.py --out dist/wfc.pyz
