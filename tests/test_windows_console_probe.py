@@ -690,6 +690,158 @@ class EnumWindowLivenessRegressions(unittest.TestCase):
                     self.assertTrue(windows)
                     self.assertFalse(windows[0]['visible'])
 
+class MetadataExitBoundaryRegressions(unittest.TestCase):
+    """Actual adapter/supervisor seam; fake native results, no process/image probing."""
+    def supervise(self, scenario):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        native, process = NativeGapRegressions().native()
+        driver = ReviewRegressions().fake_native()
+        for name in ('job', 'duplicate_job', 'parents', 'check'):
+            setattr(native, name, getattr(driver, name))
+        native.job_name = driver.job_name
+        native.k.TerminateJobObject = driver.terminate
+        native.members = lambda job: [] if driver.terminated else [321]
+        failed_query = []
+        turn = dict(second=scenario.startswith('first-seen'))
+        original_metadata = native.metadata
+        def metadata(handle, pid, creation=None):
+            if turn['second']:
+                if scenario == 'changed-creation':
+                    native.calls.append('FOREIGN_IMAGE_QUERY')
+                    return dict(pid=pid, creation=creation, image='unrelated.exe')
+                failed_query.append(True)
+                native.calls.append('image_error')
+                if scenario in ('known-exit', 'first-seen-exit'):
+                    native.mode = 'exited'
+                elif scenario == 'unknown-wait':
+                    native.mode = 'wait-failed'
+                raise OSError('PRIVATE_R8_METADATA_ERROR')
+            return original_metadata(handle, pid, creation)
+        native.metadata = metadata
+        native.identity = lambda h: 'windows:999' if scenario == 'changed-creation' and turn['second'] else 'windows:1'
+        reviews = ReviewRegressions()
+        class OS:
+            name = 'nt'
+            def __getattr__(self, key):
+                return getattr(os, key)
+        class Phase(reviews.Child):
+            def poll(self):
+                if not turn['second']:
+                    turn['second'] = True
+                    return None
+                return 0
+        def spawn(root, role, *args):
+            return reviews.Child(None) if role == 'observer' else Phase(0)
+        with tempfile.TemporaryDirectory(prefix='wfc35-r8-') as directory:
+            root = Path(directory) / 'run'
+            with patch.object(probe, 'os', OS()), patch.object(probe, 'Native', lambda: native), \
+                    patch.object(probe, 'isolated_env', lambda root: {}), patch.object(probe, 'spawn', spawn):
+                code = probe.supervise(SimpleNamespace(run_dir=root, stage='idle', seconds=6))
+            return code, native, probe.read_events(root), json.loads((root / 'members.json').read_text()), len(failed_query)
+
+    def test_known_metadata_error_plus_exact_postquery_exit_is_not_a_gap(self):
+        code, native, events, members, queries = self.supervise('known-exit')
+        self.assertEqual(code, 0, events)
+        self.assertEqual(queries, 1)
+        self.assertEqual(members, [])
+        self.assertFalse(any(e['event'] == 'membership_identity_gap' for e in events), events)
+        uncertainty = next(e for e in events if e['event'] == 'metadata_query_uncertain')
+        self.assertEqual((uncertainty['candidate_pid'], uncertainty['api'], uncertainty['winerror'], uncertainty['post_query_state']),
+                         (321, 'QueryFullProcessImageNameW', 5, 'exited'))
+        exited = next(e for e in events if e['event'] == 'owned_process_exited')
+        self.assertEqual((exited['candidate_pid'], exited['creation'], exited['proof']),
+                         (321, 'windows:1', 'same_handle_signaled_after_metadata_query'))
+        self.assertLess(events.index(uncertainty), events.index(exited))
+        self.assertNotIn('PRIVATE_R8_METADATA_ERROR', json.dumps(events))
+
+    def test_known_alive_metadata_error_remains_uncertain_gap(self):
+        code, native, events, members, queries = self.supervise('known-alive')
+        self.assertEqual(code, 2)
+        gap = next(e for e in events if e['event'] == 'membership_identity_gap')
+        self.assertEqual((gap['api'], gap['winerror'], gap['post_query_state']),
+                         ('QueryFullProcessImageNameW', 5, 'alive'))
+        self.assertFalse(gap.get('verified_exit', False))
+        self.assertFalse(any(e['event'] == 'owned_process_exited' for e in events))
+        self.assertNotIn('PRIVATE_R8_METADATA_ERROR', json.dumps(events))
+
+    def test_postquery_unknown_wait_remains_gap(self):
+        code, native, events, members, queries = self.supervise('unknown-wait')
+        self.assertEqual(code, 2)
+        gap = next(e for e in events if e['event'] == 'membership_identity_gap')
+        self.assertEqual((gap['api'], gap['winerror']), ('QueryFullProcessImageNameW', 5))
+        self.assertEqual((gap['post_query_state'], gap['post_query_api'], gap['post_query_winerror']),
+                         ('unknown', 'WaitForSingleObject', 5))
+        self.assertFalse(any(e['event'] == 'owned_process_exited' for e in events))
+
+    def test_changed_creation_is_refused_before_foreign_image_query(self):
+        code, native, events, members, queries = self.supervise('changed-creation')
+        self.assertEqual(code, 2, events)
+        self.assertNotIn('FOREIGN_IMAGE_QUERY', native.calls)
+        self.assertNotIn('unrelated.exe', json.dumps(events))
+        self.assertNotIn('windows:999', json.dumps(events))
+        self.assertTrue(any(e['event'] == 'membership_identity_gap' for e in events))
+
+    def test_first_seen_metadata_error_even_if_exited_has_no_known_exit_proof(self):
+        for scenario in ('first-seen-exit', 'first-seen-alive'):
+            with self.subTest(scenario=scenario):
+                code, native, events, members, queries = self.supervise(scenario)
+                self.assertEqual(code, 2)
+                self.assertEqual(members, [])
+                gap = next(e for e in events if e['event'] == 'membership_identity_gap')
+                self.assertEqual((gap['api'], gap['winerror']), ('QueryFullProcessImageNameW', 5))
+                self.assertFalse(any(e['event'] == 'owned_process_exited' for e in events))
+                self.assertFalse(any(e['event'] == 'process_observed' for e in events))
+
+    def test_postquery_creation_uncertainty_cannot_authorize_known_exit(self):
+        for case in ('changed', 'failed'):
+            with self.subTest(case=case):
+                native, process = NativeGapRegressions().native()
+                def metadata(*args, **kwargs):
+                    native.mode = 'exited'
+                    raise OSError('PRIVATE_R8_METADATA_ERROR')
+                def identity(handle):
+                    if native.mode == 'alive':
+                        return 'windows:1'
+                    if case == 'failed':
+                        raise OSError('PRIVATE_R8_IDENTITY_ERROR')
+                    return 'windows:999'
+                native.metadata, native.identity = metadata, identity
+                diagnostic = {}
+                with native.owned_process(123, 321, process, diagnostic=diagnostic) as pin:
+                    self.assertIsNone(pin)
+                self.assertFalse(diagnostic.get('verified_exit', False))
+                self.assertEqual(diagnostic['api'], 'QueryFullProcessImageNameW')
+                self.assertEqual(diagnostic['winerror'], 5)
+                self.assertEqual(diagnostic['post_query_state'], 'unknown' if case == 'failed' else 'identity_changed')
+                self.assertNotIn('windows:999', json.dumps(diagnostic))
+                self.assertNotIn('PRIVATE_R8', json.dumps(diagnostic))
+
+    def test_observer_records_error_and_exact_exit_without_attaching(self):
+        from unittest.mock import patch
+        native, process = NativeGapRegressions().native()
+        def metadata(*args, **kwargs):
+            native.calls.append('image_error')
+            native.mode = 'exited'
+            raise OSError('PRIVATE_R8_METADATA_ERROR')
+        native.metadata = metadata
+        with tempfile.TemporaryDirectory(prefix='wfc35-r8-observe-') as directory:
+            root = Path(directory)
+            (root / 'members.json').write_text(json.dumps([process]))
+            rounds = []
+            with patch.object(probe, 'Native', lambda: native),                     patch.object(probe.time, 'sleep', lambda _: rounds.append(True)),                     patch.object(probe, 'stop_reason', lambda *args: 'deadline' if rounds else None):
+                probe.observe(root, 'idle')
+            events = probe.read_events(root)
+            self.assertFalse((root / 'STOP').exists(), events)
+            uncertainty = next(e for e in events if e['event'] == 'metadata_query_uncertain')
+            exited = next(e for e in events if e['event'] == 'owned_process_exited')
+            self.assertLess(events.index(uncertainty), events.index(exited))
+            self.assertEqual(exited['proof'], 'same_handle_signaled_after_metadata_query')
+            self.assertNotIn('PRIVATE_R8', json.dumps(events))
+            self.assertNotIn('console', native.calls)
+            self.assertEqual(native.calls.count('open'), 1)
+            self.assertEqual(native.calls.count(('close', 555)), 1)
+
 
 if __name__ == '__main__':
     unittest.main()

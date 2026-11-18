@@ -228,15 +228,15 @@ class Native:
 
     @contextmanager
     def owned_process(self, job, pid, expected=None, diagnostic=None):
-        """Acquire one live owned object; failures never establish an exit proof."""
+        """Acquire an owned object; recover a metadata error only with exact known exit proof."""
         diagnostic = diagnostic if diagnostic is not None else {}
         handle = self.k.OpenProcess(0x1000 | 0x100000, False, pid)
-        api = 'OpenProcess'
+        api, verified_creation = 'OpenProcess', None
         def refuse(category, operation, winerror=None):
             diagnostic.update(category=category, api=operation, winerror=winerror)
             return None
         def validate():
-            nonlocal api
+            nonlocal api, verified_creation
             if not handle:
                 return refuse('query_failed', api, self.error_code())
             api = 'IsProcessInJob'
@@ -253,6 +253,7 @@ class Native:
             creation = self.identity(handle)
             if expected is not None and creation != expected.get('creation'):
                 return refuse('published_identity_changed', api)
+            verified_creation = creation
             api = 'QueryFullProcessImageNameW'
             process = self.metadata(handle, pid, creation=creation)
             if expected is not None and process != expected:
@@ -267,6 +268,24 @@ class Native:
                 pin = validate()
             except OSError:
                 pin = refuse('query_failed', api, self.error_code())
+                if api == 'QueryFullProcessImageNameW':
+                    # Preserve the image-query error before any subsequent native call.
+                    state, detail = self.liveness(handle)
+                    diagnostic.update(post_query_state=state, post_query_api=detail.get('api'),
+                                      post_query_winerror=detail.get('winerror'))
+                    if (state == 'exited' and expected is not None
+                            and verified_creation == expected.get('creation')):
+                        try:
+                            same_creation = self.identity(handle) == verified_creation
+                        except OSError:
+                            diagnostic.update(post_query_state='unknown', post_query_api='GetProcessTimes',
+                                              post_query_winerror=self.error_code())
+                        else:
+                            if same_creation:
+                                diagnostic['verified_exit'] = True
+                                pin = handle, dict(expected)
+                            else:
+                                diagnostic.update(post_query_state='identity_changed', post_query_api='GetProcessTimes')
             yield pin
         finally:
             if handle:
@@ -440,6 +459,15 @@ def owned_exit(process):
                 proof='retained_handle_signaled', api='WaitForSingleObject')
 
 
+def metadata_exit_samples(pin, diagnostic):
+    process = pin[1]
+    uncertainty = dict(event='metadata_query_uncertain', candidate_pid=process['pid'],
+                       **{k: v for k, v in diagnostic.items() if k != 'verified_exit'})
+    exited = owned_exit(process)
+    exited['proof'] = 'same_handle_signaled_after_metadata_query'
+    return [uncertainty, exited]
+
+
 def observer_pin(native, job, process, retained, cache):
     pid, diagnostic = process['pid'], {}
     if pid in cache:
@@ -454,6 +482,8 @@ def observer_pin(native, job, process, retained, cache):
             return 'unknown', None, diagnostic
         retained.enter_context(acquired.pop_all())
     cache[pid] = pin
+    if diagnostic.get('verified_exit'):
+        return 'metadata_exit', pin, diagnostic
     return 'alive', pin, {}
 
 
@@ -486,7 +516,9 @@ def observe(root, stage):
             try:
                 for process in candidates:
                     state, pin, diagnostic = observer_pin(native, job, process, retained, cache)
-                    if state == 'exited':
+                    if state == 'metadata_exit':
+                        samples.extend(metadata_exit_samples(pin, diagnostic))
+                    elif state == 'exited':
                         samples.append(owned_exit(pin[1]))
                     elif state == 'unknown':
                         emit(root, 'membership_identity_gap', stage=stage, observer=True,
@@ -722,12 +754,18 @@ def supervise(args):
                 owned, gap = {}, False
                 for pid in native.members(job):
                     diagnostic = {}
-                    pin = handles.enter_context(native.owned_process(job, pid, diagnostic=diagnostic))
+                    pin = handles.enter_context(native.owned_process(job, pid, known.get(pid), diagnostic=diagnostic))
                     if pin is None:
                         known_pid = dict(candidate_pid=pid) if pid in known else {}
                         emit(root, 'membership_identity_gap', stage=args.stage, observer=False,
                              **diagnostic, **known_pid)
                         gap = True
+                    elif diagnostic.get('verified_exit'):
+                        # Only this same-handle, previously published object is skipped.
+                        # Its API error remains evidence; it is not retroactive proof of cause.
+                        for sample in metadata_exit_samples(pin, diagnostic):
+                            event = sample.pop('event')
+                            emit(root, event, stage=args.stage, observer=False, **sample)
                     else:
                         owned[pid] = pin[1]
                 temporary = root / 'members.next'
