@@ -20,7 +20,7 @@ class WindowsDistribution(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             app = directory / 'wfc.pyz'
             with zipfile.ZipFile(app) as archive:
-                for module in ('wfc.py', 'router.py', 'host_launch.py', 'wfc_platform.py', 'herdr_backend.py'):
+                for module in ('wfc.py', 'router.py', 'host_launch.py', 'wfc_platform.py', 'herdr_backend.py', 'bundled_backend.py', 'bundled_runtime.py'):
                     self.assertEqual(archive.read(module), (ROOT / module).read_bytes())
             env = {**os.environ, 'WFC_STATE': str(Path(tmp) / 'state'), 'PYTHONUTF8': '1'}
             native = subprocess.run([sys.executable, str(app), '--version'], env=env, capture_output=True)

@@ -1,0 +1,70 @@
+name: Bundled kernel experimental lifecycle
+on:
+  push:
+    branches: [experiment/kernel-core-win-preflight]
+permissions:
+  contents: read
+jobs:
+  native-windows:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - name: Preserve pinned Git source bytes
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: herdrdev/herdr
+          ref: ee5bfb5041bb3e4a49d591c72308aae3c81ecdde
+          path: upstream
+          persist-credentials: false
+      - uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943
+        with:
+          version: 0.16.0
+      - name: Build pinned standalone kernel
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.96.1 --profile minimal
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python experiments/herdr-kernel-prototype/prepare.py --source upstream --scratch prepared
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo +1.96.1 build --manifest-path prepared/Cargo.toml --release --locked
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $trial = New-Item -ItemType Directory "$env:RUNNER_TEMP/Bundled Kernel with spaces"
+          Copy-Item prepared/target/release/herdr-kernel-prototype.exe "$trial/wfc-kernel.exe"
+          "WFC_BUNDLED_TEST_KERNEL=$trial/wfc-kernel.exe" >> $env:GITHUB_ENV
+      - name: Real standalone CLI lifecycle and Job cleanup
+        run: python -m unittest discover -s tests -p test_bundled.py -v
+      - name: Relocated zipapp and companion discovery
+        shell: pwsh
+        run: |
+          python build.py --windows-dir 'dist/relocated payload with spaces'
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Copy-Item $env:WFC_BUNDLED_TEST_KERNEL 'dist/relocated payload with spaces/wfc-kernel.exe'
+          $env:WFC_BUNDLED_TEST_KERNEL = (Resolve-Path 'dist/relocated payload with spaces/wfc-kernel.exe').Path
+          $env:WFC_BUNDLED_TEST_DISCOVERY = '1'
+          $env:WFC_TEST_PROGRAM = (Resolve-Path 'dist/relocated payload with spaces/wfc.pyz').Path
+          python -m unittest discover -s tests -p test_bundled.py -v
+      - name: Preserve build provenance for controller integration
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force evidence | Out-Null
+          git rev-parse HEAD | Set-Content evidence/COMMIT.txt
+          if (Test-Path prepared/extraction.json) { Copy-Item prepared/extraction.json evidence/ }
+          if (Test-Path prepared/target/release/herdr-kernel-prototype.exe) {
+            Get-FileHash prepared/target/release/herdr-kernel-prototype.exe -Algorithm SHA256 | Format-List | Out-File evidence/kernel-sha256.txt
+          }
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: bundled-lifecycle-evidence-${{ github.sha }}
+          path: evidence/

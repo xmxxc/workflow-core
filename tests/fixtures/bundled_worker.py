@@ -1,0 +1,81 @@
+"""Account-free PTY worker for standalone WFC lifecycle acceptance."""
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import time
+
+PROGRAM = os.environ['WFC_TEST_PROGRAM']
+REPORT = Path(os.environ['WFC_TEST_REPORT'])
+ATTEMPT = re.search(r'a-[0-9a-f]{12}', ' '.join(sys.argv)).group()
+MODE = os.environ.get('WFC_TEST_MODE', '')
+EVIDENCE = Path(os.environ['WFC_TEST_EVIDENCE'])
+
+# Emit a controlled host transcript in the fixture's isolated CODEX_HOME. This
+# lets the real router discover a conversation and enforce its normal resume path.
+sessions = Path(os.environ['CODEX_HOME']) / 'sessions'
+sessions.mkdir(parents=True, exist_ok=True)
+record = sessions / ('rollout-controlled-' + os.environ['WFC_DISPATCH'] + '.jsonl')
+if not record.exists():
+    import uuid
+    record.write_text(json.dumps({'type': 'session_meta', 'payload': {'id': str(uuid.uuid4()), 'source': 'cli'}}) + '\n'
+                      + json.dumps({'type': 'response_item', 'payload': {'type': 'message', 'role': 'user',
+                          'content': [{'type': 'input_text', 'text': sys.argv[-1]}]}}) + '\n', encoding='utf-8')
+
+def callback(*args):
+    result = subprocess.run([sys.executable, PROGRAM, *args, '--attempt', ATTEMPT],
+                            capture_output=True, text=True, encoding='utf-8', timeout=15)
+    if result.returncode:
+        print('CALLBACK_ERROR ' + result.stderr, flush=True)
+        return None
+    return json.loads(result.stdout)
+
+
+def descendant():
+    # The pid file is only test cleanup evidence, never backend ownership authority.
+    source = str(Path(__file__).resolve().parents[2])
+    code = ('import os,signal,time,json,sys; sys.path.insert(0,' + repr(source) + '); import wfc_platform; '
+            'signal.signal(signal.SIGHUP, signal.SIG_IGN) if hasattr(signal,"SIGHUP") else None; '
+            'signal.signal(signal.SIGINT, signal.SIG_IGN); '
+            'open(os.environ["WFC_TEST_EVIDENCE"],"w").write(json.dumps({"pid":os.getpid(),"creation":wfc_platform.process_identity(os.getpid())})); time.sleep(120)')
+    child = subprocess.Popen([sys.executable, '-c', code], start_new_session=(os.name != 'nt'))
+    deadline = time.monotonic() + 5
+    while not EVIDENCE.exists() and time.monotonic() < deadline:
+        time.sleep(.02)
+    return child
+
+signal.signal(signal.SIGINT, lambda *_: print('CTRL_C_HANDLED', flush=True))
+if os.name != 'nt':
+    import tty
+    tty.setraw(0)
+print('READY ' + json.dumps({'pid': os.getpid(), 'tty': [os.isatty(0), os.isatty(1)]}), flush=True)
+print('wrong\rRIGHT\x1b[K', flush=True)
+if MODE in ('tree', 'parent-exit'):
+    descendant()
+    if MODE == 'parent-exit':
+        raise SystemExit(0)
+question = callback('ask', 'controlled question', '--options', 'yes,no')
+print('QUESTION ' + json.dumps(question), flush=True)
+buffer = ''
+while True:
+    raw = os.read(0, 4096)
+    if not raw:
+        break
+    buffer += raw.decode('utf-8', 'replace')
+    while '\r' in buffer or '\n' in buffer:
+        match = re.search(r'[\r\n]', buffer)
+        text, buffer = buffer[:match.start()], buffer[match.end():]
+        text = text.replace('\x1b[200~', '').replace('\x1b[201~', '')
+        if 'Answer to question' in text:
+            print('ANSWER_RECEIVED', flush=True)
+            # Marker proves that dropping a response never replays applied input.
+            with open(str(EVIDENCE) + '.applied', 'a', encoding='utf-8') as target:
+                target.write('once\n')
+            REPORT.write_text('controlled bundled worker completed\n', encoding='utf-8')
+            done = callback('done', '--report', str(REPORT), '--message-id', 'controlled:' + ATTEMPT)
+            print('DONE ' + json.dumps(done), flush=True)
+        elif 'Message from the controller' in text:
+            print('NUDGE_RECEIVED', flush=True)
