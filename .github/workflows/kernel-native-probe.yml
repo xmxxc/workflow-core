@@ -30,9 +30,42 @@ jobs:
           python experiments/herdr-kernel-prototype/prepare.py --source upstream --scratch prepared
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo +1.96.1 build --manifest-path prepared/Cargo.toml --release --locked
-      - name: Test copied executable from a separate directory
+      - uses: actions/checkout@v4
+        with:
+          ref: 13c09c9fbf21fdb0d46141dfd01daafb8165fe20
+          path: wfc-rc4
+          persist-credentials: false
+      - name: Probe independently extracted baseline bundle
         shell: pwsh
         run: |
-          $trial = New-Item -ItemType Directory "$env:RUNNER_TEMP/Extracted Kernel"
-          Copy-Item prepared/target/release/herdr-kernel-prototype.exe "$trial/wfc-pty.exe"
-          python experiments/herdr-kernel-prototype/native_probe.py "$trial/wfc-pty.exe"
+          python wfc-rc4/build.py --windows-dir baseline
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Copy-Item prepared/target/release/herdr-kernel-prototype.exe baseline/wfc-pty.exe
+          Copy-Item experiments/herdr-kernel-prototype/native_probe.py baseline/
+          Copy-Item prepared/extraction.json baseline/
+          foreach ($notice in (Get-Content -Raw experiments/herdr-kernel-prototype/artifacts/licenses.json | ConvertFrom-Json)) {
+            $path = Join-Path 'prepared' $notice.path
+            if ((Get-FileHash $path).Hash.ToLowerInvariant() -ne $notice.sha256) { throw "Notice mismatch: $path" }
+            $dest = Join-Path 'baseline/notices' $notice.path
+            New-Item -ItemType Directory -Force (Split-Path $dest) | Out-Null
+            Copy-Item $path $dest
+          }
+          Compress-Archive -LiteralPath baseline -DestinationPath baseline.zip
+          $trial = Join-Path $env:RUNNER_TEMP 'Extracted Kernel'
+          Expand-Archive baseline.zip $trial
+          Push-Location "$trial/baseline"
+          try {
+            ./wfc.cmd --version
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            python native_probe.py wfc-pty.exe
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          } finally { Pop-Location }
+          (Get-FileHash baseline.zip).Hash.ToLowerInvariant() + '  baseline.zip' | Set-Content -Encoding ascii SHA256SUMS
+          Get-Content SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: internal-native-kernel-probe
+          retention-days: 5
+          path: |
+            baseline.zip
+            SHA256SUMS
