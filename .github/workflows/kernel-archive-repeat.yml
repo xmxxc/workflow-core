@@ -1,0 +1,57 @@
+name: Retest extracted candidate close ordering
+on:
+  push:
+    branches: [experiment/kernel-close-package-verify]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  repeat:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    env:
+      PYTHONUTF8: '1'
+      CANDIDATE: b802a4c0dda83e4956f04c949d37b20fb76603e4
+      ORIGIN_RUN: '44356510933'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: b802a4c0dda83e4956f04c949d37b20fb76603e4
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - name: Verify fixed build and repeat three close orderings
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $dest = Join-Path $env:RUNNER_TEMP 'Release Candidate'
+          New-Item -ItemType Directory -Path evidence | Out-Null
+          gh run download $env:ORIGIN_RUN --repo $env:GITHUB_REPOSITORY --name "internal-bundled-experiment-$env:CANDIDATE" --dir download
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $archive = Get-Item "download/wfc-kernel-experiment-$env:CANDIDATE-windows-x64.zip"
+          $sha = (Get-FileHash $archive).Hash.ToLowerInvariant()
+          if ((Get-Content download/SHA256SUMS).Split(' ')[0] -ne $sha) { throw 'Archive checksum mismatch' }
+          Expand-Archive $archive $dest
+          $wfc = (Get-ChildItem $dest -Recurse -Filter wfc.pyz -File).FullName
+          $bundle = Split-Path $wfc -Parent
+          python tools/package_bundled_experiment.py verify --directory $bundle --commit $env:CANDIDATE
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $env:WFC_BUNDLED_TEST_KERNEL = Join-Path $bundle 'wfc-kernel.exe'
+          python tools/probe_bundled_close.py --attempts 12 --out evidence/source.json
+          $sourceExit = $LASTEXITCODE
+          $env:WFC_TEST_PROGRAM = $wfc
+          $env:WFC_BUNDLED_TEST_DISCOVERY = '1'
+          python tools/probe_bundled_close.py --attempts 12 --out evidence/packaged.json
+          $packagedExit = $LASTEXITCODE
+          @{sourceExit=$sourceExit; packagedExit=$packagedExit; sha256=$sha; commit=$env:CANDIDATE} | ConvertTo-Json | Set-Content evidence/result.json
+          if ($sourceExit -or $packagedExit) { exit 1 }
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-close-ordering
+          path: evidence/
+          retention-days: 7
