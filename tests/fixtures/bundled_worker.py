@@ -74,32 +74,33 @@ if MODE == 'pressure':
         os.write(1, chunk)
     print('PRESSURE_FINISHED', flush=True)
     Path(str(EVIDENCE) + '.pressure-written').write_text(str(len(chunk) * 2048))
-buffer = ''
-while True:
-    raw = os.read(0, 4096)
-    if not raw:
-        break
-    buffer += raw.decode('utf-8', 'replace')
-    while '\r' in buffer or '\n' in buffer:
-        match = re.search(r'[\r\n]', buffer)
-        text, buffer = buffer[:match.start()], buffer[match.end():]
-        text = text.replace('\x1b[200~', '').replace('\x1b[201~', '')
-        if 'pressure-input:' in text:
-            import hashlib
-            payload = text.split('pressure-input:', 1)[1]
-            Path(str(EVIDENCE) + '.pressure-input').write_text(hashlib.sha256(payload.encode()).hexdigest())
-        elif 'Answer to question' in text:
-            print('ANSWER_RECEIVED', flush=True)
-            # Marker proves that dropping a response never replays applied input.
-            with open(str(EVIDENCE) + '.applied', 'a', encoding='utf-8') as target:
-                target.write('once\n')
-            with open(str(EVIDENCE) + '.input.jsonl', 'a', encoding='utf-8') as target:
-                target.write(json.dumps(text) + '\n')
-            if MODE != 'record-only':
-                REPORT.write_text('controlled bundled worker completed\n', encoding='utf-8')
-                done = callback('done', '--report', str(REPORT), '--message-id', 'controlled:' + ATTEMPT)
-                print('DONE ' + json.dumps(done), flush=True)
-        elif 'Message from the controller' in text:
-            print('NUDGE_RECEIVED', flush=True)
-        elif '[router] New task for you' in text and MODE == 'record-only':
-            Path(str(EVIDENCE) + '.continued').write_text(text, encoding='utf-8')
+# Windows CRT fd reads can replace console Unicode with the active OEM codepage.
+# Python's console text stream uses the wide console API without changing that codepage.
+if os.name == 'nt':
+    lines = sys.stdin
+else:
+    from bundled_input import read_utf8_lines
+    lines = read_utf8_lines(lambda: os.read(0, 4096))
+for text in lines:
+    text = text.rstrip('\r\n').replace('\x1b[200~', '').replace('\x1b[201~', '')
+    if 'pressure-input:' in text:
+        import hashlib
+        payload = text.split('pressure-input:', 1)[1]
+        Path(str(EVIDENCE) + '.pressure-input').write_text(hashlib.sha256(payload.encode()).hexdigest())
+    elif 'Answer to question' in text:
+        print('ANSWER_RECEIVED', flush=True)
+        if '复验路径-中文-42 Ω😀' in text:
+            print('UNICODE_RECEIVED:复验路径-中文-42 Ω😀', flush=True)
+        # Marker proves that dropping a response never replays applied input.
+        with open(str(EVIDENCE) + '.applied', 'a', encoding='utf-8') as target:
+            target.write('once\n')
+        with open(str(EVIDENCE) + '.input.jsonl', 'a', encoding='utf-8') as target:
+            target.write(json.dumps(text) + '\n')
+        if MODE != 'record-only':
+            REPORT.write_text('controlled bundled worker completed\n', encoding='utf-8')
+            done = callback('done', '--report', str(REPORT), '--message-id', 'controlled:' + ATTEMPT)
+            print('DONE ' + json.dumps(done), flush=True)
+    elif 'Message from the controller' in text:
+        print('NUDGE_RECEIVED', flush=True)
+    elif '[router] New task for you' in text and MODE == 'record-only':
+        Path(str(EVIDENCE) + '.continued').write_text(text, encoding='utf-8')

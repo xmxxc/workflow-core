@@ -198,7 +198,7 @@ class BundledNative(unittest.TestCase):
         self.env['WFC_DISPATCH'] = dispatch
         self.report.write_text('controlled completed round', encoding='utf-8')
         self.cli('done', '--report', str(self.report), '--attempt', value['attempt'])
-        task, report = self.root / 'next task.md', self.root / 'next report.md'
+        task, report = self.root / 'next task 复验路径-中文-42.md', self.root / 'next report.md'
         task.write_text('controlled next round', encoding='utf-8')
         continued = self.cli('continue', dispatch, '--task', str(task), '--report', str(report))
         self.assertEqual(continued['continued'], dispatch)
@@ -207,14 +207,22 @@ class BundledNative(unittest.TestCase):
         status = self.status(dispatch)
         self.assertEqual(status['round'], 2)
         self.assertNotEqual(status['attempt'], value['attempt'])
-        self.assertIn(str(task), marker.read_text(encoding='utf-8'))
+        self.assertIn(str(task.resolve()), marker.read_text(encoding='utf-8'))
         self.assertIn(status['attempt'], marker.read_text(encoding='utf-8'))
         second = self.handle(dispatch)
         self.assertEqual((second['generation'], second['service'], second['kernel']),
                          (handle['generation'], handle['service'], handle['kernel']))
         question = self.cli('ask', 'controlled next-round question', '--attempt', status['attempt'])
-        self.cli('reply', str(question['message']), 'new round answer')
+        self.cli('reply', str(question['message']), '复验路径-中文-42 Ω😀')
         self.until(lambda: applied.read_text() == 'once\nonce\n')
+        recorded = [json.loads(line) for line in Path(str(self.evidence) + '.input.jsonl').read_text(encoding='utf-8').splitlines()]
+        self.assertEqual(recorded[-1], f"[router] Answer to question {question['message']}: 复验路径-中文-42 Ω😀")
+        import bundled_runtime
+        self.until(lambda: 'UNICODE_RECEIVED:复验路径-中文-42 Ω😀' in
+                   bundled_runtime.call(handle, 'read').get('data', {}).get('text', ''))
+        print('UNICODE_ROUNDTRIP ' + json.dumps({'marker': '复验路径-中文-42 Ω😀',
+              'utf8': '复验路径-中文-42 Ω😀'.encode('utf-8').hex(),
+              'canonicalTaskExact': True, 'receivedReplyExact': True, 'terminalOutputExact': True}), flush=True)
         replies = [m for m in self.status(dispatch)['messages'] if m['type'] == 'reply']
         self.assertEqual(len(replies), 2)
         self.assertEqual(self.cli('close', dispatch)['result'], 'completed')
