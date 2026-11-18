@@ -176,15 +176,35 @@ class HerdrContract(unittest.TestCase):
                                 'runtime': [sys.executable, '-u']}}}), encoding='utf-8')
 
     def stop_server(self):
-        if self.server.poll() is None:
-            if os.name == 'nt':
-                # This Popen is the isolated test-owned service. Kill its test process tree
-                # so crash/restart coverage cannot leave a child holding server.log open.
-                subprocess.run(['taskkill', '/PID', str(self.server.pid), '/T', '/F'],
-                               capture_output=True, timeout=10, check=True)
+        evidence = {'pid': self.server.pid, 'poll_before': self.server.poll(),
+                    'taskkill': None, 'reaped_returncode': None}
+        try:
+            if evidence['poll_before'] is None:
+                if os.name == 'nt':
+                    # This Popen owns the isolated service; retain tree cleanup and its diagnostics.
+                    command = ['taskkill', '/PID', str(self.server.pid), '/T', '/F']
+                    try:
+                        result = subprocess.run(command, capture_output=True, timeout=10, check=True)
+                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                        evidence['taskkill'] = {'command': command, 'returncode': getattr(error, 'returncode', None),
+                                                'stdout': repr(error.output), 'stderr': repr(error.stderr),
+                                                'timed_out': isinstance(error, subprocess.TimeoutExpired)}
+                        try:
+                            evidence['reaped_returncode'] = self.server.wait(timeout=0)
+                        except subprocess.TimeoutExpired:
+                            evidence['wait_timed_out'] = True
+                        # Root exit alone cannot prove that /T cleaned all descendants.
+                        # Keep the failure until native evidence establishes a benign case.
+                        raise AssertionError('Herdr fixture tree cleanup unconfirmed: ' + json.dumps(evidence)) from error
+                    evidence['taskkill'] = {'command': command, 'returncode': result.returncode,
+                                            'stdout': repr(result.stdout), 'stderr': repr(result.stderr)}
+                else:
+                    self.server.terminate()
+                evidence['reaped_returncode'] = self.server.wait(timeout=10)
             else:
-                self.server.terminate()
-            self.server.wait(timeout=10)
+                evidence['reaped_returncode'] = self.server.wait(timeout=0)
+        finally:
+            print('[herdr-fixture-stop] ' + json.dumps(evidence), file=sys.stderr)
 
     def cli(self, *args):
         result = subprocess.run([sys.executable, str(PROGRAM), *args], env=self.env,
