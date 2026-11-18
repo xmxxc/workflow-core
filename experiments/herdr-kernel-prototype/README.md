@@ -229,3 +229,25 @@ libc/libgcc; its sibling generated Ghostty shared object is not required.
 
 The measured conclusion, acceptance mapping and dependent work are in
 `docs/research/herdr-kernel-prototype-evidence.md`.
+
+### Linux co-distribution trial with WFC rc.4
+
+From this experiment directory, after the locked release build described above,
+run `python3 bundle_linux.py PREPARED_TREE /path/to/wfc.pyz trial.tar.gz`.
+Extract the archive in a fresh directory and run
+`python3 wfc-kernel-trial/smoke.py`. The smoke uses the adjacent kernel and
+zipapp. It injects the test backend into one router process, uses a controlled
+Python worker, verifies its real WFC done callback and removes its temporary state.
+The standard CLI has no kernel backend registration. Separate CLI invocations
+would require a reconnectable service with persisted ownership.
+
+On 2026-11-18, Linux x86_64, the rc.4 zipapp and the locked offline kernel
+built from the PR #27 prototype passed after extraction with a fresh HOME,
+a PATH containing only python3, and no Herdr endpoint. Dispatch d-876874e7
+completed, including Unicode input, interrupt, done receipt and normal close.
+The kernel was 2,811,480 bytes, and the trial archive was 1,330,783 bytes.
+The kernel SHA-256 was ead8b312c079324d28ecb6cb4586b3548cfd378e42a6120c97d7496e27fabe3c.
+The package includes extraction provenance and the inventoried source notices.
+Third-party distribution notices require a complete dependency audit before
+publication. Windows ConPTY, crash cleanup, cross-process CLI access and
+real agent callbacks remain outside this smoke.
