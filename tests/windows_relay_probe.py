@@ -55,7 +55,14 @@ class Relay(BundledNative):
         self.assertEqual(self.cli('ack',question['messageId'])['state'],'processed')
         done, w2 = self.until(lambda: delivered('done'))
         self.assertEqual(self.report.read_text().strip(),'controlled bundled worker completed')
-        self.assertEqual(self.cli('ack',done['messageId'])['state'],'processed')
+        ack = self.cli('ack', done['messageId'])
+        self.assertEqual(ack['state'], 'processed')
+        conflict = self.cli('ack', done['messageId'], '--body', 'different test body', success=False)
+        self.assertNotEqual(conflict.returncode, 0)
+        self.assertIn('conflict', conflict.stderr.lower())
+        duplicate = self.cli('ack', done['messageId'])
+        self.assertTrue(duplicate['duplicate'])
+        self.assertEqual(duplicate['statusVersion'], ack['statusVersion'])
         self.assertEqual(self.cli('close',d)['result'],'completed')
         self.until(lambda: wfc_platform.process_identity(relay['pid']) != creation, timeout=25)
         self.assertFalse(any(w['pid'] == relay['pid'] for w in self.cli('status')['waiters']))
@@ -64,7 +71,7 @@ class Relay(BundledNative):
         self.assertEqual(self.cli('close', sibling['dispatch'])['result'], 'completed')
         self.assertEqual(len(list(capture.glob('*.received'))),2)
         print(json.dumps(dict(scope=value['scope'],attempt=attempt,queueConsoleHWND=[w1,w2],
-                              ack='processed',queueCalls=2,relayExited=True,siblingQuestion='unsent',registeredIdentity=creation)), flush=True)
+                              ack='processed',queueCalls=2,conflictingAckRejected=True,relayExited=True,siblingQuestion='unsent',registeredIdentity=creation)), flush=True)
         self.assertEqual([w1,w2],[0,0], 'queue helper acquired a console')
 
 
