@@ -35,7 +35,7 @@ jobs:
           $env:WFC_TEST_PROGRAM = "$root/wfc/wfc.pyz"
           $env:WFC_BUNDLED_TEST_KERNEL = "$root/wfc/wfc-kernel.exe"
           $env:WFC_BUNDLED_TEST_DISCOVERY = '1'
-          & "$env:WINDIR/Microsoft.NET/Framework64/v4.0.30319/csc.exe" /nologo /target:exe /out:$env:RUNNER_TEMP/codex.exe tests/fixtures/queue_probe.cs
+          & "$env:WINDIR/Microsoft.NET/Framework64/v4.0.30319/csc.exe" /nologo /target:exe /out:$env:RUNNER_TEMP/codex.exe (Resolve-Path tests/fixtures/queue_probe.cs).Path
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $env:PATH = "$env:RUNNER_TEMP;$env:PATH"
           python tests/windows_relay_probe.py
