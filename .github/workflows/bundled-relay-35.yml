@@ -10,7 +10,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 6
     env:
-      CANDIDATE: 95ef40f57387393be60def7f9289c5ed9e563b1b
+      CANDIDATE: 37e74bbe87a6d02aec08f1b4bd9c0d03fa3e422c
       PYTHONUTF8: '1'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -20,13 +20,13 @@ jobs:
       - name: Download published experimental ZIP
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release download kernel-experiment-20261118.2 --dir artifact
+        run: gh run download 44525271523 --name internal-bundled-experiment-37e74bbe87a6d02aec08f1b4bd9c0d03fa3e422c --dir artifact
       - name: Verify candidate and exercise detached relay
         run: |
           $archive = Get-Item "artifact/wfc-kernel-experiment-$env:CANDIDATE-windows-x64.zip"
           $digest = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($digest -ne (Get-Content artifact/SHA256SUMS).Split(' ')[0]) { throw 'ZIP digest mismatch' }
-          if ($digest -ne '0c137a333e77b33ab23ccf9606b4609fb5425f4a16644bc9337a08a9af05e2ae') { throw 'Published ZIP identity mismatch' }
+          if ($digest -ne 'eca5f407f2bf799e43ca4f6df271e03b1f4ccc648f76fc0cee5571d7ff41baf0') { throw 'Published ZIP identity mismatch' }
           Write-Output "ZIP SHA-256 $digest"
           $root = "$env:RUNNER_TEMP/Relocated Candidate"
           Expand-Archive -LiteralPath $archive.FullName -DestinationPath $root
@@ -38,4 +38,4 @@ jobs:
           & "$env:WINDIR/Microsoft.NET/Framework64/v4.0.30319/csc.exe" /nologo /target:exe /out:$env:RUNNER_TEMP/codex.exe (Resolve-Path tests/fixtures/queue_probe.cs).Path
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $env:PATH = "$env:RUNNER_TEMP;$env:PATH"
-          python tests/relay_console_ab.py
+          python tests/windows_relay_probe.py
