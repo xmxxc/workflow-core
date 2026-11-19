@@ -30,6 +30,24 @@ import wfc_platform
 
 
 class WindowsRecovery(BundledNative):
+    def cli(self, *args, success=True):
+        proc = super().cli(*args, success=False)
+        try:
+            data = json.loads(proc.stdout)
+        except ValueError:
+            data = {}
+        summary = {k: data[k] for k in ('result', 'backendAlive', 'duplicate', 'inputReplayed', 'cleanupReceipt') if k in data}
+        for row in data.get('dispatches', []):
+            summary.update(dispatch=row['dispatch'], attempt=row['attempt'], backendAlive=row['backendAlive'],
+                           audits=[{k: a.get(k) for k in ('id', 'operation', 'attempt', 'result')} for a in row['audit']],
+                           messages=[{k: m.get(k) for k in ('type', 'state')} for m in row['messages']])
+        print(json.dumps(dict(command=args[0], exit=proc.returncode, observed=summary,
+                              reconcileRequired='lifecycle_reconcile_required' in proc.stderr)), flush=True)
+        if not success:
+            return proc
+        self.assertIn(proc.returncode, (0, 3), proc.stderr)
+        return data
+
     def test_recovery(self):
         self.config('record-only')
         marker = self.root / 'paused'
@@ -77,6 +95,7 @@ class WindowsRecovery(BundledNative):
         self.assertEqual(self.cli('close', dispatch)['result'], 'completed')
         after = self.status(dispatch)
         self.assertFalse(after['backendAlive'])
+        self.assertEqual(sum(a['operation'] == 'create' for a in after['audit']), 1)
         self.assertEqual(after['attempt'], create['attempt'])
         self.assertEqual(next(a for a in after['audit'] if a['id'] == create['id'])['result'], 'unknown')
         self.assertFalse(any(m['type'] in ('done', 'reply') for m in after['messages']))
@@ -86,4 +105,18 @@ class WindowsRecovery(BundledNative):
 
 
 if __name__ == '__main__':
+    if '--child' not in sys.argv:
+        job = runtime.WindowsContainment()
+        try:
+            with subprocess.Popen([sys.executable, __file__, '--child'], stdin=subprocess.PIPE) as proc:
+                try:
+                    job.attach(proc.pid)
+                    proc.communicate(b'1', timeout=120)
+                finally:
+                    job.stop(lambda phase, **fields: print(json.dumps(dict(phase=phase, **fields)), flush=True))
+        finally:
+            job.dispose()
+        sys.exit(proc.returncode)
+    if sys.stdin.buffer.read(1) != b'1':
+        sys.exit('outer containment required')
     unittest.main(argv=[sys.argv[0], 'WindowsRecovery.test_recovery'], verbosity=2)
