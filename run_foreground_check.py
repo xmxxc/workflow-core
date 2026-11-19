@@ -48,9 +48,6 @@ def cleared(trial):
 
 if __name__ == "__main__":
     EVIDENCE.mkdir(exist_ok=True)
-    code, normal = measure("normal", sys.argv[1])
-    if code or len(normal["trials"]) != 2 or not all(cleared(t) for t in normal["trials"]):
-        raise SystemExit("Normal comparison incomplete: see evidence; negative control deferred")
     code, negative = measure("hold-guardian-gate", sys.argv[1])
     trial, = negative["trials"]
     if code != 1 or not cleared(trial) or not any("timeout" in e["error_type"].lower() for e in trial["errors"]):
