@@ -223,6 +223,35 @@ class MessageRoundTrip(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("conflicts", result.stderr)
 
+    def test_ack_body_must_match_even_after_processing(self):
+        dispatch = self.env.dispatch()
+        self.env.json("ask", "Ready?", dispatch=dispatch)
+        [question] = self.env.json("wait", "--timeout", "2")["messages"]
+        ack = ("ack", question["messageId"])
+        body = json.dumps({key: question[key] for key in ("question", "options", "scope", "role", "round", "attempt")},
+                          sort_keys=True, ensure_ascii=False)
+
+        def assert_body_conflict(*args):
+            rejected = self.env.run(*ack, "--body", "{}", *args)
+            self.assertNotEqual(rejected.returncode, 0, rejected.stdout)
+            self.assertIn("ACK conflicts with its body", rejected.stderr)
+
+        assert_body_conflict()
+        first = self.env.json(*ack, "--body", body)
+        self.assertEqual((first["state"], first["statusVersion"], first["duplicate"]), ("processed", 3, False))
+        owner = self.env.json("owner", "acquire", "--scope", question["scope"])
+        fenced = self.env.run(*ack, "--body", "{}", "--owner-token", "wrong-token")
+        self.assertNotEqual(fenced.returncode, 0)
+        self.assertEqual(json.loads(fenced.stderr)["error"], "stale_controller_owner")
+
+        token = ("--owner-token", owner["token"])
+        assert_body_conflict(*token)
+        for args in (("--body", body), ()):
+            self.assertEqual(self.env.json(*ack, *token, *args), {**first, "duplicate": True})
+        [stored] = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]["messages"]
+        self.assertEqual((stored["messageId"], stored["state"], stored["statusVersion"], stored["delivered"]),
+                         (question["messageId"], "processed", 3, True))
+
     def test_ack_before_receive_is_rejected_and_does_not_regress(self):
         dispatch = self.env.dispatch()
         self.env.report.write_text("# report\n")

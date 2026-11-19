@@ -1146,11 +1146,7 @@ def cmd_ack(args):
         raise SystemExit(f"no controller message with id {args.message}")
     scope = db.execute("SELECT scope FROM dispatch WHERE id = ?", (row["dispatch"],)).fetchone()["scope"]
     require_owner(db, scope, owner_token(args), "ack")
-    if row["state"] == "processed":
-        db.execute("ROLLBACK")
-        emit({**receipt_response(db, row["id"], duplicate=True)})
-        return
-    if row["state"] != "received":
+    if row["state"] not in ("received", "processed"):
         db.execute("ROLLBACK")
         raise SystemExit(f"message {args.message} is {row['state']}; ACK requires received")
     if args.body is not None:
@@ -1158,6 +1154,10 @@ def cmd_ack(args):
         if digest != row["body_hash"]:
             db.execute("ROLLBACK")
             raise SystemExit(f"message {args.message} ACK conflicts with its body")
+    if row["state"] == "processed":
+        db.execute("ROLLBACK")
+        emit({**receipt_response(db, row["id"], duplicate=True)})
+        return
     db.execute("UPDATE message SET state = 'processed', status_version = status_version + 1 WHERE id = ?",
                (row["id"],))
     db.execute("COMMIT")
