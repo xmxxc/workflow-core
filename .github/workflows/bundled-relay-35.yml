@@ -38,4 +38,4 @@ jobs:
           & "$env:WINDIR/Microsoft.NET/Framework64/v4.0.30319/csc.exe" /nologo /target:exe /out:$env:RUNNER_TEMP/codex.exe (Resolve-Path tests/fixtures/queue_probe.cs).Path
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $env:PATH = "$env:RUNNER_TEMP;$env:PATH"
-          python tests/windows_relay_probe.py
+          python tests/relay_console_ab.py
