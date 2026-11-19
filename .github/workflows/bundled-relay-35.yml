@@ -20,13 +20,13 @@ jobs:
       - name: Download published experimental ZIP
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh run download 44528035283 --name internal-bundled-experiment-a95248a431e30730b4d943a2b34c2ff6e90c6449 --dir artifact
+        run: gh release download kernel-experiment-20261118.3 --dir artifact
       - name: Verify candidate and exercise detached relay
         run: |
           $archive = Get-Item "artifact/wfc-kernel-experiment-$env:CANDIDATE-windows-x64.zip"
           $digest = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($digest -ne (Get-Content artifact/SHA256SUMS).Split(' ')[0]) { throw 'ZIP digest mismatch' }
-          if ($digest -ne '9631e1598abfaac86423227417f6085bfd49a255c64f07a3cf59ce2ee1bfc8d8') { throw 'Published ZIP identity mismatch' }
+          if ($digest -ne '10ad0643d9844e49c209be5ef2bad1e9ce6ad4fd3ce75192a8cb7820e7a7a340') { throw 'Published ZIP identity mismatch' }
           Write-Output "ZIP SHA-256 $digest"
           $root = "$env:RUNNER_TEMP/Relocated Candidate"
           Expand-Archive -LiteralPath $archive.FullName -DestinationPath $root
