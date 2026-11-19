@@ -10,16 +10,20 @@ import unittest
 
 if sys.argv[1:2] == ['--debug-dispatch']:
     program, marker, *args = sys.argv[2:]
-    def gate(frame, event, arg):
-        if (event == 'line' and frame.f_code.co_filename.replace('\\\\', '/').endswith('/bundled_backend.py')
-                and frame.f_code.co_name == 'create' and frame.f_lineno == 164):
+    sys.path.insert(0, program)
+    import bundled_backend
+    assert Path(bundled_backend.__file__).parent == Path(program)
+    save = bundled_backend.BundledBackend._save
+    def gate(self, dispatch, handle):
+        result = save(self, dispatch, handle)
+        if 'guardian' in handle and 'kernel' not in handle:
             Path(marker).write_text(str(os.getpid()))
             time.sleep(45)
             raise TimeoutError('dispatch breakpoint expired')
-        return gate
+        return result
 
+    bundled_backend.BundledBackend._save = gate
     sys.argv = [program, *args]
-    sys.settrace(gate)
     runpy.run_path(program, run_name='__main__')
     sys.exit('unexpected return')
 
