@@ -761,6 +761,14 @@ def cmd_dispatch(args):
             created_result = backend_result(UNCERTAIN, f"{args.backend} create requires explicit reconciliation", category="unknown")
         db.execute("BEGIN IMMEDIATE")
         require_owner(db, scope, owner_token(args), "dispatch")
+        latest_create = db.execute("SELECT result, resolver_actor FROM lifecycle_event WHERE id = ?",
+                                   (create_audit,)).fetchone()
+        if latest_create["result"] != "pending" or latest_create["resolver_actor"] is not None:
+            # An explicit reconciliation after input-lock release owns this audit.
+            db.execute("ROLLBACK")
+            raise SystemExit(json.dumps({"error": "lifecycle_reconciled_during_create", "dispatch": dispatch_id,
+                                         "audit": create_audit, "result": latest_create["result"],
+                                         "requiresDecision": True}))
         finish_lifecycle_event(db, create_audit, created_result["result"], created_result.get("diagnostic"))
         if created_result["result"] == DEFINITELY_NOT_SENT:
             handle = json.loads(db.execute("SELECT backend_handle FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()[0])
@@ -2110,6 +2118,31 @@ def cmd_reconcile(args):
     db = connect()
     with input_lock(args.dispatch):
         row, current = _current_attempt(db, args.dispatch)
+        cleanup = None
+        evidence = args.evidence
+        if getattr(args, "cleanup_receipt", False):
+            require_owner(db, row["scope"], owner_token(args), "reconcile")
+            prior = db.execute("SELECT * FROM lifecycle_event WHERE id = ? AND dispatch = ?",
+                               (args.audit, args.dispatch)).fetchone()
+            if (row["backend"] != "bundled" or args.result != "unknown" or prior is None
+                    or prior["operation"] != "create" or prior["round"] != current["round"]
+                    or prior["attempt"] != current["attempt"]
+                    or (prior["to_attempt"] or prior["attempt"]) != current["attempt"]
+                    or prior["result"] not in ("pending", "uncertain", "unknown")):
+                raise SystemExit(json.dumps({"error": "cleanup_receipt_requires_current_bundled_create_unknown",
+                                             "requiresDecision": True}))
+            if not args.actor.strip() or not args.evidence.strip():
+                raise SystemExit("cleanup reconciliation requires an actor and operator evidence")
+            handle = json.loads(row["backend_handle"] or "{}")
+            if handle.get("unit") != args.dispatch or handle.get("attempt") != current["attempt"]:
+                raise SystemExit("bundled handle is not the current create attempt")
+            # File/signature observation is deliberately outside a database writer.
+            observed = backend_for(row).cleanup_receipt(args.dispatch)
+            if observed["result"] != "accepted":
+                raise SystemExit(json.dumps(observed, ensure_ascii=False))
+            cleanup = observed["proof"]
+            evidence = json.dumps({"operatorEvidence": args.evidence, "cleanupReceipt": cleanup},
+                                  ensure_ascii=False, sort_keys=True)
         db.execute("BEGIN IMMEDIATE")
         current_owner = require_owner(db, row["scope"], owner_token(args), "reconcile")
         event = db.execute("SELECT * FROM lifecycle_event WHERE id = ? AND dispatch = ? "
@@ -2118,6 +2151,14 @@ def cmd_reconcile(args):
         if event is None:
             db.execute("ROLLBACK")
             raise SystemExit(f"no lifecycle audit {args.audit} for dispatch {args.dispatch}")
+        if cleanup is not None:
+            latest, latest_attempt = _current_attempt(db, args.dispatch)
+            if (latest["scope"] != row["scope"] or latest["backend"] != row["backend"]
+                    or latest["backend_handle"] != row["backend_handle"]
+                    or latest_attempt["round"] != current["round"]
+                    or latest_attempt["attempt"] != current["attempt"] or dict(event) != dict(prior)):
+                db.execute("ROLLBACK")
+                raise SystemExit(json.dumps({"error": "cleanup_reconcile_identity_changed", "requiresDecision": True}))
         # Historical operation generation is evidence, not current authority.
         # A scoped operation still needs a real, valid current scope owner.
         if event["owner_generation"] is not None and current_owner is None:
@@ -2127,11 +2168,12 @@ def cmd_reconcile(args):
                                         ensure_ascii=False))
         if event["result"] not in ("pending", "uncertain"):
             same = (event["result"] == args.result and event["resolver_actor"] == args.actor
-                    and event["resolution_evidence"] == args.evidence)
+                    and event["resolution_evidence"] == evidence)
             db.execute("ROLLBACK")
             if same:
                 emit({"dispatch": args.dispatch, "operation": "reconcile", "result": args.result,
-                      "audit": event["id"], "duplicate": True})
+                      "audit": event["id"], "duplicate": True,
+                      **({"cleanupReceipt": cleanup, "backendAlive": False, "inputReplayed": False} if cleanup else {})})
                 return
             raise SystemExit(f"handoff audit {args.audit} is already {event['result']}")
         expected_attempt = event["to_attempt"] or event["attempt"]
@@ -2145,7 +2187,7 @@ def cmd_reconcile(args):
         else:
             state = "unknown"
         finish_lifecycle_event(db, event["id"], args.result,
-                               f"reconciled by {args.actor}: {args.evidence}", args.actor, args.evidence,
+                               f"reconciled by {args.actor}: {args.evidence}", args.actor, evidence,
                                resolution_generation=current_owner["generation"] if current_owner else None)
         if args.result == "accepted" and event["operation"] in ("create", "handoff", "resume"):
             db.execute("DELETE FROM fault_event WHERE dispatch = ? AND operation IN ('create', 'launch') "
@@ -2155,7 +2197,8 @@ def cmd_reconcile(args):
                    (state, state, time.time(), args.dispatch, event["round"], expected_attempt))
         db.execute("COMMIT")
     emit({"dispatch": args.dispatch, "operation": "reconcile", "result": args.result,
-          "audit": event["id"], "attempt": expected_attempt, "duplicate": False})
+          "audit": event["id"], "attempt": expected_attempt, "duplicate": False,
+          **({"cleanupReceipt": cleanup, "backendAlive": False, "inputReplayed": False} if cleanup else {})})
 
 
 def cmd_handoff(args):
@@ -3508,6 +3551,8 @@ def main(argv):
     p.add_argument("--actor", required=True)
     p.add_argument("--evidence", required=True)
     p.add_argument("--owner-token")
+    p.add_argument("--cleanup-receipt", action="store_true",
+                   help="verify owned bundled cleanup for current create; requires --result unknown")
     p.set_defaults(func=cmd_reconcile)
     p = sub.add_parser("handoff", help="move a task to a new host and attempt")
     p.add_argument("dispatch")

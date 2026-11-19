@@ -245,6 +245,239 @@ class BundledNative(unittest.TestCase):
         self.assertEqual(len(replies), 2)
         self.assertEqual(self.cli('close', dispatch)['result'], 'completed')
 
+    def aborted_create_cleanup(self, *extra):
+        import bundled_runtime
+        import signal
+        import time
+        import wfc_platform
+        # Gate only native kernel startup, then exec the real companion in the same
+        # contained PID. No fake backend response or database mutation is involved.
+        self.config('record-only')
+        self.owner_args = (['--owner-token', extra[extra.index('--owner-token') + 1]]
+                           if '--owner-token' in extra else [])
+        ready, release = self.root / 'kernel-ready', self.root / 'kernel-release'
+        real_kernel = str(Path(os.environ['WFC_BUNDLED_TEST_KERNEL']).resolve())
+        gate = self.root / 'kernel-gate'
+        gate.write_text('#!' + sys.executable + '\n' +
+                        'import os,time\nfrom pathlib import Path\n' +
+                        'Path(os.environ["WFC_TEST_KERNEL_READY"]).touch()\n' +
+                        'deadline=time.monotonic()+5\n' +
+                        'while not Path(os.environ["WFC_TEST_KERNEL_RELEASE"]).exists():\n' +
+                        '    if time.monotonic()>deadline: raise TimeoutError("controlled kernel gate expired")\n' +
+                        '    time.sleep(.01)\n' +
+                        'os.execv(os.environ["WFC_TEST_REAL_KERNEL"], [os.environ["WFC_TEST_REAL_KERNEL"]])\n', encoding='utf-8')
+        gate.chmod(0o755)
+        self.env.update(WFC_BUNDLED_KERNEL=str(gate), WFC_TEST_REAL_KERNEL=real_kernel,
+                        WFC_TEST_KERNEL_READY=str(ready), WFC_TEST_KERNEL_RELEASE=str(release))
+        process = subprocess.Popen([sys.executable, str(self.program), 'dispatch', '--backend', 'bundled',
+                                    '--host', 'codex', '--task', str(self.task), '--cwd', str(self.root),
+                                    '--report', str(self.report), '--launch-config', str(self.launch), *extra],
+                                   env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        creation = wfc_platform.process_identity(process.pid)
+        try:
+            self.until(lambda: ready.exists(), timeout=3)
+            [view] = self.cli('status')['dispatches']
+            dispatch = view['dispatch']
+            self.dispatches.append(dispatch)
+            [create] = [item for item in view['audit'] if item['operation'] == 'create']
+            self.assertEqual(create['result'], 'pending')
+            self.assertIsNone(process.poll())
+            self.assertEqual(wfc_platform.process_identity(process.pid), creation)
+            process.send_signal(signal.SIGINT)
+            process.communicate(timeout=3)
+            self.assertNotEqual(process.returncode, 0)
+        finally:
+            release.touch()
+            if process.poll() is None:
+                process.kill()
+            process.communicate()
+        handle = view['backendHandle']
+        def active():
+            try:
+                value = bundled_runtime.read_json(handle['snapshot'])
+                return value if value.get('state') == 'active' else None
+            except (OSError, ValueError):
+                return None
+        snapshot = self.until(active)
+        self.identities.extend(snapshot[key] for key in ('service', 'kernel', 'guardian'))
+        self.until(lambda: any(item['type'] == 'question' for item in self.status(dispatch)['messages']))
+        self.assertEqual(bundled_runtime.call(snapshot, 'close')['result'], 'completed')
+        receipt = bundled_runtime.read_json(handle['snapshot'])
+        self.assertTrue(bundled_runtime.confirmed_cleanup(handle, receipt))
+        stopped = self.status(dispatch)
+        self.assertFalse(stopped['backendAlive'])
+        self.assertEqual(next(a for a in stopped['audit'] if a['id'] == create['id'])['result'], 'pending')
+        self.assertEqual(next(m for m in stopped['messages'] if m['type'] == 'question')['state'], 'unsent')
+        blocked = self.cli('close', dispatch, *self.owner_args, success=False)
+        self.assertIn('lifecycle_reconcile_required', blocked.stderr)
+        print('ABORTED_CREATE_SCENE ' + json.dumps({'create': 'pending', 'backendAlive': False,
+              'cleanupReceiptAuthenticated': True, 'question': 'unsent', 'inputReplayed': False}), flush=True)
+        return dispatch, create, handle, receipt
+
+    def cleanup_reconcile_args(self, dispatch, audit):
+        return ('reconcile', dispatch, str(audit), '--result', 'unknown', '--actor', 'controlled-operator',
+                '--evidence', 'owned aborted create cleanup', '--cleanup-receipt')
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'controlled foreground SIGINT reproduction')
+    def test_aborted_create_cleanup_receipt_has_public_recovery(self):
+        dispatch, create, handle, receipt = self.aborted_create_cleanup()
+        args = self.cleanup_reconcile_args(dispatch, create['id'])
+        recovered = self.cli(*args)
+        self.assertEqual(recovered['result'], 'unknown')
+        self.assertFalse(recovered['backendAlive'])
+        self.assertFalse(recovered['inputReplayed'])
+        self.assertEqual(recovered['cleanupReceipt']['proves'], 'execution-empty')
+        self.assertEqual(recovered['cleanupReceipt']['attempt'], create['attempt'])
+        self.assertEqual(recovered['cleanupReceipt']['generation'], handle['generation'])
+        self.assertEqual(len(recovered['cleanupReceipt']['receiptSha256']), 64)
+        self.assertNotIn('token', json.dumps(recovered))
+        duplicate = self.cli(*args)
+        self.assertTrue(duplicate['duplicate'])
+        self.assertEqual(duplicate['cleanupReceipt'], recovered['cleanupReceipt'])
+        current = self.status(dispatch)
+        audit = next(a for a in current['audit'] if a['id'] == create['id'])
+        self.assertEqual(audit['result'], 'unknown')
+        self.assertEqual(json.loads(audit['resolution']['evidence'])['cleanupReceipt'], recovered['cleanupReceipt'])
+        self.assertFalse(any(m['type'] in ('reply', 'done') for m in current['messages']))
+        self.assertFalse(Path(str(self.evidence) + '.applied').exists())
+        self.assertEqual(self.cli('close', dispatch)['result'], 'completed')
+        resumed = self.cli('resume', dispatch)
+        current_handle = self.handle(dispatch)
+        self.assertNotEqual(resumed['attempt'], create['attempt'])
+        self.assertNotEqual(current_handle['generation'], handle['generation'])
+        stale = self.cli(*args, success=False)
+        self.assertIn('cleanup_receipt_requires_current_bundled_create_unknown', stale.stderr)
+        self.assertTrue(self.status(dispatch)['backendAlive'])
+        self.assertEqual(self.cli('close', dispatch)['result'], 'completed')
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'controlled foreground SIGINT reproduction')
+    def test_cleanup_reconcile_refuses_insufficient_wrong_or_stale_receipts(self):
+        import hashlib
+        import hmac
+        import bundled_runtime as runtime
+        dispatch, create, handle, receipt = self.aborted_create_cleanup()
+        args = self.cleanup_reconcile_args(dispatch, create['id'])
+        def signed(**changes):
+            value = {**receipt, **changes}
+            payload = {key: item for key, item in value.items() if key not in ('token', 'receiptSignature')}
+            value['receiptSignature'] = hmac.new(value['token'].encode(), json.dumps(
+                payload, sort_keys=True, separators=(',', ':')).encode(), hashlib.sha256).hexdigest()
+            return value
+        unsigned = dict(receipt); unsigned.pop('receiptSignature')
+        tampered = dict(receipt); tampered['final_screen'] = 'controlled modified receipt'
+        variants = [('missing', None), ('non-object', []), ('unsigned', unsigned), ('tampered', tampered),
+                    ('not-confirmed', signed(cleanup='unknown')), ('not-terminal', signed(state='active'))]
+        for key in ('unit', 'attempt', 'generation', 'nonce'):
+            variants.append((key, signed(**{key: 'controlled-other'})))
+        for role in ('service', 'kernel', 'guardian', 'containment'):
+            # A pre-hello durable handle may not yet record every role. Known
+            # bindings must match even under a valid signature; other body changes
+            # still require the original authenticated receipt, never a trace.
+            bad = signed(**{role: {'controlled': 'other'}}) if handle.get(role) else {**receipt, role: {'controlled': 'other'}}
+            variants.append((role, bad))
+        variants.append(('key substitution', signed(token='controlled-other-key',
+                         capabilityHash=hashlib.sha256(b'controlled-other-key').hexdigest())))
+        try:
+            for label, bad in variants:
+                with self.subTest(receipt=label):
+                    if bad is None: Path(handle['snapshot']).unlink(missing_ok=True)
+                    else: runtime.publish(handle['snapshot'], bad)
+                    refused = self.cli(*args, success=False)
+                    self.assertNotEqual(refused.returncode, 0)
+                    self.assertIn('bundled_cleanup_unconfirmed', refused.stderr)
+                    self.assertEqual(next(a for a in self.status(dispatch)['audit'] if a['id'] == create['id'])['result'], 'pending')
+        finally:
+            runtime.publish(handle['snapshot'], receipt)
+        for wrong_result in ('accepted', 'definitely-not-sent', 'refused'):
+            wrong = list(args); wrong[wrong.index('unknown')] = wrong_result
+            refused = self.cli(*wrong, success=False)
+            self.assertIn('cleanup_receipt_requires_current_bundled_create_unknown', refused.stderr)
+        wrong_audit = list(args); wrong_audit[2] = str(create['id'] + 1000)
+        self.assertIn('cleanup_receipt_requires_current_bundled_create_unknown', self.cli(*wrong_audit, success=False).stderr)
+        arbitrary_path = self.cli(*args, str(self.root / 'untrusted.json'), success=False)
+        self.assertNotEqual(arbitrary_path.returncode, 0)
+        self.assertEqual(self.cli(*args)['result'], 'unknown')
+        self.assertEqual(self.cli('close', dispatch)['result'], 'completed')
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'controlled foreground SIGINT reproduction')
+    def test_cleanup_reconcile_concurrent_duplicate_and_conflict_are_audited_once(self):
+        dispatch, create, _, _ = self.aborted_create_cleanup()
+        args = self.cleanup_reconcile_args(dispatch, create['id'])
+        processes = [subprocess.Popen([sys.executable, str(self.program), *args], env=self.env,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(2)]
+        try:
+            outcomes = []
+            for process in processes:
+                output, error = process.communicate(timeout=15)
+                self.assertEqual(process.returncode, 0, error)
+                outcomes.append(json.loads(output))
+            self.assertEqual(sorted(value['duplicate'] for value in outcomes), [False, True])
+            self.assertEqual(outcomes[0]['cleanupReceipt'], outcomes[1]['cleanupReceipt'])
+            conflict = list(args); conflict[conflict.index('controlled-operator')] = 'other-operator'
+            self.assertIn('already unknown', self.cli(*conflict, success=False).stderr)
+            self.assertEqual(len([a for a in self.status(dispatch)['audit'] if a['id'] == create['id']]), 1)
+            self.assertEqual(self.cli('close', dispatch)['result'], 'completed')
+        finally:
+            for process in processes:
+                if process.poll() is None: process.kill()
+                process.communicate()
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'controlled FIFO/owner takeover regression')
+    def test_cleanup_receipt_io_has_no_database_writer_and_rechecks_owner_after_takeover(self):
+        import errno
+        import time
+        import bundled_runtime as runtime
+        owner = self.cli('owner', 'acquire', '--scope', 'cleanup-fixture', '--owner', 'first')
+        dispatch, create, handle, receipt = self.aborted_create_cleanup(
+            '--scope', 'cleanup-fixture', '--owner-token', owner['token'])
+        self.owner_args = ['--owner-token', owner['token']]
+        args = self.cleanup_reconcile_args(dispatch, create['id'])
+        other = self.cli('owner', 'acquire', '--scope', 'other-fixture', '--owner', 'other')
+        wrong_scope = self.cli(*args, '--owner-token', other['token'], success=False)
+        self.assertIn('stale_controller_owner', wrong_scope.stderr)
+        path = Path(handle['snapshot'])
+        path.unlink(); os.mkfifo(path, 0o600)
+        process = subprocess.Popen([sys.executable, str(self.program), *args, *self.owner_args], env=self.env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        writer = None
+        try:
+            deadline = time.monotonic() + 5
+            while writer is None and time.monotonic() < deadline:
+                try: writer = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+                except OSError as error:
+                    if error.errno != errno.ENXIO: raise
+                    time.sleep(.01)
+            self.assertIsNotNone(writer, 'reconciliation never reached its controlled receipt read')
+            # The reader waits on owned file IO. Takeover must still acquire SQLite.
+            takeover = subprocess.run([sys.executable, str(self.program), 'owner', 'takeover', '--scope', 'cleanup-fixture',
+                                       '--owner', 'next'], env=self.env, capture_output=True, text=True, timeout=2)
+            self.assertEqual(takeover.returncode, 0, takeover.stderr)
+            current_owner = json.loads(takeover.stdout)
+            self.owner_args = ['--owner-token', current_owner['token']]
+            payload = json.dumps(receipt).encode('utf-8')
+            os.set_blocking(writer, True)
+            with os.fdopen(writer, 'wb') as stream: stream.write(payload)
+            writer = None
+            _, error = process.communicate(timeout=15)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn('stale_controller_owner', error)
+        finally:
+            if writer is not None: os.close(writer)
+            if process.poll() is None: process.kill()
+            process.communicate()
+            path.unlink(missing_ok=True); runtime.publish(path, receipt)
+        stale = self.cli(*args, '--owner-token', owner['token'], success=False)
+        self.assertIn('stale_controller_owner', stale.stderr)
+        self.assertEqual(next(a for a in self.status(dispatch)['audit'] if a['id'] == create['id'])['result'], 'pending')
+        accepted = self.cli(*args, *self.owner_args)
+        self.assertEqual(accepted['result'], 'unknown')
+        audit = next(a for a in self.status(dispatch)['audit'] if a['id'] == create['id'])
+        self.assertEqual(audit['ownerGeneration'], owner['generation'])
+        self.assertEqual(audit['resolution']['ownerGeneration'], current_owner['generation'])
+        self.assertTrue(self.cli(*args, *self.owner_args)['duplicate'])
+        self.assertIn('stale_controller_owner', self.cli(*args, '--owner-token', owner['token'], success=False).stderr)
+        self.assertEqual(self.cli('close', dispatch, *self.owner_args)['result'], 'completed')
+
     def test_wrong_nonce_and_generation_cannot_input_or_close(self):
         import bundled_runtime
         value = self.dispatch()

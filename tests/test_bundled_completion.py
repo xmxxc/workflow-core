@@ -107,3 +107,23 @@ class CompletionReceipt(unittest.TestCase):
         with patch.object(bundled_runtime, 'call', side_effect=refused) as call:
             self.assertEqual(self.backend.close('d-test')['result'], 'refused')
         self.assertEqual(call.call_count, 1)
+
+    def test_cleanup_proof_is_read_only_and_does_not_claim_create_acceptance(self):
+        receipt = self.receipt()
+        bundled_runtime.publish(self.handle['snapshot'], receipt)
+        with patch.object(bundled_runtime, 'call') as call:
+            result = self.backend.cleanup_receipt('d-test')
+        self.assertEqual(result['result'], 'accepted')
+        self.assertEqual(result['proof']['proves'], 'execution-empty')
+        self.assertEqual(result['proof']['attempt'], self.handle['attempt'])
+        self.assertNotIn('token', json.dumps(result))
+        self.assertNotIn('receiptSignature', json.dumps(result))
+        self.assertNotIn('createAccepted', result)
+        call.assert_not_called()
+
+    def test_non_object_receipt_remains_unconfirmed(self):
+        bundled_runtime.publish(self.handle['snapshot'], [])
+        with patch.object(bundled_runtime, 'call') as call:
+            result = self.backend.cleanup_receipt('d-test')
+        self.assertEqual(result['result'], 'refused')
+        call.assert_not_called()

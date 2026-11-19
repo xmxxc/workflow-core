@@ -1,4 +1,5 @@
 """Opt-in bundled kernel adapter; one persistent runtime per execution attempt."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -54,12 +55,14 @@ class BundledBackend:
     def _snapshot(self, handle):
         try:
             snapshot = runtime.read_json(handle['snapshot'])
+            if not isinstance(snapshot, dict):
+                return None
             if any(snapshot.get(key) != handle.get(key) for key in ('generation', 'unit', 'nonce', 'attempt')):
                 return None
             if handle.get('capabilityHash') and not runtime.capability_matches(handle, snapshot):
                 return None
             return snapshot
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError, RecursionError):
             return None
 
     def _observe(self, handle):
@@ -85,6 +88,18 @@ class BundledBackend:
         if snapshot and runtime.confirmed_cleanup(handle, snapshot):
             return outcome('accepted', alive=False, owned=True, confirmedAbsent=True)
         return None
+
+    def cleanup_receipt(self, dispatch_id):
+        """Read owned cleanup proof, without an RPC or any claim about create delivery."""
+        handle = self._handle(dispatch_id)
+        snapshot = self._snapshot(handle)
+        if not snapshot or not runtime.confirmed_cleanup(handle, snapshot):
+            return outcome('refused', 'bundled cleanup receipt is absent, invalid or unconfirmed',
+                           category='bundled_cleanup_unconfirmed')
+        proof = {key: snapshot[key] for key in ('unit', 'generation', 'attempt', 'nonce', 'state')}
+        proof.update(proves='execution-empty', cleanup='confirmed',
+                     receiptSha256=hashlib.sha256(runtime.receipt_payload(snapshot)).hexdigest())
+        return outcome('accepted', proof=proof)
 
     def _call(self, dispatch, op, **data):
         handle = self._handle(dispatch)
