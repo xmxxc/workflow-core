@@ -1,0 +1,39 @@
+name: Foreground launch comparison
+on:
+  push:
+    branches: [experiment/foreground-38-native]
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: windows-2022
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.13'
+      - name: Stage verified companion and run reviewed probe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PYTHONUTF8: '1'
+        shell: pwsh
+        run: |
+          gh release download kernel-experiment-20261118.1 -R xmxxc/workflow-core -p '*.zip' -D "$env:RUNNER_TEMP/fixture"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $zip = Get-ChildItem "$env:RUNNER_TEMP/fixture/*.zip"
+          if ((Get-FileHash $zip).Hash -ne 'c5bab4936c16aa2ea5677d7d08d173e16a0cda5d88bb64bec69e46a9409fd326') { throw 'ZIP mismatch' }
+          Expand-Archive $zip "$env:RUNNER_TEMP/kernel"
+          if ((Get-FileHash tools/probe_windows_foreground.py).Hash -ne '91046c2deacea4866c41ac1332e08de3ddb82f8a774fc6c1fb356df8ff4a8a45') {
+            git -c core.autocrlf=false checkout-index --force -- tools/probe_windows_foreground.py
+            if ((Get-FileHash tools/probe_windows_foreground.py).Hash -ne '91046c2deacea4866c41ac1332e08de3ddb82f8a774fc6c1fb356df8ff4a8a45') { throw 'probe mismatch' }
+          }
+          Remove-Item Env:GH_TOKEN
+          python run_foreground_check.py "$env:RUNNER_TEMP/kernel/wfc/wfc-kernel.exe"
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: foreground-native-evidence
+          path: evidence/
