@@ -1,0 +1,37 @@
+name: Windows public interrupted-create recovery
+on:
+  push:
+    branches: [experiment/windows-interrupt-38]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  verify:
+    runs-on: windows-2022
+    timeout-minutes: 6
+    env:
+      CANDIDATE: 95ef40f57387393be60def7f9289c5ed9e563b1b
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - name: Download exact original native build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download 44480654862 --name "internal-bundled-experiment-$env:CANDIDATE" --dir artifact
+      - name: Verify candidate and exercise public recovery
+        run: |
+          $archive = Get-Item "artifact/wfc-kernel-experiment-$env:CANDIDATE-windows-x64.zip"
+          $digest = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($digest -ne (Get-Content artifact/SHA256SUMS).Split(' ')[0]) { throw 'ZIP digest mismatch' }
+          Write-Output "ZIP SHA-256 $digest"
+          $root = "$env:RUNNER_TEMP/Relocated Candidate"
+          Expand-Archive -LiteralPath $archive.FullName -DestinationPath $root
+          python tools/package_bundled_experiment.py verify --directory "$root/wfc" --commit $env:CANDIDATE
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $env:WFC_TEST_PROGRAM = "$root/wfc/wfc.pyz"
+          $env:WFC_BUNDLED_TEST_KERNEL = "$root/wfc/wfc-kernel.exe"
+          $env:WFC_BUNDLED_TEST_DISCOVERY = '1'
+          python tests/windows_interrupt_probe.py
