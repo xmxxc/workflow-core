@@ -26,9 +26,16 @@ class Relay(BundledNative):
         value = self.dispatch()
         d, attempt = value['dispatch'], value['attempt']
         self.handle(d)
+        sibling = self.dispatch()
+        self.assertNotEqual(sibling['scope'], value['scope'])
+        self.until(lambda: any(m['type'] == 'question' and m['state'] == 'unsent'
+                               for m in self.status(sibling['dispatch'])['messages']))
         relay = self.cli('relay','--codex','--scope',value['scope'],'--for','16','--stall-after','60','--detach')
         creation = wfc_platform.process_identity(relay['pid'])
         self.assertTrue(creation)
+        self.until(lambda: any(w['pid'] == relay['pid'] and w['kind'] == 'relay'
+                               and w['liveness'] == 'alive' and w['processStart'] == creation
+                               for w in self.cli('status')['waiters']))
         def delivered(kind):
             for path in capture.glob('*.received'):
                 window, line = path.read_text(encoding='utf-8-sig').splitlines()
@@ -37,7 +44,11 @@ class Relay(BundledNative):
                     if msg['type'] == kind:
                         self.assertEqual((msg['dispatch'],msg['attempt']), (d,attempt))
                         row = next(m for m in self.status(d)['messages'] if m['messageId']==msg['messageId'])
+                        self.assertEqual(msg['state'], 'unknown')
+                        self.assertEqual(msg['delivery'], 'pending')
+                        self.assertEqual(msg['deliveryAttempt'], f"relay:{msg['messageId']}:{msg['statusVersion']}")
                         if row['state']=='received':
+                            self.assertEqual(row['statusVersion'], msg['statusVersion'] + 1)
                             return msg, int(window)
         question, w1 = self.until(lambda: delivered('question'))
         self.cli('reply',str(question['id']),'finish now')
@@ -47,9 +58,13 @@ class Relay(BundledNative):
         self.assertEqual(self.cli('ack',done['messageId'])['state'],'processed')
         self.assertEqual(self.cli('close',d)['result'],'completed')
         self.until(lambda: wfc_platform.process_identity(relay['pid']) != creation, timeout=25)
+        self.assertFalse(any(w['pid'] == relay['pid'] for w in self.cli('status')['waiters']))
+        other = self.status(sibling['dispatch'])['messages']
+        self.assertEqual([(m['type'],m['state']) for m in other], [('question','unsent')])
+        self.assertEqual(self.cli('close', sibling['dispatch'])['result'], 'completed')
         self.assertEqual(len(list(capture.glob('*.received'))),2)
         print(json.dumps(dict(scope=value['scope'],attempt=attempt,queueConsoleHWND=[w1,w2],
-                              ack='processed',queueCalls=2,relayExited=True)), flush=True)
+                              ack='processed',queueCalls=2,relayExited=True,siblingQuestion='unsent',registeredIdentity=creation)), flush=True)
         self.assertEqual([w1,w2],[0,0], 'queue helper acquired a console')
 
 
