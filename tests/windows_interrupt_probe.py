@@ -40,7 +40,7 @@ class WindowsRecovery(BundledNative):
         for row in data.get('dispatches', []):
             summary.update(dispatch=row['dispatch'], attempt=row['attempt'], backendAlive=row['backendAlive'],
                            audits=[{k: a.get(k) for k in ('id', 'operation', 'attempt', 'result')} for a in row['audit']],
-                           messages=[{k: m.get(k) for k in ('type', 'state')} for m in row['messages']])
+                           messages=[{k: m.get(k) for k in ('type', 'state')} for m in row.get('messages', [])])
         print(json.dumps(dict(command=args[0], exit=proc.returncode, observed=summary,
                               reconcileRequired='lifecycle_reconcile_required' in proc.stderr)), flush=True)
         if not success:
