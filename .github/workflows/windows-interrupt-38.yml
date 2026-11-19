@@ -17,15 +17,16 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: '3.12'
-      - name: Download exact original native build
+      - name: Download published experimental ZIP
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh run download 44480654862 --name "internal-bundled-experiment-$env:CANDIDATE" --dir artifact
+        run: gh release download kernel-experiment-20261118.2 --dir artifact
       - name: Verify candidate and exercise public recovery
         run: |
           $archive = Get-Item "artifact/wfc-kernel-experiment-$env:CANDIDATE-windows-x64.zip"
           $digest = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($digest -ne (Get-Content artifact/SHA256SUMS).Split(' ')[0]) { throw 'ZIP digest mismatch' }
+          if ($digest -ne '0c137a333e77b33ab23ccf9606b4609fb5425f4a16644bc9337a08a9af05e2ae') { throw 'Published ZIP identity mismatch' }
           Write-Output "ZIP SHA-256 $digest"
           $root = "$env:RUNNER_TEMP/Relocated Candidate"
           Expand-Archive -LiteralPath $archive.FullName -DestinationPath $root
