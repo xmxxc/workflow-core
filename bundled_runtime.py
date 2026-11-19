@@ -542,7 +542,8 @@ def guard(spec_path):
         import router
         child = subprocess.Popen([sys.executable, str(router.PROGRAM), '_bundled-runtime', str(spec_path)],
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 close_fds=True)
+                                 close_fds=True,
+                                 **({'creationflags': subprocess.CREATE_NO_WINDOW} if wfc_platform.WINDOWS else {}))
         trace.record('runtime_started', pid=child.pid, creation=wfc_platform.process_identity(child.pid))
         code = child.wait()
         trace.record('runtime_ended', code=code)
