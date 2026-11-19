@@ -3206,7 +3206,8 @@ def queue_into_codex(thread, messages):
     ids = [m["id"] for m in messages]
     try:
         result = subprocess.run(["codex", "queue", "--thread", thread, "--message", text, "--resume"],
-                                capture_output=True, text=True, timeout=float(os.environ.get("WFC_QUEUE_TIMEOUT", 60)))
+                                capture_output=True, text=True, timeout=float(os.environ.get("WFC_QUEUE_TIMEOUT", 60)),
+                                **({"creationflags": subprocess.CREATE_NO_WINDOW} if wfc_platform.WINDOWS else {}))
     except OSError as err:
         print(f"router relay: codex queue could not run: {err}", flush=True)
         return "failed"

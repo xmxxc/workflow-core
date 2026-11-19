@@ -993,6 +993,73 @@ class ClaudeTrust(unittest.TestCase):
         self.assertEqual(self.dispatch("codex"), before)
 
 
+class CodexQueueCall(unittest.TestCase):
+    """Queue launch contract; mocked runs never address a real Desktop session."""
+
+    THREAD = '00000000-0000-4000-8000-000000000035'
+    MESSAGES = [{'id': 101, 'type': 'question', 'question': 'controlled 中文'}]
+    TEXT = '[router] Messages for the controller: {"messages": [{"id": 101, "type": "question", "question": "controlled 中文"}]}'
+
+    def call_queue(self, windows, result=None, error=None):
+        import router
+        with patch.dict(os.environ, {'WFC_QUEUE_TIMEOUT': '7.25'}), \
+                patch.object(router.wfc_platform, 'WINDOWS', windows), \
+                patch.object(router.subprocess, 'CREATE_NO_WINDOW', 0x08000000, create=True), \
+                patch.object(router.subprocess, 'run', return_value=result, side_effect=error) as run:
+            outcome = router.queue_into_codex(self.THREAD, self.MESSAGES)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args, (['codex', 'queue', '--thread', self.THREAD,
+                                              '--message', self.TEXT, '--resume'],))
+        return outcome, run.call_args.kwargs
+
+    def test_windows_queue_uses_only_create_no_window_and_original_run_contract(self):
+        result = subprocess.CompletedProcess([], 0, stdout='', stderr='')
+        outcome, options = self.call_queue(True, result)
+        self.assertEqual(outcome, 'delivered')
+        self.assertEqual(options, {'capture_output': True, 'text': True, 'timeout': 7.25,
+                                   'creationflags': 0x08000000})
+
+    def test_posix_queue_retains_exact_original_kwargs(self):
+        result = subprocess.CompletedProcess([], 0, stdout='', stderr='')
+        outcome, options = self.call_queue(False, result)
+        self.assertEqual(outcome, 'delivered')
+        self.assertEqual(options, {'capture_output': True, 'text': True, 'timeout': 7.25})
+
+    def test_oserror_means_failed_without_a_second_queue_call(self):
+        for windows in (False, True):
+            with self.subTest(windows=windows):
+                outcome, _ = self.call_queue(windows, error=OSError('controlled missing queue executable'))
+                self.assertEqual(outcome, 'failed')
+
+    def test_timeout_stays_uncertain_without_a_second_queue_call(self):
+        for windows in (False, True):
+            with self.subTest(windows=windows):
+                outcome, _ = self.call_queue(windows, error=subprocess.TimeoutExpired('controlled queue', 7.25))
+                self.assertEqual(outcome, 'uncertain')
+
+    def test_nonzero_exit_stays_uncertain_without_a_second_queue_call(self):
+        for windows in (False, True):
+            with self.subTest(windows=windows):
+                result = subprocess.CompletedProcess([], 5, stdout='', stderr='controlled queue error')
+                outcome, _ = self.call_queue(windows, result)
+                self.assertEqual(outcome, 'uncertain')
+
+    def test_missing_rollout_stays_missing_without_a_second_queue_call(self):
+        for windows in (False, True):
+            with self.subTest(windows=windows):
+                result = subprocess.CompletedProcess([], 1, stdout='', stderr='no rollout found for thread controlled')
+                outcome, _ = self.call_queue(windows, result)
+                self.assertEqual(outcome, 'missing')
+
+    def test_exit_zero_with_resume_warning_stays_delivered(self):
+        for windows in (False, True):
+            with self.subTest(windows=windows):
+                result = subprocess.CompletedProcess([], 0, stdout='controlled queued',
+                                                     stderr='warning: could not resume the controller session')
+                outcome, _ = self.call_queue(windows, result)
+                self.assertEqual(outcome, 'delivered')
+
+
 class CodexRelay(unittest.TestCase):
     """relay pushes controller messages into a Codex controller session with codex queue."""
 
