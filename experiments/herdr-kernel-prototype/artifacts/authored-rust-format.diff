@@ -1,0 +1,136 @@
+--- r1/src/main.rs
++++ r2/src/main.rs
+@@ -78,18 +78,28 @@
+ }
+ 
+ fn string<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
+-    v[key].as_str().with_context(|| format!("missing string {key}"))
++    v[key]
++        .as_str()
++        .with_context(|| format!("missing string {key}"))
+ }
+ 
+ fn size(v: &Value) -> Result<(u16, u16)> {
+     let cols = u16::try_from(v["cols"].as_u64().context("missing cols")?)?;
+     let rows = u16::try_from(v["rows"].as_u64().context("missing rows")?)?;
+-    ensure!((1..=1000).contains(&cols) && (1..=1000).contains(&rows), "invalid size");
++    ensure!(
++        (1..=1000).contains(&cols) && (1..=1000).contains(&rows),
++        "invalid size"
++    );
+     Ok((cols, rows))
+ }
+ 
+ fn pty_size(cols: u16, rows: u16) -> PtySize {
+-    PtySize { cols, rows, pixel_width: 0, pixel_height: 0 }
++    PtySize {
++        cols,
++        rows,
++        pixel_width: 0,
++        pixel_height: 0,
++    }
+ }
+ 
+ fn spawn(v: &Value, tx: mpsc::Sender<Event>) -> Result<Unit> {
+@@ -128,7 +138,14 @@
+             match reader.read(&mut buffer) {
+                 Ok(0) => break None,
+                 Ok(n) => {
+-                    if tx.send(Event::Output(unit.clone(), output_nonce.clone(), buffer[..n].to_vec())).is_err() {
++                    if tx
++                        .send(Event::Output(
++                            unit.clone(),
++                            output_nonce.clone(),
++                            buffer[..n].to_vec(),
++                        ))
++                        .is_err()
++                    {
+                         return;
+                     }
+                 }
+@@ -140,11 +157,26 @@
+         };
+         let _ = tx.send(Event::End(unit, output_nonce, error));
+     });
+-    Ok(Unit { nonce, child, master: pair.master, writer, terminal, cols, rows,
+-              exit: None, eof: false, read_error: None })
+-}
+-
+-fn handle(v: &Value, generation: &str, units: &mut HashMap<String, Unit>, tx: &mpsc::Sender<Event>) -> Result<Value> {
++    Ok(Unit {
++        nonce,
++        child,
++        master: pair.master,
++        writer,
++        terminal,
++        cols,
++        rows,
++        exit: None,
++        eof: false,
++        read_error: None,
++    })
++}
++
++fn handle(
++    v: &Value,
++    generation: &str,
++    units: &mut HashMap<String, Unit>,
++    tx: &mpsc::Sender<Event>,
++) -> Result<Value> {
+     ensure!(string(v, "generation")? == generation, "stale_generation");
+     let name = string(v, "unit")?;
+     let op = string(v, "op")?;
+@@ -167,7 +199,10 @@
+         })),
+         "input" => {
+             ensure!(unit.exit.is_none(), "unit_exited");
+-            let mut writer = unit.writer.lock().map_err(|_| anyhow::anyhow!("writer poisoned"))?;
++            let mut writer = unit
++                .writer
++                .lock()
++                .map_err(|_| anyhow::anyhow!("writer poisoned"))?;
+             writer.write_all(string(v, "text")?.as_bytes())?;
+             writer.flush()?;
+             Ok(json!({"written": true}))
+@@ -200,13 +235,19 @@
+ 
+ fn main() -> Result<()> {
+     let generation = Uuid::new_v4().to_string();
+-    emit(json!({"event": "hello", "generation": generation, "recovery": "lost", "transport": "private-stdio-ndjson"}))?;
++    emit(
++        json!({"event": "hello", "generation": generation, "recovery": "lost", "transport": "private-stdio-ndjson"}),
++    )?;
+     let (tx, rx) = mpsc::channel();
+     let stdin_tx = tx.clone();
+     thread::spawn(move || {
+         for line in io::stdin().lock().lines() {
+             match line {
+-                Ok(line) => { if stdin_tx.send(Event::Command(line)).is_err() { return; } }
++                Ok(line) => {
++                    if stdin_tx.send(Event::Command(line)).is_err() {
++                        return;
++                    }
++                }
+                 Err(_) => break,
+             }
+         }
+@@ -230,10 +271,16 @@
+             Event::Command(line) => {
+                 let request = serde_json::from_str::<Value>(&line);
+                 let id = request.as_ref().ok().map(|v| v["id"].clone());
+-                let result = request.map_err(anyhow::Error::from).and_then(|v| handle(&v, &generation, &mut units, &tx));
++                let result = request
++                    .map_err(anyhow::Error::from)
++                    .and_then(|v| handle(&v, &generation, &mut units, &tx));
+                 emit(match result {
+-                    Ok(result) => json!({"id": id, "generation": generation, "ok": true, "result": result}),
+-                    Err(error) => json!({"id": id, "generation": generation, "ok": false, "error": error.to_string()}),
++                    Ok(result) => {
++                        json!({"id": id, "generation": generation, "ok": true, "result": result})
++                    }
++                    Err(error) => {
++                        json!({"id": id, "generation": generation, "ok": false, "error": error.to_string()})
++                    }
+                 })?;
+             }
+         }

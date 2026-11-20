@@ -1,0 +1,734 @@
+{
+  "counting": "physical nonblank source lines including comments; inline tests are a format-based subset; all retained files count toward bytes; generated bindings explicitly separated",
+  "retained_groups": {
+    "licenses-patches-provenance/retained": {
+      "files": 4,
+      "bytes": 27366,
+      "source_nonblank_lines": 0,
+      "inline_test_nonblank_lines": 0,
+      "inline_test_blocks": 0
+    },
+    "ghostty-rust/retained": {
+      "files": 6,
+      "bytes": 227091,
+      "source_nonblank_lines": 5972,
+      "inline_test_nonblank_lines": 1205,
+      "inline_test_blocks": 2
+    },
+    "ghostty-rust/generated-bindings": {
+      "files": 1,
+      "bytes": 465602,
+      "source_nonblank_lines": 5375,
+      "inline_test_nonblank_lines": 0,
+      "inline_test_blocks": 0
+    },
+    "ghostty-rust/tests-fixtures": {
+      "files": 3,
+      "bytes": 15402,
+      "source_nonblank_lines": 412,
+      "inline_test_nonblank_lines": 0,
+      "inline_test_blocks": 0
+    },
+    "ghostty-zig-vendor/retained": {
+      "files": 1277,
+      "bytes": 19317473,
+      "source_nonblank_lines": 414513,
+      "inline_test_nonblank_lines": 102993,
+      "inline_test_blocks": 4089
+    },
+    "ghostty-zig-vendor/tests-fixtures": {
+      "files": 68,
+      "bytes": 363699,
+      "source_nonblank_lines": 0,
+      "inline_test_nonblank_lines": 0,
+      "inline_test_blocks": 0
+    },
+    "portable-pty-vendor/retained": {
+      "files": 19,
+      "bytes": 137040,
+      "source_nonblank_lines": 2852,
+      "inline_test_nonblank_lines": 171,
+      "inline_test_blocks": 1
+    }
+  },
+  "authored": [
+    {
+      "path": "build_probe.py",
+      "bytes": 2905,
+      "nonblank_lines": 55,
+      "sha256": "cf55ec8135fdb566b1b39abff6622a99c5652748f2f4daa25c4c2bd34745a8c4"
+    },
+    {
+      "path": "controlled_host.py",
+      "bytes": 1939,
+      "nonblank_lines": 38,
+      "sha256": "e35f9b528d2e795e6d9e0e32a9d035ac376598cf77f2515bf2a684fa1682c447"
+    },
+    {
+      "path": "metrics.py",
+      "bytes": 4944,
+      "nonblank_lines": 71,
+      "sha256": "50635d08a6815c157c3d10b45f283407f00319143fa5e8f35ff6fc30d3c8e877"
+    },
+    {
+      "path": "prepare.py",
+      "bytes": 3337,
+      "nonblank_lines": 65,
+      "sha256": "14f1554bdac5dce44cfbd7c5faaab6135d35f47e2b212dd0003d878d599a9ec7"
+    },
+    {
+      "path": "probe.py",
+      "bytes": 18559,
+      "nonblank_lines": 335,
+      "sha256": "f15d40fb7d1a12a0f95638a7960fe5b4a0a6321a7a475a3839ddd4b2a9d2a360"
+    },
+    {
+      "path": "src/main.rs",
+      "bytes": 9444,
+      "nonblank_lines": 277,
+      "sha256": "6c8b0a2910575734a034ada255e3a91391ea714238757552e7f15eb7f21268c9"
+    }
+  ],
+  "retained_total_files": 1378,
+  "retained_total_bytes": 20553673,
+  "rust_dependency_closure_including_root": {
+    "linux": [
+      "adler2 v2.0.1",
+      "anyhow v1.0.102",
+      "base64 v0.22.1",
+      "bitflags v1.3.2",
+      "bitflags v2.11.0",
+      "cfg-if v1.0.4",
+      "cfg_aliases v0.1.1",
+      "crc32fast v1.5.0",
+      "downcast-rs v1.2.1",
+      "fdeflate v0.3.7",
+      "filedescriptor v0.8.3",
+      "flate2 v1.1.9",
+      "getrandom v0.4.2",
+      "ghostty-vt v0.0.0 (/tmp/wfc-herdr-kernel-prototype-r1/crates/ghostty-vt)",
+      "herdr-kernel-prototype v0.0.0 (/tmp/wfc-herdr-kernel-prototype-r1)",
+      "itoa v1.0.18",
+      "libc v0.2.190",
+      "log v0.4.29",
+      "memchr v2.8.0",
+      "miniz_oxide v0.8.9",
+      "nix v0.28.0",
+      "once_cell v1.21.4",
+      "pin-project-lite v0.2.17",
+      "png v0.17.16",
+      "portable-pty v0.9.0 (/tmp/wfc-herdr-kernel-prototype-r1/vendor/portable-pty)",
+      "proc-macro2 v1.0.106",
+      "quote v1.0.45",
+      "serde_core v1.0.229",
+      "serde_json v1.0.151",
+      "serial2 v0.2.34",
+      "shell-words v1.1.1",
+      "simd-adler32 v0.3.9",
+      "syn v2.0.117",
+      "thiserror v1.0.69",
+      "thiserror-impl v1.0.69 (proc-macro)",
+      "tracing v0.1.44",
+      "tracing-attributes v0.1.31 (proc-macro)",
+      "tracing-core v0.1.36",
+      "unicode-ident v1.0.24",
+      "uuid v1.22.0",
+      "zmij v1.0.21"
+    ],
+    "all-targets": [
+      "adler2 v2.0.1",
+      "anyhow v1.0.102",
+      "base64 v0.22.1",
+      "bitflags v1.3.2",
+      "bitflags v2.11.0",
+      "block-buffer v0.10.4",
+      "cfg-if v1.0.4",
+      "cfg_aliases v0.1.1",
+      "cpufeatures v0.2.17",
+      "crc32fast v1.5.0",
+      "crypto-common v0.1.7",
+      "digest v0.10.7",
+      "downcast-rs v1.2.1",
+      "fdeflate v0.3.7",
+      "filedescriptor v0.8.3",
+      "flate2 v1.1.9",
+      "generic-array v0.14.7",
+      "getrandom v0.4.2",
+      "ghostty-vt v0.0.0 (/tmp/wfc-herdr-kernel-prototype-r1/crates/ghostty-vt)",
+      "herdr-kernel-prototype v0.0.0 (/tmp/wfc-herdr-kernel-prototype-r1)",
+      "itoa v1.0.18",
+      "lazy_static v1.5.0",
+      "libc v0.2.190",
+      "log v0.4.29",
+      "memchr v2.8.0",
+      "miniz_oxide v0.8.9",
+      "nix v0.28.0",
+      "once_cell v1.21.4",
+      "pin-project-lite v0.2.17",
+      "png v0.17.16",
+      "portable-pty v0.9.0 (/tmp/wfc-herdr-kernel-prototype-r1/vendor/portable-pty)",
+      "proc-macro2 v1.0.106",
+      "quote v1.0.45",
+      "r-efi v6.0.0",
+      "serde v1.0.229",
+      "serde_core v1.0.229",
+      "serde_derive v1.0.229 (proc-macro)",
+      "serde_json v1.0.151",
+      "serial2 v0.2.34",
+      "sha2 v0.10.9",
+      "shell-words v1.1.1",
+      "simd-adler32 v0.3.9",
+      "syn v2.0.117",
+      "syn v3.0.6",
+      "thiserror v1.0.69",
+      "thiserror-impl v1.0.69 (proc-macro)",
+      "tracing v0.1.44",
+      "tracing-attributes v0.1.31 (proc-macro)",
+      "tracing-core v0.1.36",
+      "typenum v1.19.0",
+      "unicode-ident v1.0.24",
+      "uuid v1.22.0",
+      "version_check v0.9.5",
+      "wasip2 v1.0.2+wasi-0.2.9",
+      "wasip3 v0.4.0+wasi-0.3.0-rc-2026-01-06",
+      "winapi v0.3.9",
+      "winapi-i686-pc-windows-gnu v0.4.0",
+      "winapi-x86_64-pc-windows-gnu v0.4.0",
+      "winreg v0.10.1",
+      "wit-bindgen v0.51.0",
+      "zmij v1.0.21"
+    ]
+  },
+  "metadata_packages": [
+    {
+      "name": "adler2",
+      "version": "2.0.1",
+      "license": "0BSD OR MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "anyhow",
+      "version": "1.0.102",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "base64",
+      "version": "0.22.1",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "bitflags",
+      "version": "1.3.2",
+      "license": "MIT/Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "bitflags",
+      "version": "2.11.0",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "block-buffer",
+      "version": "0.10.4",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "bumpalo",
+      "version": "3.20.2",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "cfg-if",
+      "version": "1.0.4",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "cfg_aliases",
+      "version": "0.1.1",
+      "license": "MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "cpufeatures",
+      "version": "0.2.17",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "crc32fast",
+      "version": "1.5.0",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "crypto-common",
+      "version": "0.1.7",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "digest",
+      "version": "0.10.7",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "downcast-rs",
+      "version": "1.2.1",
+      "license": "MIT/Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "equivalent",
+      "version": "1.0.2",
+      "license": "Apache-2.0 OR MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "fdeflate",
+      "version": "0.3.7",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "filedescriptor",
+      "version": "0.8.3",
+      "license": "MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "flate2",
+      "version": "1.1.9",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "foldhash",
+      "version": "0.1.5",
+      "license": "Zlib",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "generic-array",
+      "version": "0.14.7",
+      "license": "MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "getrandom",
+      "version": "0.4.2",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "ghostty-vt",
+      "version": "0.0.0",
+      "license": "Apache-2.0",
+      "source": null
+    },
+    {
+      "name": "hashbrown",
+      "version": "0.15.5",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "hashbrown",
+      "version": "0.16.1",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "heck",
+      "version": "0.5.0",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "herdr-kernel-prototype",
+      "version": "0.0.0",
+      "license": null,
+      "source": null
+    },
+    {
+      "name": "id-arena",
+      "version": "2.3.0",
+      "license": "MIT/Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "indexmap",
+      "version": "2.13.0",
+      "license": "Apache-2.0 OR MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "itoa",
+      "version": "1.0.18",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "js-sys",
+      "version": "0.3.91",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "lazy_static",
+      "version": "1.5.0",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "leb128fmt",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "libc",
+      "version": "0.2.190",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "log",
+      "version": "0.4.29",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "memchr",
+      "version": "2.8.0",
+      "license": "Unlicense OR MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "miniz_oxide",
+      "version": "0.8.9",
+      "license": "MIT OR Zlib OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "nix",
+      "version": "0.28.0",
+      "license": "MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "once_cell",
+      "version": "1.21.4",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "pin-project-lite",
+      "version": "0.2.17",
+      "license": "Apache-2.0 OR MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "png",
+      "version": "0.17.16",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "portable-pty",
+      "version": "0.9.0",
+      "license": "MIT",
+      "source": null
+    },
+    {
+      "name": "prettyplease",
+      "version": "0.2.37",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "proc-macro2",
+      "version": "1.0.106",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "quote",
+      "version": "1.0.45",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "r-efi",
+      "version": "6.0.0",
+      "license": "MIT OR Apache-2.0 OR LGPL-2.1-or-later",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "rustversion",
+      "version": "1.0.22",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "semver",
+      "version": "1.0.27",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "serde",
+      "version": "1.0.229",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "serde_core",
+      "version": "1.0.229",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "serde_derive",
+      "version": "1.0.229",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "serde_json",
+      "version": "1.0.151",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "serial2",
+      "version": "0.2.34",
+      "license": "BSD-2-Clause OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "sha2",
+      "version": "0.10.9",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "shell-words",
+      "version": "1.1.1",
+      "license": "MIT/Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "simd-adler32",
+      "version": "0.3.9",
+      "license": "MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "syn",
+      "version": "2.0.117",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "syn",
+      "version": "3.0.6",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "thiserror",
+      "version": "1.0.69",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "thiserror-impl",
+      "version": "1.0.69",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "tracing",
+      "version": "0.1.44",
+      "license": "MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "tracing-attributes",
+      "version": "0.1.31",
+      "license": "MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "tracing-core",
+      "version": "0.1.36",
+      "license": "MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "typenum",
+      "version": "1.19.0",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "unicode-ident",
+      "version": "1.0.24",
+      "license": "(MIT OR Apache-2.0) AND Unicode-3.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "unicode-xid",
+      "version": "0.2.6",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "uuid",
+      "version": "1.22.0",
+      "license": "Apache-2.0 OR MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "version_check",
+      "version": "0.9.5",
+      "license": "MIT/Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "wasip2",
+      "version": "1.0.2+wasi-0.2.9",
+      "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "wasip3",
+      "version": "0.4.0+wasi-0.3.0-rc-2026-01-06",
+      "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "wasm-bindgen",
+      "version": "0.2.114",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "wasm-bindgen-macro",
+      "version": "0.2.114",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "wasm-bindgen-macro-support",
+      "version": "0.2.114",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "wasm-bindgen-shared",
+      "version": "0.2.114",
+      "license": "MIT OR Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "wasm-encoder",
+      "version": "0.244.0",
+      "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "wasm-metadata",
+      "version": "0.244.0",
+      "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "wasmparser",
+      "version": "0.244.0",
+      "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "winapi",
+      "version": "0.3.9",
+      "license": "MIT/Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "winapi-i686-pc-windows-gnu",
+      "version": "0.4.0",
+      "license": "MIT/Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "winapi-x86_64-pc-windows-gnu",
+      "version": "0.4.0",
+      "license": "MIT/Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "winreg",
+      "version": "0.10.1",
+      "license": "MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "wit-bindgen",
+      "version": "0.51.0",
+      "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "wit-bindgen-core",
+      "version": "0.51.0",
+      "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "wit-bindgen-rust",
+      "version": "0.51.0",
+      "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "wit-bindgen-rust-macro",
+      "version": "0.51.0",
+      "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "wit-component",
+      "version": "0.244.0",
+      "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "wit-parser",
+      "version": "0.244.0",
+      "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    {
+      "name": "zmij",
+      "version": "1.0.21",
+      "license": "MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+  ],
+  "binary": {
+    "bytes": 2811480,
+    "sha256": "ead8b312c079324d28ecb6cb4586b3548cfd378e42a6120c97d7496e27fabe3c"
+  },
+  "full_herdr": {
+    "bytes": 30285672,
+    "sha256": "14d9e8bc8b4a9e0118d77c32266f76d461f09b40342eb23752960bd89f59929d"
+  }
+}

@@ -1,5 +1,7 @@
 # workflow-core
 
+> 开发候选已包含 Windows 核心层、可选 Herdr 后端和便携启动入口，参见 [Windows 分发与验收](docs/windows-distribution.md)。真实 Windows Codex 验收仍待完成；下文发布版 tmux 支持范围仍为基线。
+
 ![wfc · workflow-core：一个总控终端向三个 worker 终端派发任务，消息沿箭头传回](docs/assets/banner.png)
 
 [![CI](https://github.com/xmxxc/workflow-core/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/xmxxc/workflow-core/actions/workflows/ci.yml)
@@ -127,6 +129,8 @@ tmux attach -t wfc-d-1a2b3c4d   # 按 Ctrl-b d 离开
 ```
 
 命令的结果以 JSON 输出；例如 `dispatch` 会输出 dispatch id、标签和 tmux 会话名。
+
+宿主命令路径、runtime argv、环境优先级与启动诊断见 [宿主启动配置](docs/host-launch.md)。桌面、后台 shell 或既有 tmux server 的 PATH 不同时，可使用 `dispatch --launch-config launch.json` 或 `WFC_LAUNCH_CONFIG`。
 
 ## 支持的宿主
 
@@ -367,15 +371,11 @@ Claude Code 和 OpenCode 仍然只按一次回车。它们的输入框量过（C
 
 ## 项目状态与路线图
 
-第一阶段已经可用。xmxxc/example-project 的三张票已经用它走完了派发、审查、发布和真实验收的全过程。
+当前发行版在 Linux/macOS 上通过 tmux 调度 Codex、Claude Code 和 OpenCode 的交互式 worker；原生 Windows 支持仍是后续候选。
 
-1. **完工唤醒**：worker 或审查者做完后，通过宿主自己的入口唤醒总控窗口。不需要常驻调度器，也不需要无头总控。
-2. **不同角色用不同宿主**：GPT 跑在 Codex CLI 里，Claude 跑在 Claude Code 里，其他模型跑在 OpenCode 里。
-3. **独立运行**：总控扫描 `ready-for-agent` 的 issue，先以观察模式运行。
-4. **更轻的总控**：机械性的工作移到代码里。
-5. **更多唤醒来源**：Hermes 网关、MCP 和面板。
+2026-11-13 用户确认的方向是小而完整的 router 基础层：执行身份、可靠消息、观察、中断和恢复。工人、流程政策与外壳建立在其上，super-coding 是当前工作流层。票据扫描、审查门禁和发布决定由调用方负责。
 
-每个阶段都建立在前一阶段之上，每个阶段也都可以单独使用。
+下一步见 [Router 定位与补齐顺序](docs/router-foundation.md)、[源码比较](docs/router-sources-20261113.md)及 [Windows 评估](docs/windows-router-assessment-20261113.md)。所提后端与协议路线尚未实施或在 Windows 验证。新会话从[文档索引](docs/README.md)和[研究验证记录](docs/research-validation-20261113.md)恢复。
 
 ## 开发与发布
 
@@ -401,6 +401,7 @@ python3 build.py                        # 生成 dist/wfc
 
 ### 文档
 
+- [文档索引](docs/README.md)：当前产品方向、源码研究与验证状态。
 - [决策日志](docs/decision-log.md)：用户决定、总控决定和教训。
 - [交接，2026-11-04](docs/handoff-20261104-completion-wake.md)：当时已做的决定、各宿主的唤醒矩阵、需要先做的探针，以及被否决的方向。
 - `docs/probes-20261105-*.md`：实测的唤醒和完工行为，包括 [Claude Code](docs/probes-20261105-claude-code.md)、[Codex](docs/probes-20261105-codex.md)、[OpenCode](docs/probes-20261105-opencode.md)、[Orca](docs/probes-20261105-orca.md)，以及[完工钩子](docs/probes-20261105-completion-hooks.md)。

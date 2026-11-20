@@ -1,0 +1,16 @@
+{
+  "command": [
+    "/usr/bin/python3",
+    "-m",
+    "py_compile",
+    "experiments/herdr-kernel-prototype/build_probe.py",
+    "experiments/herdr-kernel-prototype/controlled_host.py",
+    "experiments/herdr-kernel-prototype/metrics.py",
+    "experiments/herdr-kernel-prototype/prepare.py",
+    "experiments/herdr-kernel-prototype/probe.py"
+  ],
+  "exit": 0,
+  "seconds": 0.30751000400050543,
+  "stdout": "",
+  "stderr": ""
+}

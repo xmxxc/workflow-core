@@ -1,0 +1,266 @@
+[
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/lib/libghostty-vt.a",
+    "bytes": 18532732
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/lib/libghostty-vt.so.0.1.0",
+    "bytes": 10436328
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/lib/libghostty-vt.so.0",
+    "bytes": 10436328
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/lib/libghostty-vt.so",
+    "bytes": 10436328
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt.h",
+    "bytes": 6967
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/io.h",
+    "bytes": 4950
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/terminal.h",
+    "bytes": 89513
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/allocator.h",
+    "bytes": 11017
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/sgr.h",
+    "bytes": 10743
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/key.h",
+    "bytes": 2228
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/paste.h",
+    "bytes": 9965
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/selection.h",
+    "bytes": 44098
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/style.h",
+    "bytes": 2987
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/render.h",
+    "bytes": 33375
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/osc.h",
+    "bytes": 7734
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/point.h",
+    "bytes": 1729
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/build_info.h",
+    "bytes": 3354
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/search.h",
+    "bytes": 19593
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/screen.h",
+    "bytes": 11336
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/grid_ref.h",
+    "bytes": 8028
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/mouse.h",
+    "bytes": 2153
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/color.h",
+    "bytes": 14598
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/device.h",
+    "bytes": 4679
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/kitty_graphics.h",
+    "bytes": 31824
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/wasm.h",
+    "bytes": 5680
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/sys.h",
+    "bytes": 7856
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/types.h",
+    "bytes": 12864
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/grid_ref_tracked.h",
+    "bytes": 4766
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/modes.h",
+    "bytes": 8388
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/unicode.h",
+    "bytes": 6358
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/size_report.h",
+    "bytes": 2994
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/focus.h",
+    "bytes": 2044
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/color_scheme.h",
+    "bytes": 2174
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/snapshot.h",
+    "bytes": 22702
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/formatter.h",
+    "bytes": 7555
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/mouse/encoder.h",
+    "bytes": 6226
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/mouse/event.h",
+    "bytes": 4923
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/key/encoder.h",
+    "bytes": 9149
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/include/ghostty/vt/key/event.h",
+    "bytes": 13432
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/share/pkgconfig/libghostty-vt.pc",
+    "bytes": 357
+  },
+  {
+    "path": "target/release/build/ghostty-vt-084c66292739233d/out/zig-out/share/pkgconfig/libghostty-vt-static.pc",
+    "bytes": 374
+  },
+  {
+    "path": "vendor/libghostty-vt/.zig-cache/o/e2f28bdf83faa84dc634b3eb90cb9c4d/bpf.zig",
+    "bytes": 11291
+  },
+  {
+    "path": "vendor/libghostty-vt/.zig-cache/o/3d33c0c3ab51fecb130d6d46abf0eb70/wuffs_c.h.zig",
+    "bytes": 3136960
+  },
+  {
+    "path": "vendor/libghostty-vt/.zig-cache/o/e0e5bf1a1a72b8ed39f7a322c0ef506c/dependencies.zig",
+    "bytes": 16388
+  },
+  {
+    "path": "vendor/libghostty-vt/.zig-cache/o/36ea6fe5ac8e3165d59e8031a4ececd5/arm.zig",
+    "bytes": 69928
+  },
+  {
+    "path": "vendor/libghostty-vt/.zig-cache/o/6aa1926681617b81bffb4e1d4c1123d8/powerpc.zig",
+    "bytes": 174968
+  },
+  {
+    "path": "vendor/libghostty-vt/.zig-cache/o/d6be1cf2c93867876b25088286369dd2/neon.zig",
+    "bytes": 230420
+  },
+  {
+    "path": "vendor/libghostty-vt/.zig-cache/o/668193c1bc3ee9f8f33a7fba89f952bf/loongarch.zig",
+    "bytes": 269537
+  },
+  {
+    "path": "vendor/libghostty-vt/.zig-cache/o/fbd03ca0b6cd4548d997a410f53439d0/common.zig",
+    "bytes": 461473
+  },
+  {
+    "path": "vendor/libghostty-vt/.zig-cache/o/b69f5ff447449ff2086763d116c8cc1f/symbols.zig",
+    "bytes": 21298
+  },
+  {
+    "path": "vendor/libghostty-vt/.zig-cache/o/b69f5ff447449ff2086763d116c8cc1f/props.zig",
+    "bytes": 117086
+  },
+  {
+    "path": "vendor/libghostty-vt/.zig-cache/o/fb7659b01714206c8f17f0175e963852/wasm.zig",
+    "bytes": 72063
+  },
+  {
+    "path": "vendor/libghostty-vt/.zig-cache/o/f213fe19227c4c809493dbdb6ddb6a01/mips.zig",
+    "bytes": 132741
+  },
+  {
+    "path": "vendor/libghostty-vt/.zig-cache/o/a76da3cd8c677a7c354eab8d3a61bbc5/nvptx.zig",
+    "bytes": 273207
+  },
+  {
+    "path": "vendor/libghostty-vt/.zig-cache/o/134a2198a8da8f6e5f899e5183634246/x86.zig",
+    "bytes": 483594
+  },
+  {
+    "path": "vendor/libghostty-vt/.zig-cache/o/d7aef289e4871c8b2378080ca7c8b739/tables.zig",
+    "bytes": 5447752
+  },
+  {
+    "path": "vendor/libghostty-vt/.zig-cache/o/832d0084f71ac5a99609acb16dfc6f9b/amdgcn.zig",
+    "bytes": 334157
+  },
+  {
+    "path": "vendor/libghostty-vt/.zig-cache/o/8b02644fdcc60ab6783e8aa1e2263183/hexagon.zig",
+    "bytes": 534882
+  },
+  {
+    "path": "vendor/libghostty-vt/.zig-cache/o/5c36e1fe271e851af6744e9289852131/xcore.zig",
+    "bytes": 8523
+  },
+  {
+    "path": "vendor/libghostty-vt/.zig-cache/o/3ea6f85391dfb39cd0f27c4200530260/dependencies.zig",
+    "bytes": 18341
+  },
+  {
+    "path": "vendor/libghostty-vt/.zig-cache/o/4917eb6c6b08d303b3365241b319eadc/ve.zig",
+    "bytes": 176673
+  },
+  {
+    "path": "vendor/libghostty-vt/.zig-cache/o/f51979fe7c8d57bd1f29cfff2529957e/dependencies.zig",
+    "bytes": 18121
+  },
+  {
+    "path": "vendor/libghostty-vt/.zig-cache/o/9b77e1ebd26ada503e1f1134b09f3132/x86_64.zig",
+    "bytes": 82481
+  },
+  {
+    "path": "vendor/libghostty-vt/.zig-cache/o/b47b733387bb23aeba2f3c69e97ac778/s390x.zig",
+    "bytes": 75190
+  },
+  {
+    "path": "vendor/libghostty-vt/.zig-cache/o/1b438d28fd5af208f77add0724539915/riscv.zig",
+    "bytes": 30329
+  },
+  {
+    "path": "vendor/libghostty-vt/.zig-cache/o/aec6f6b120cf672071ba45ee28cede5a/aarch64.zig",
+    "bytes": 87381
+  }
+]

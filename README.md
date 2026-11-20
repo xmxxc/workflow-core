@@ -1,5 +1,7 @@
 # workflow-core
 
+> Development candidate: native Windows core, optional Herdr backend and portable entrypoints are documented in [Windows distribution and acceptance](docs/windows-distribution.md). Real Windows Codex acceptance is pending; the released tmux support scope below remains the baseline.
+
 ![wfc · workflow-core: one controller terminal dispatching to three worker terminals, with messages flowing back](docs/assets/banner.png)
 
 [![CI](https://github.com/xmxxc/workflow-core/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/xmxxc/workflow-core/actions/workflows/ci.yml)
@@ -146,6 +148,8 @@ Commands print their result as JSON; `dispatch`, for one, prints the dispatch id
 
 Pin `--model` for OpenCode: its default model can be a rate-limited free one.
 
+Host executable paths, explicit runtime argv, environment precedence and launch diagnostics are documented in [Host launch configuration](docs/host-launch.md). Use `dispatch --launch-config launch.json` or `WFC_LAUNCH_CONFIG` when a desktop/background shell or an existing tmux server has a different PATH.
+
 ## Command reference
 
 ```sh
@@ -186,6 +190,7 @@ wfc ask "<question>" --options a,b
 - **`wait`** blocks until a worker message arrives (`done`, a question, `blocked`, `stalled` or `exited`) and exits with code 3 on timeout. `--stall-after` (default 300) is how many seconds a worker's screen may stay unchanged before it is reported `stalled`.
 - **`relay`** is the `wait` of a Codex or OpenCode controller: it pushes messages into the controller session instead. `--detach` runs it in a new session with output to `$WFC_STATE/relay.log` and prints its pid and log path; `--for <seconds>` stops it after that long (by default it runs on).
   - `--codex`, run from inside the Codex controller, takes the thread from `$CODEX_THREAD_ID`. `--codex-thread <uuid>` names a thread instead. Both are checked before relay starts; see [Codex thread check](#codex-thread-check).
+  - `--scope <scope>` limits delivery and watchdog checks to that scope, including with `--detach`. An unowned scope needs no token. A claimed scope requires its current, unexpired token through `--owner-token`, `$WFC_CONTROLLER_TOKEN`, or `$WFC_OWNER_TOKEN`.
   - `--opencode-url` and `--opencode-session` deliver over OpenCode's `prompt_async` HTTP API; the OpenCode controller must be started with `--port`.
 
 ### Inspecting
@@ -367,15 +372,11 @@ The design of `super-coding` is recorded here, in `docs/decision-log.md` and `do
 
 ## Project status and roadmap
 
-Phase 1 is functional. Three tickets in xmxxc/example-project were taken through dispatch, review, release and live acceptance with it.
+The current release routes interactive Codex, Claude Code and OpenCode workers through tmux on Linux and macOS; native Windows support remains a proposed next step.
 
-1. **Completion wake**: a finished worker or reviewer wakes the controller window through its host's own entry point. Neither a resident scheduler nor a headless controller is required.
-2. **Different hosts for different roles**: GPT runs in Codex CLI, Claude in Claude Code, and other models in OpenCode.
-3. **Independent run**: the controller scans `ready-for-agent` issues, in observe mode first.
-4. **Lighter controller**: mechanical work moves into code.
-5. **More wake sources**: Hermes gateway, MCP and a panel.
+The product direction confirmed on 2026-11-13 is a small, complete router foundation: execution identity, reliable messages, observation, interruption and recovery. Workflow policies, workers and interfaces build on top; super-coding is the current workflow layer. Issue scanning, review gates and release decisions belong to those callers.
 
-Each phase adds to the previous one, and each phase can be used on its own.
+Read the [router foundation and implementation order](docs/router-foundation.md), [source comparison](docs/router-sources-20261113.md) and [native Windows assessment](docs/windows-router-assessment-20261113.md). Proposed backends and protocol paths have not been implemented or verified on Windows. The [documentation index](docs/README.md) and [research validation record](docs/research-validation-20261113.md) are the entry points for a new session.
 
 ## Development and releases
 
@@ -401,6 +402,7 @@ python3 build.py                        # writes dist/wfc
 
 ### Documents
 
+- [Documentation index](docs/README.md): current direction, source research and validation status.
 - [Decision log](docs/decision-log.md): user decisions, controller decisions and lessons.
 - [Handoff, 2026-11-04](docs/handoff-20261104-completion-wake.md): decisions made so far, the host wake matrix, the probes to run first, and the directions that were rejected.
 - `docs/probes-20261105-*.md`: measured wake and completion behaviour of [Claude Code](docs/probes-20261105-claude-code.md), [Codex](docs/probes-20261105-codex.md), [OpenCode](docs/probes-20261105-opencode.md) and [Orca](docs/probes-20261105-orca.md), plus [completion hooks](docs/probes-20261105-completion-hooks.md).

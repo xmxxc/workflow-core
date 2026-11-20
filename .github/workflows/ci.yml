@@ -15,6 +15,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         python: ["3.9", "3.12"]
+        exclude:
+          - os: ubuntu-latest
+            python: "3.9"
+        include:
+          - os: ubuntu-24.04
+            python: "3.9"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -29,3 +35,76 @@ jobs:
           python build.py --out dist/wfc
           dist/wfc --version
           dist/wfc --help
+
+  windows-core:
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.12"]
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Native core and backend contracts
+        run: |
+          python -m unittest discover -s tests -p test_platform.py -v
+          python -m unittest discover -s tests -p test_backend.py -v
+          python -m unittest discover -s tests -p test_distribution.py -v
+      - name: Native Herdr fixture Job cleanup
+        run: python -m unittest discover -s tests -p test_herdr_cleanup.py -v
+      - name: Build and inspect native zipapp
+        run: |
+          python build.py --out dist/wfc.pyz
+          python dist/wfc.pyz --version
+          python dist/wfc.pyz --help
+          python dist/wfc.pyz status
+
+  herdr-contract:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: "3.12"
+      - name: Fetch pinned test-only Herdr
+        shell: pwsh
+        run: |
+          $binary = python tools/fetch_test_herdr.py --out .herdr-test
+          "WFC_HERDR_TEST_BINARY=$binary" >> $env:GITHUB_ENV
+      - name: Real Herdr with controlled host
+        run: python -m unittest discover -s tests -p test_herdr.py -v
+      - name: Build portable payload
+        run: python build.py --windows-dir "dist/portable with spaces"
+      - name: Real Herdr through packaged payload
+        env:
+          WFC_TEST_PROGRAM: dist/portable with spaces/wfc.pyz
+        run: python -m unittest discover -s tests -p test_herdr.py -v
+      - name: Prepare Windows candidate for manual testing
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Copy-Item docs/verification/windows-opencode-candidate.md 'dist/portable with spaces/README-candidate.md'
+          Copy-Item docs/herdr-backend.md,docs/host-launch.md 'dist/portable with spaces/'
+          git rev-parse HEAD | Set-Content -Encoding ascii 'dist/portable with spaces/COMMIT.txt'
+          Compress-Archive -Path 'dist/portable with spaces/*' -DestinationPath dist/wfc-opencode2-windows.zip
+          $hash = (Get-FileHash dist/wfc-opencode2-windows.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  wfc-opencode2-windows.zip" | Set-Content -Encoding ascii dist/SHA256SUMS
+      - name: Upload Windows candidate
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: windows-candidate-${{ github.sha }}
+          path: |
+            dist/wfc-opencode2-windows.zip
+            dist/SHA256SUMS
+          retention-days: 14

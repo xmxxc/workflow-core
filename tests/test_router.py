@@ -5,6 +5,7 @@ import fcntl
 import json
 import os
 import shlex
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -12,6 +13,9 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+import wfc_platform
 
 ROUTER = Path(__file__).resolve().parent.parent / "router.py"
 
@@ -56,7 +60,14 @@ class Env:
                 f"sessions = {str(self.sessions)!r}\n"
                 f"if {name!r} == 'tmux' and sys.argv[1] == 'new-session':\n"
                 f"    time.sleep(float(os.environ.get('FAKE_LAUNCH_DELAY', '0')))\n"
+                f"    if '_host-run' in sys.argv:\n"
+                f"        spec_path = sys.argv[sys.argv.index('_host-run') + 1]\n"
+                f"        spec = json.load(open(spec_path))\n"
+                f"        json.dump({{'category': 'started', 'diagnostic': 'fake host started'}}, open(spec['receipt'], 'w'))\n"
+                f"        os.unlink(spec_path)\n"
                 f"    session_env = dict(sys.argv[i + 1].split('=', 1) for i, a in enumerate(sys.argv) if a == '-e')\n"
+                f"    if '_host-run' in sys.argv and 'OPENCODE_CONFIG_CONTENT' in spec['env']:\n"
+                f"        session_env['OPENCODE_CONFIG_CONTENT'] = spec['env']['OPENCODE_CONFIG_CONTENT']\n"
                 f"    open(os.path.join(sessions, sys.argv[sys.argv.index('-s') + 1]), 'w').write(json.dumps(session_env))\n"
                 f"if {name!r} == 'tmux' and sys.argv[1] == 'has-session':\n"
                 f"    sys.exit(0 if os.path.exists(os.path.join(sessions, sys.argv[sys.argv.index('-t') + 1])) else 1)\n"
@@ -83,6 +94,8 @@ class Env:
                 f"    print(sys.argv[-1] + '=' + value)\n"
                 f"if {name!r} == 'tmux' and sys.argv[1] == 'kill-session':\n"
                 f"    target = sys.argv[sys.argv.index('-t') + 1]\n"
+                f"    if os.environ.get('FAKE_KILL_RECEIPT'):\n"
+                f"        json.dump({{'category':'process_exited','diagnostic':'exited during close','exitCode':143}}, open(os.environ['FAKE_KILL_RECEIPT'], 'w'))\n"
                 f"    if os.environ.get('FAKE_KILL_FAIL') == target or not os.path.exists(os.path.join(sessions, target)):\n"
                 f"        sys.exit(1)\n"
                 f"    os.unlink(os.path.join(sessions, target))\n"
@@ -183,6 +196,119 @@ class MessageRoundTrip(unittest.TestCase):
         self.assertIn("blue", text_call[-1])
         self.assertIn(str(question["id"]), text_call[-1])
         self.assertEqual(enter_call, ["tmux", "send-keys", "-t", f"wfc-{dispatch}", "Enter"])
+
+    def test_stable_done_receipt_is_idempotent_and_ack_is_versioned(self):
+        dispatch = self.env.dispatch()
+        self.env.report.write_text("# report\n")
+        first = self.env.run("done", "--report", str(self.env.report), "--message-id", "receipt-1", dispatch=dispatch)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        first_json = json.loads(first.stdout)
+        delivered = self.env.json("wait", "--timeout", "2")["messages"]
+        self.assertEqual(delivered[0]["messageId"], first_json["messageId"])
+        self.assertEqual(delivered[0]["state"], "received")
+        duplicate = self.env.run("done", "--report", str(self.env.report), "--message-id", "receipt-1", dispatch=dispatch)
+        self.assertEqual(duplicate.returncode, 0, duplicate.stderr)
+        self.assertEqual(json.loads(duplicate.stdout)["messageId"], first_json["messageId"])
+        self.assertEqual(self.env.json("wait", "--timeout", "0.1"), {"messages": [], "timedOut": True})
+        ack = self.env.json("ack", first_json["messageId"])
+        self.assertEqual((ack["state"], ack["statusVersion"], ack["duplicate"]), ("processed", 3, False))
+        again = self.env.json("ack", first_json["messageId"])
+        self.assertTrue(again["duplicate"])
+
+    def test_stable_receipt_with_different_content_is_rejected(self):
+        dispatch = self.env.dispatch()
+        first = self.env.run("ask", "first", "--message-id", "receipt-2", dispatch=dispatch)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        result = self.env.run("ask", "second", "--message-id", "receipt-2", dispatch=dispatch)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("conflicts", result.stderr)
+
+    def test_ack_body_must_match_even_after_processing(self):
+        dispatch = self.env.dispatch()
+        self.env.json("ask", "Ready?", dispatch=dispatch)
+        [question] = self.env.json("wait", "--timeout", "2")["messages"]
+        ack = ("ack", question["messageId"])
+        body = json.dumps({key: question[key] for key in ("question", "options", "scope", "role", "round", "attempt")},
+                          sort_keys=True, ensure_ascii=False)
+
+        def assert_body_conflict(*args):
+            rejected = self.env.run(*ack, "--body", "{}", *args)
+            self.assertNotEqual(rejected.returncode, 0, rejected.stdout)
+            self.assertIn("ACK conflicts with its body", rejected.stderr)
+
+        assert_body_conflict()
+        first = self.env.json(*ack, "--body", body)
+        self.assertEqual((first["state"], first["statusVersion"], first["duplicate"]), ("processed", 3, False))
+        owner = self.env.json("owner", "acquire", "--scope", question["scope"])
+        fenced = self.env.run(*ack, "--body", "{}", "--owner-token", "wrong-token")
+        self.assertNotEqual(fenced.returncode, 0)
+        self.assertEqual(json.loads(fenced.stderr)["error"], "stale_controller_owner")
+
+        token = ("--owner-token", owner["token"])
+        assert_body_conflict(*token)
+        for args in (("--body", body), ()):
+            self.assertEqual(self.env.json(*ack, *token, *args), {**first, "duplicate": True})
+        [stored] = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]["messages"]
+        self.assertEqual((stored["messageId"], stored["state"], stored["statusVersion"], stored["delivered"]),
+                         (question["messageId"], "processed", 3, True))
+
+    def test_ack_before_receive_is_rejected_and_does_not_regress(self):
+        dispatch = self.env.dispatch()
+        self.env.report.write_text("# report\n")
+        done = self.env.run("done", "--report", str(self.env.report), "--message-id", "receipt-3", dispatch=dispatch)
+        message_id = json.loads(done.stdout)["messageId"]
+        rejected = self.env.run("ack", message_id)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("requires received", rejected.stderr)
+        received = self.env.json("wait", "--timeout", "2")["messages"][0]
+        self.assertEqual(received["state"], "received")
+
+    def test_attempt_aware_legacy_shape_gets_a_stable_default_receipt_key(self):
+        dispatch = self.env.dispatch()
+        self.env.report.write_text("# report\n")
+        attempt = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]["attempt"]
+        first = self.env.run("done", "--report", str(self.env.report), "--attempt", attempt, dispatch=dispatch)
+        second = self.env.run("done", "--report", str(self.env.report), "--attempt", attempt, dispatch=dispatch)
+        self.assertEqual((first.returncode, second.returncode), (0, 0))
+        self.env.json("wait", "--timeout", "2")
+        self.assertEqual(self.env.json("wait", "--timeout", "0.1"), {"messages": [], "timedOut": True})
+
+    def test_unknown_receipt_has_explicit_resolve_path(self):
+        dispatch = self.env.dispatch()
+        self.env.report.write_text("# report\n")
+        done = self.env.json("done", "--report", str(self.env.report), "--message-id", "receipt-4", dispatch=dispatch)
+        db = sqlite3.connect(self.env.state / "router.db")
+        db.execute("UPDATE message SET state='unknown', delivered=0, status_version=2 WHERE id=?", (done["message"],))
+        db.commit(); db.close()
+        db = sqlite3.connect(self.env.state / "router.db")
+        body_hash = db.execute("SELECT body_hash FROM message WHERE id=?", (done["message"],)).fetchone()[0]
+        db.close()
+        rejected = self.env.run("resolve", done["messageId"], "--actor", "controller-1", "--reason", "verified",
+                                "--evidence", "queue-receipt-1", "--body-hash", "bad")
+        self.assertNotEqual(rejected.returncode, 0)
+        resolved = self.env.json("resolve", done["messageId"], "--actor", "controller-1", "--reason", "verified",
+                                 "--evidence", "queue-receipt-1", "--body-hash", body_hash)
+        self.assertEqual((resolved["state"], resolved["statusVersion"], resolved["resolution"]["actor"]),
+                         ("received", 3, "controller-1"))
+        duplicate = self.env.json("resolve", done["messageId"], "--actor", "controller-1", "--reason", "verified",
+                                  "--evidence", "queue-receipt-1", "--body-hash", body_hash)
+        self.assertTrue(duplicate["duplicate"])
+        conflict = self.env.run("resolve", done["messageId"], "--actor", "controller-2", "--reason", "verified",
+                                "--evidence", "queue-receipt-2", "--body-hash", body_hash)
+        self.assertNotEqual(conflict.returncode, 0)
+        self.assertIn("conflicts", conflict.stderr)
+
+    def test_done_replay_uses_stored_snapshot_when_worktree_changes(self):
+        subprocess.run(["git", "-C", str(self.env.cwd), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(self.env.cwd), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                        "commit", "-q", "--allow-empty", "-m", "one"], check=True)
+        dispatch = self.env.dispatch()
+        self.env.report.write_text("# report\n")
+        attempt = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]["attempt"]
+        first = self.env.json("done", "--report", str(self.env.report), "--attempt", attempt, dispatch=dispatch)
+        (self.env.cwd / "unrelated.txt").write_text("later\n")
+        second = self.env.json("done", "--report", str(self.env.report), "--attempt", attempt, dispatch=dispatch)
+        self.assertEqual((second["messageId"], second["duplicate"]), (first["messageId"], True))
 
 
 def make_repo(main, worktree=None):
@@ -477,6 +603,13 @@ class Delivery(unittest.TestCase):
         self.assertIn(f"{router} ask ", brief)
         self.assertIn("Never ask questions in plain text or with an interactive question tool", brief)
 
+    def test_dispatch_and_status_expose_the_execution_backend(self):
+        dispatch = self.env.dispatch("codex")
+
+        view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+
+        self.assertEqual(view["backend"], "tmux")
+
     def test_every_host_gets_its_worker_identity_and_a_created_report_directory(self):
         self.env.report = self.env.report.parent / "new-scope" / "113-impl-r1.md"
         for host in ("codex", "opencode", "claude"):
@@ -510,8 +643,8 @@ class Delivery(unittest.TestCase):
         self.env.dispatch("opencode")
 
         [call] = self.env.host_calls()
-        config = json.loads(next(a for a in call if a.startswith("OPENCODE_CONFIG_CONTENT="))
-                            .split("=", 1)[1])
+        marker = self.env.sessions / call[call.index("-s") + 1]
+        config = json.loads(json.loads(marker.read_text())["OPENCODE_CONFIG_CONTENT"])
         # User decision 2026-11-05: OpenCode's directory rules are tool prompts, not a sandbox
         # (shell writes bypass them), and git/pnpm touch ~ constantly, so unattended workers allow all.
         # "*" overrides any narrower rule in the user's own config, which OpenCode merges in.
@@ -889,6 +1022,73 @@ class ClaudeTrust(unittest.TestCase):
         self.assertEqual(self.dispatch("codex"), before)
 
 
+class CodexQueueCall(unittest.TestCase):
+    """Queue launch contract; mocked runs never address a real Desktop session."""
+
+    THREAD = '00000000-0000-4000-8000-000000000035'
+    MESSAGES = [{'id': 101, 'type': 'question', 'question': 'controlled 中文'}]
+    TEXT = '[router] Messages for the controller: {"messages": [{"id": 101, "type": "question", "question": "controlled 中文"}]}'
+
+    def call_queue(self, windows, result=None, error=None):
+        import router
+        with patch.dict(os.environ, {'WFC_QUEUE_TIMEOUT': '7.25'}), \
+                patch.object(router.wfc_platform, 'WINDOWS', windows), \
+                patch.object(router.subprocess, 'CREATE_NO_WINDOW', 0x08000000, create=True), \
+                patch.object(router.subprocess, 'run', return_value=result, side_effect=error) as run:
+            outcome = router.queue_into_codex(self.THREAD, self.MESSAGES)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args, (['codex', 'queue', '--thread', self.THREAD,
+                                              '--message', self.TEXT, '--resume'],))
+        return outcome, run.call_args.kwargs
+
+    def test_windows_queue_uses_only_create_no_window_and_original_run_contract(self):
+        result = subprocess.CompletedProcess([], 0, stdout='', stderr='')
+        outcome, options = self.call_queue(True, result)
+        self.assertEqual(outcome, 'delivered')
+        self.assertEqual(options, {'capture_output': True, 'text': True, 'timeout': 7.25,
+                                   'creationflags': 0x08000000})
+
+    def test_posix_queue_retains_exact_original_kwargs(self):
+        result = subprocess.CompletedProcess([], 0, stdout='', stderr='')
+        outcome, options = self.call_queue(False, result)
+        self.assertEqual(outcome, 'delivered')
+        self.assertEqual(options, {'capture_output': True, 'text': True, 'timeout': 7.25})
+
+    def test_oserror_means_failed_without_a_second_queue_call(self):
+        for windows in (False, True):
+            with self.subTest(windows=windows):
+                outcome, _ = self.call_queue(windows, error=OSError('controlled missing queue executable'))
+                self.assertEqual(outcome, 'failed')
+
+    def test_timeout_stays_uncertain_without_a_second_queue_call(self):
+        for windows in (False, True):
+            with self.subTest(windows=windows):
+                outcome, _ = self.call_queue(windows, error=subprocess.TimeoutExpired('controlled queue', 7.25))
+                self.assertEqual(outcome, 'uncertain')
+
+    def test_nonzero_exit_stays_uncertain_without_a_second_queue_call(self):
+        for windows in (False, True):
+            with self.subTest(windows=windows):
+                result = subprocess.CompletedProcess([], 5, stdout='', stderr='controlled queue error')
+                outcome, _ = self.call_queue(windows, result)
+                self.assertEqual(outcome, 'uncertain')
+
+    def test_missing_rollout_stays_missing_without_a_second_queue_call(self):
+        for windows in (False, True):
+            with self.subTest(windows=windows):
+                result = subprocess.CompletedProcess([], 1, stdout='', stderr='no rollout found for thread controlled')
+                outcome, _ = self.call_queue(windows, result)
+                self.assertEqual(outcome, 'missing')
+
+    def test_exit_zero_with_resume_warning_stays_delivered(self):
+        for windows in (False, True):
+            with self.subTest(windows=windows):
+                result = subprocess.CompletedProcess([], 0, stdout='controlled queued',
+                                                     stderr='warning: could not resume the controller session')
+                outcome, _ = self.call_queue(windows, result)
+                self.assertEqual(outcome, 'delivered')
+
+
 class CodexRelay(unittest.TestCase):
     """relay pushes controller messages into a Codex controller session with codex queue."""
 
@@ -921,6 +1121,10 @@ class CodexRelay(unittest.TestCase):
         message = call[call.index("--message") + 1]
         self.assertIn('"type": "done"', message)
         self.assertIn(self.dispatch, message)
+        self.assertIn('"state": "unknown"', message)
+        self.assertIn('"delivery": "pending"', message)
+        self.assertEqual(self.env.json("status", "--dispatch", self.dispatch)["dispatches"][0]["messages"][0]["state"],
+                         "received")
 
     def test_a_queue_that_exited_non_zero_is_not_retried(self):
         # A non-zero exit does not prove codex did not take the batch (it may die after accepting),
@@ -932,6 +1136,8 @@ class CodexRelay(unittest.TestCase):
         self.assertEqual(len([c for c in self.env.host_calls() if c[:2] == ["codex", "queue"]]), 1)
         self.assertIn("uncertain", result.stdout)
         self.assertEqual(self.env.json("wait", "--timeout", "0.5")["messages"], [])
+        self.assertEqual(self.env.json("status", "--dispatch", self.dispatch)["dispatches"][0]["messages"][0]["state"],
+                         "unknown")
 
     def test_messages_stay_waiting_when_codex_is_not_installed(self):
         self.env.run("done", "--report", str(self.env.report), dispatch=self.dispatch)
@@ -974,6 +1180,179 @@ class CodexRelay(unittest.TestCase):
         [call] = self.queued()
         self.assertIn('"type": "done"', call[call.index("--message") + 1])
 
+
+
+class ScopedDetachedCodexRelay(unittest.TestCase):
+    """Exercise the original CLI and real child, with an isolated Codex queue recorder."""
+
+    THREAD = CodexRelay.THREAD
+    SCOPE = "detached-scope"
+
+    def setUp(self):
+        clean_env = patch.dict(os.environ)
+        clean_env.start()
+        self.addCleanup(clean_env.stop)
+        for key in ("WFC_CONTROLLER_TOKEN", "WFC_OWNER_TOKEN"):
+            os.environ.pop(key, None)
+        self.env = Env()
+        self.addCleanup(self.env.close)
+        self.env.codex_controller(self.THREAD)
+        self.env.report.write_text("# scoped detached report\n")
+
+    def relay(self, *args, seconds="2", env=None):
+        return self.env.run("relay", "--codex", "--scope", self.SCOPE,
+                            "--stall-after", "180", "--for", seconds, "--detach", *args,
+                            env={"CODEX_THREAD_ID": self.THREAD, **(env or {})})
+
+    def queued(self):
+        return [c for c in self.env.host_calls() if c[:2] == ["codex", "queue"]]
+
+    def until(self, predicate, timeout=5):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            value = predicate()
+            if value:
+                return value
+            time.sleep(0.05)
+        self.fail("detached relay did not reach the expected state")
+
+    def start(self, *args, **kwargs):
+        result = self.relay(*args, **kwargs)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        started = json.loads(result.stdout)
+        pid = started["pid"]
+        identity = wfc_platform.process_identity(pid)
+
+        def stop_child():
+            if not started.get("exited") and identity and wfc_platform.process_identity(pid) == identity:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+
+        self.addCleanup(stop_child)
+        self.until(lambda: any(w["pid"] == pid and w["kind"] == "relay"
+                               for w in self.env.json("status")["waiters"]))
+        os.kill(pid, 0)
+        self.assertNotEqual(os.getsid(pid), os.getsid(0))
+        return started
+
+    def finished(self, started):
+        # A detached child cannot be waitpid'ed by this test. Observe its actual exit,
+        # including an exited zombie awaiting the system reaper, rather than just its PID.
+        def exited():
+            state = subprocess.run(["ps", "-o", "stat=", "-p", str(started["pid"])],
+                                   capture_output=True, text=True).stdout.strip()
+            return not state or state.startswith("Z")
+
+        self.until(exited, timeout=8)
+        started["exited"] = True
+        self.assertEqual(self.env.json("status")["waiters"], [])
+        return Path(started["log"]).read_text()
+
+    def messages(self, dispatch):
+        return self.env.json("status", "--dispatch", dispatch)["dispatches"][0]["messages"]
+
+    def assert_envelope(self, before):
+        [call] = self.queued()
+        expected = {key: value for key, value in before.items() if key not in ("at", "to", "delivered")}
+        version = before["statusVersion"] + 1
+        expected.update(state="unknown", statusVersion=version, delivery="pending",
+                        deliveryAttempt=f"relay:{before['messageId']}:{version}")
+        self.assertEqual(call, ["codex", "queue", "--thread", self.THREAD, "--message",
+                               "[router] Messages for the controller: " + json.dumps({"messages": [expected]},
+                                                                                   ensure_ascii=False),
+                               "--resume"])
+
+    def test_unowned_scope_without_token_delivers_only_its_exact_envelope(self):
+        dispatch = self.env.dispatch(extra_args=("--scope", self.SCOPE))
+        other = self.env.dispatch(extra_args=("--scope", "other-scope"))
+        self.env.json("done", "--report", str(self.env.report), dispatch=other)
+        unrelated = self.env.dispatch(extra_args=("--scope", "other-scope"))
+        self.env.end_session(unrelated)  # a scoped relay must not scan this worker either
+        started = self.start()
+        # The original launcher has returned; only its real detached child can deliver this.
+        receipt = self.env.json("done", "--report", str(self.env.report), dispatch=dispatch)
+        [before] = self.messages(dispatch)
+        before.update(state=receipt["state"], statusVersion=receipt["statusVersion"])
+        self.until(self.queued)
+        self.assertNotIn("Traceback", self.finished(started))
+        self.assert_envelope(before)
+        self.assertEqual(self.messages(dispatch)[0]["state"], "received")
+        self.assertEqual(self.messages(other)[0]["state"], "unsent")
+        self.assertEqual(self.messages(unrelated), [])
+        ack = self.env.json("ack", before["messageId"])
+        self.assertEqual(ack["state"], "processed")
+
+    def test_claimed_scope_accepts_explicit_and_environment_tokens(self):
+        for source in ("argument", "WFC_CONTROLLER_TOKEN", "WFC_OWNER_TOKEN"):
+            with self.subTest(source=source):
+                owner = self.env.json("owner", "takeover", "--scope", self.SCOPE, "--lease", "60")
+                token = owner["token"]
+                dispatch = self.env.dispatch(extra_args=("--scope", self.SCOPE, "--owner-token", token))
+                args = ("--owner-token", token) if source == "argument" else ()
+                env = {} if source == "argument" else {source: token}
+                # An explicit credential must also override a stale environment credential.
+                if source == "argument":
+                    env = {"WFC_CONTROLLER_TOKEN": "stale-test-token"}
+                started = self.start(*args, seconds="1.5", env=env)
+                self.env.json("done", "--report", str(self.env.report), "--owner-token", token,
+                              dispatch=dispatch)
+                self.until(lambda: self.messages(dispatch)[0]["state"] == "received")
+                self.assertNotIn("stale_controller_owner", self.finished(started))
+                self.assertEqual(self.env.json("ack", self.messages(dispatch)[0]["messageId"],
+                                               "--owner-token", token)["state"], "processed")
+        self.assertEqual(len(self.queued()), 3)
+
+    def test_claimed_scope_refuses_missing_stale_and_expired_credentials_before_launch(self):
+        first = self.env.json("owner", "acquire", "--scope", self.SCOPE)
+        dispatch = self.env.dispatch(extra_args=("--scope", self.SCOPE, "--owner-token", first["token"]))
+        self.env.end_session(dispatch)
+        second = self.env.json("owner", "takeover", "--scope", self.SCOPE)
+        cases = [((), {}), (("--owner-token", first["token"]), {}),
+                 ((), {"WFC_CONTROLLER_TOKEN": first["token"]}),
+                 ((), {"WFC_OWNER_TOKEN": first["token"]})]
+        for args, env in cases:
+            result = self.relay(*args, env=env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(json.loads(result.stderr)["error"], "stale_controller_owner")
+            self.assertEqual(result.stdout, "")
+        expired = self.env.json("owner", "takeover", "--scope", self.SCOPE, "--lease", "-1")
+        result = self.relay("--owner-token", expired["token"])
+        self.assertFalse(json.loads(result.stderr)["active"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        unscoped = self.env.run("relay", "--codex", "--detach", env={"CODEX_THREAD_ID": self.THREAD})
+        self.assertEqual(json.loads(unscoped.stderr)["error"], "controller_owner_required")
+        self.assertNotEqual(second["token"], first["token"])
+        self.assertEqual(self.queued(), [])
+        self.assertEqual(self.messages(dispatch), [])  # no watchdog side effects
+        self.assertEqual(self.env.json("status")["waiters"], [])
+        self.assertFalse((self.env.state / "relay.log").exists())
+
+    def test_running_child_is_fenced_after_takeover(self):
+        first = self.env.json("owner", "acquire", "--scope", self.SCOPE)
+        dispatch = self.env.dispatch(extra_args=("--scope", self.SCOPE, "--owner-token", first["token"]))
+        started = self.start("--owner-token", first["token"], seconds="4")
+        second = self.env.json("owner", "takeover", "--scope", self.SCOPE)
+        self.env.json("done", "--report", str(self.env.report), "--owner-token", second["token"],
+                      dispatch=dispatch)
+        self.assertIn("stale_controller_owner", self.finished(started))
+        self.assertEqual(self.queued(), [])
+        self.assertEqual(self.messages(dispatch)[0]["state"], "unsent")
+
+    def test_unknown_delivery_is_not_replayed_by_a_new_detached_child(self):
+        dispatch = self.env.dispatch(extra_args=("--scope", self.SCOPE))
+        self.env.json("done", "--report", str(self.env.report), dispatch=dispatch)
+        [before] = self.messages(dispatch)
+        started = self.start(seconds="0.5", env={"FAKE_FAIL": "queue"})
+        self.assertIn("uncertain", self.finished(started))
+        self.assert_envelope(before)
+        self.assertEqual(self.messages(dispatch)[0]["state"], "unknown")
+        self.finished(self.start(seconds="0.5"))
+        self.assertEqual(len(self.queued()), 1)
+        self.assertEqual(self.messages(dispatch)[0]["state"], "unknown")
+        self.assertEqual(self.env.json("wait", "--scope", self.SCOPE, "--timeout", "0")["messages"], [])
 
 
 class CodexRelayThread(unittest.TestCase):
@@ -1178,6 +1557,31 @@ class Resume(unittest.TestCase):
         self.assertNotIn("--prompt", opencode)
         typed = [c for c in self.env.host_calls() if c[:2] == ["tmux", "send-keys"] and "-l" in c]
         self.assertIn(str(self.env.report), typed[-1][-1])
+
+    def test_opencode_v2_session_is_discovered_for_resume(self):
+        self.env.screen.write_text("> ready\n")
+        dispatch = self.env.dispatch("opencode")
+        # OpenCode v2.0.12 tag 2670273: session/sql.ts + schema/session-message.ts.
+        with sqlite3.connect(self.env.bin.parent / "opencode.db") as db:
+            db.executescript("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT, time_created INTEGER);"
+                             "CREATE TABLE session_message (id TEXT, session_id TEXT, type TEXT, seq INTEGER, "
+                             "time_created INTEGER, data TEXT);")
+            db.execute("INSERT INTO session_v2 VALUES ('ses_v2-main', NULL, 2)")
+            brief = f"You are a worker dispatched by the controller (dispatch {dispatch}). Read ..."
+            db.execute("INSERT INTO session_message VALUES ('msg_user', 'ses_v2-main', 'user', 1, 2, ?)",
+                       (json.dumps({"text": brief, "files": [], "agents": [], "skills": []}),))
+            for name, parent, kind, text in (("ses_child", "ses_v2-main", "user", brief),
+                                              ("ses_controller", None, "user", "[router] quoted " + brief),
+                                              ("ses_assistant", None, "assistant", brief),
+                                              ("ses_synthetic", None, "synthetic", brief)):
+                db.execute("INSERT INTO session_v2 VALUES (?, ?, 1)", (name, parent))
+                db.execute("INSERT INTO session_message VALUES (?, ?, ?, 1, 1, ?)",
+                           ("msg_" + name, name, kind, json.dumps({"text": text})))
+        self.env.end_session(dispatch)
+        self.env.json("resume", dispatch, env={"FAKE_SCREEN": str(self.env.screen)}, timeout=20)
+        [_, again] = self.launch(dispatch)
+        opencode = again[again.index("opencode"):]
+        self.assertEqual(opencode[opencode.index("-s") + 1], "ses_v2-main")
 
     def test_a_resumed_worker_is_watched_again(self):
         dispatch = self.env.dispatch("claude")
@@ -1486,9 +1890,14 @@ class ResumePartialTyping(unittest.TestCase):
         first = env.run("resume", dispatch, "--task", str(task2), "--report", str(report2),
                         env={**screen, "FAKE_ENTER_FAIL": "1"}, timeout=20)
         env.end_session(dispatch)
+        blocked = env.run("resume", dispatch, env=screen, timeout=20)
+        audit = env.json("status", "--dispatch", dispatch)["dispatches"][0]["audit"][-1]["id"]
+        env.json("reconcile", dispatch, str(audit), "--result", "definitely-not-sent",
+                 "--actor", "operator-1", "--evidence", "enter-failed")
         second = env.run("resume", dispatch, env=screen, timeout=20)
 
         self.assertNotEqual(first.returncode, 0)
+        self.assertNotEqual(blocked.returncode, 0)
         self.assertEqual(second.returncode, 0, second.stderr)
         typed = [c[-1] for c in env.host_calls() if c[:2] == ["tmux", "send-keys"] and "-l" in c]
         self.assertIn(str(report2), typed[-1])
@@ -1608,6 +2017,57 @@ class RoundIdentity(unittest.TestCase):
         self.assertIn("earlier round", stale.stderr)
         self.assertEqual(self.env.json("wait", "--timeout", "0.5")["messages"], [])
 
+    def test_dispatch_identity_and_round_history_survive_a_status_restart(self):
+        dispatch = self.env.dispatch("codex", extra_args=["--scope", "scope-a", "--role", "reviewer"])
+        first = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((first["scope"], first["role"], first["round"]), ("scope-a", "reviewer", 1))
+        self.assertTrue(first["attempt"].startswith("a-"))
+        self.env.report.write_text("# r1\n")
+        self.env.run("done", "--report", str(self.env.report), dispatch=dispatch)
+        task2 = self.env.task.with_name("r2.md")
+        task2.write_text("# r2\n")
+        report2 = self.env.report.with_name("r2.md")
+        self.env.json("continue", dispatch, "--task", str(task2), "--report", str(report2))
+        current = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual(current["round"], 2)
+        self.assertEqual([r["round"] for r in current["rounds"]], [1, 2])
+        self.assertEqual(current["rounds"][0]["state"], "completed")
+        self.assertEqual(current["rounds"][0]["report"], str(self.env.report))
+
+    def test_resume_retry_keeps_round_and_closes_old_attempt(self):
+        dispatch = self.env.dispatch("claude")
+        self.env.end_session(dispatch)
+        self.assertEqual(self.env.json("resume", dispatch)["round"], 1)
+        rounds = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]["rounds"]
+        self.assertEqual([r["round"] for r in rounds], [1, 1])
+        self.assertEqual([r["state"] for r in rounds], ["unknown", "running"])
+        stale = self.env.run("ask", "stale worker", dispatch=dispatch)
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertIn("missing", stale.stderr)
+
+    def test_done_from_old_attempt_is_rejected_after_retry(self):
+        dispatch = self.env.dispatch("claude")
+        first = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.env.end_session(dispatch)
+        self.env.json("resume", dispatch)
+        self.env.report.write_text("# report\n")
+        stale = self.env.run("done", "--report", str(self.env.report), "--attempt", first["attempt"],
+                             dispatch=dispatch)
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertIn("no longer accepted", stale.stderr)
+
+    def test_missing_attempt_question_is_rejected_after_continue_round(self):
+        dispatch = self.env.dispatch()
+        self.env.report.write_text("# r1\n")
+        self.env.run("done", "--report", str(self.env.report), dispatch=dispatch)
+        task2 = self.env.task.with_name("r2.md")
+        task2.write_text("# r2\n")
+        self.env.json("continue", dispatch, "--task", str(task2),
+                      "--report", str(self.env.report.with_name("r2.md")))
+        stale = self.env.run("ask", "old worker", dispatch=dispatch)
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertIn("missing", stale.stderr)
+
     def test_a_resume_decided_on_a_stale_view_does_not_relaunch_a_finished_task(self):
         import concurrent.futures
         dispatch = self.env.dispatch("codex")
@@ -1678,7 +2138,23 @@ class RoundIdentity(unittest.TestCase):
         done = self.env.run("done", "--report", str(report2), dispatch=dispatch)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("no longer accepted", done.stderr)
+        view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((view["rounds"][-1]["state"], view["audit"][-1]["result"]), ("unknown", "uncertain"))
+
+    def test_a_resume_definitely_not_sent_keeps_attempt_and_audit(self):
+        dispatch = self.env.dispatch("claude")
+        self.env.end_session(dispatch)
+        before = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]["attempt"]
+
+        result = self.env.run("resume", dispatch, env={"PATH": "/definitely/no-such-tmux"})
+
+        self.assertNotEqual(result.returncode, 0)
+        view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertNotEqual(view["attempt"], before)
+        self.assertEqual((view["rounds"][-1]["state"], view["audit"][-1]["result"]),
+                         ("unknown", "definitely-not-sent"))
 
 
 
@@ -1863,6 +2339,133 @@ class HostErrors(unittest.TestCase):
         # Neither reported again nor followed by a stall on the same screen.
         self.assertTrue(self.wait(timeout="2.5", stall_after="0.3")["timedOut"])
 
+    def test_quota_and_timeout_remain_bounded_across_watchdog_restarts(self):
+        dispatch = self.env.dispatch("codex")
+        self.codex_rollout(dispatch, [self.codex_quota()])
+        self.still["WFC_MAX_TURN_SECONDS"] = "0.001"
+        messages = []
+        # Every wait starts a fresh router process against the same durable state.
+        for _ in range(6):
+            messages.extend(self.wait(timeout="0", stall_after="60")["messages"])
+        self.assertEqual([m["type"] for m in messages], ["blocked", "unknown"])
+        self.assertEqual(len({m["id"] for m in messages}), 2)
+
+    def test_parallel_watchdogs_do_not_duplicate_quota_or_timeout(self):
+        dispatch = self.env.dispatch("codex")
+        self.codex_rollout(dispatch, [self.codex_quota()])
+        self.still["WFC_MAX_TURN_SECONDS"] = "0.001"
+        processes = [subprocess.Popen(
+            [sys.executable, str(ROUTER), "wait", "--timeout", "0", "--stall-after", "60"],
+            env=self.env.router_env(env=self.still), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True) for _ in range(6)]
+        messages = []
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=15)
+            self.assertIn(process.returncode, (0, 3), stderr)
+            messages.extend(json.loads(stdout)["messages"])
+        self.assertCountEqual([m["type"] for m in messages], ["blocked", "unknown"])
+        self.assertEqual(len({m["id"] for m in messages}), 2)
+        self.assertTrue(self.wait(timeout="0")["timedOut"])
+
+    def test_new_host_turn_and_changed_error_are_visible_after_timeout(self):
+        dispatch = self.env.dispatch("codex")
+        self.codex_rollout(dispatch, [self.codex_quota()])
+        self.still["WFC_MAX_TURN_SECONDS"] = "0.001"
+        self.assertEqual([m["type"] for m in self.wait(timeout="0")["messages"]], ["blocked"])
+        self.assertEqual([m["type"] for m in self.wait(timeout="0")["messages"]], ["unknown"])
+        self.codex_rollout(dispatch, [self.codex_quota("t-2")])
+        self.assertEqual([m["type"] for m in self.wait(timeout="0")["messages"]], ["blocked"])
+        changed = self.codex_quota("t-2")
+        changed["error"] = {"message": "Authentication expired", "codex_error_info": "authentication"}
+        self.codex_rollout(dispatch, [changed])
+        [message] = self.wait(timeout="0")["messages"]
+        self.assertEqual(message["message"], "Authentication expired")
+        self.assertTrue(self.wait(timeout="0")["timedOut"])
+        self.codex_rollout(dispatch, [{"type": "task_started", "turn_id": "t-3"}])
+        self.assertTrue(self.wait(timeout="0")["timedOut"])
+        self.codex_rollout(dispatch, [self.codex_quota("t-3")])
+        self.assertEqual([m["type"] for m in self.wait(timeout="0")["messages"]], ["blocked"])
+
+    def test_new_attempt_reports_timeout_without_replaying_old_host_fault(self):
+        dispatch = self.env.dispatch("codex")
+        self.codex_rollout(dispatch, [self.codex_quota()])
+        self.still["WFC_MAX_TURN_SECONDS"] = "0.001"
+        self.wait(timeout="0")
+        self.wait(timeout="0")
+        self.env.end_session(dispatch)
+        self.env.json("resume", dispatch)
+        messages = self.wait(timeout="0")["messages"]
+        self.assertEqual([m["type"] for m in messages], ["unknown"])
+        self.codex_rollout(dispatch, [self.codex_quota()])
+        self.assertEqual([m["type"] for m in self.wait(timeout="0")["messages"]], ["blocked"])
+        self.assertTrue(self.wait(timeout="0")["timedOut"])
+
+    def test_new_round_can_report_the_same_host_turn_and_its_own_timeout(self):
+        dispatch = self.env.dispatch("codex")
+        self.codex_rollout(dispatch, [self.codex_quota()])
+        self.still["WFC_MAX_TURN_SECONDS"] = "0.001"
+        self.wait(timeout="0")
+        self.wait(timeout="0")
+        self.env.report.write_text("# round one\n")
+        self.env.json("done", "--report", str(self.env.report), dispatch=dispatch)
+        self.wait(timeout="0")
+        report = self.env.report.with_name("round-two.md")
+        self.env.json("continue", dispatch, "--task", str(self.env.task), "--report", str(report))
+        self.codex_rollout(dispatch, [self.codex_quota()])
+        messages = []
+        for _ in range(4):
+            messages.extend(self.wait(timeout="0")["messages"])
+        self.assertEqual([m["type"] for m in messages], ["blocked", "unknown"])
+
+    def test_relay_restart_does_not_requeue_persistent_quota_and_timeout(self):
+        dispatch = self.env.dispatch("codex")
+        self.codex_rollout(dispatch, [self.codex_quota()])
+        self.env.codex_controller(CodexRelay.THREAD)
+        self.still["WFC_MAX_TURN_SECONDS"] = "0.001"
+        for _ in range(2):
+            result = self.env.run("relay", "--codex-thread", CodexRelay.THREAD,
+                                  "--for", "1.5", "--stall-after", "60", env=self.still)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        messages = []
+        for call in self.env.host_calls():
+            if call[:2] == ["codex", "queue"]:
+                messages.extend(json.loads(call[call.index("--message") + 1].split(": ", 1)[1])["messages"])
+        self.assertEqual([m["type"] for m in messages], ["blocked", "unknown"])
+        self.assertEqual(len({m["messageId"] for m in messages}), 2)
+        self.assertTrue(all(m["state"] == "unknown" for m in messages))
+        self.assertTrue(self.wait(timeout="0")["timedOut"])
+
+    def test_watchdog_discards_a_fault_sampled_before_new_input(self):
+        dispatch = self.env.dispatch("codex")
+        self.codex_rollout(dispatch, [self.codex_quota()])
+        gate = self.env.bin.parent / "capture-gate"
+        tmux = self.env.bin / "tmux"
+        tmux.write_text(tmux.read_text().replace(
+            "    screen = os.environ.get('FAKE_SCREEN')",
+            "    gate = os.environ.get('CAPTURE_GATE')\n"
+            "    if gate:\n"
+            "        open(gate + '.ready', 'w').close()\n"
+            "        while not os.path.exists(gate + '.release'): time.sleep(0.01)\n"
+            "    screen = os.environ.get('FAKE_SCREEN')"))
+        process = subprocess.Popen([sys.executable, str(ROUTER), "wait", "--timeout", "0"],
+                                   env=self.env.router_env(env={**self.still, "CAPTURE_GATE": str(gate),
+                                                               "WFC_MAX_TURN_SECONDS": "0.001"}),
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not gate.with_suffix(".ready").exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(gate.with_suffix(".ready").exists())
+            self.env.json("nudge", dispatch, "--text", "new input")
+            gate.with_suffix(".release").touch()
+            stdout, stderr = process.communicate(timeout=10)
+            self.assertEqual(process.returncode, 3, stderr)
+            self.assertEqual(json.loads(stdout)["messages"], [])
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
     def test_claude_rate_limit_is_reported_as_blocked(self):
         dispatch = self.env.dispatch("claude")
         [launch] = [c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]]
@@ -1878,6 +2481,38 @@ class HostErrors(unittest.TestCase):
         [message] = self.wait()["messages"]
         self.assertEqual((message["type"], message["kind"], message["message"]),
                          ("blocked", "rate_limit", "You've hit your 5-hour limit · resets 3am"))
+
+    def test_opencode_v2_failed_idle_reports_structured_error(self):
+        dispatch = self.env.dispatch("opencode")
+        now = int(time.time() * 1000)
+        with sqlite3.connect(self.env.bin.parent / "opencode.db") as db:
+            db.executescript("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT, time_created INTEGER);"
+                             "CREATE TABLE session_message (id TEXT, session_id TEXT, type TEXT, seq INTEGER, "
+                             "time_created INTEGER, data TEXT);")
+            db.execute("INSERT INTO session_v2 VALUES ('ses_v2', NULL, ?)", (now,))
+            brief = f"You are a worker dispatched by the controller (dispatch {dispatch}). Read"
+            for seq, kind, data in ((1, "user", {"text": brief}),
+                                    (2, "assistant", {"error": {"type": "APIError", "message": "Budget exhausted"}}),
+                                    (3, "idle", {"outcome": "failed"})):
+                db.execute("INSERT INTO session_message VALUES (?, 'ses_v2', ?, ?, ?, ?)",
+                           (f"msg_{seq}", kind, seq, now + seq, json.dumps(data)))
+        [message] = self.wait(timeout="1")["messages"]
+        self.assertEqual((message["type"], message["kind"], message["message"]),
+                         ("blocked", "APIError", "Budget exhausted"))
+        with sqlite3.connect(self.env.bin.parent / "opencode.db") as db:
+            # A recovered turn and a newer in-flight assistant must not replay that error.
+            for seq, kind, data in ((4, "user", {"text": "retry"}),
+                                    (5, "assistant", {"error": {"type": "APIError", "message": "transient"}}),
+                                    (6, "idle", {"outcome": "succeeded"})):
+                db.execute("INSERT INTO session_message VALUES (?, 'ses_v2', ?, ?, ?, ?)",
+                           (f"msg_{seq}", kind, seq, now + seq, json.dumps(data)))
+        self.assertTrue(self.wait(timeout=".5")["timedOut"])
+        with sqlite3.connect(self.env.bin.parent / "opencode.db") as db:
+            for seq, kind, data in ((7, "user", {"text": "next turn"}),
+                                    (8, "assistant", {"error": {"type": "APIError", "message": "still retrying"}})):
+                db.execute("INSERT INTO session_message VALUES (?, 'ses_v2', ?, ?, ?, ?)",
+                           (f"msg_{seq}", kind, seq, now + seq, json.dumps(data)))
+        self.assertTrue(self.wait(timeout=".5")["timedOut"])
 
     def test_opencode_error_is_reported_as_blocked(self):
         dispatch = self.env.dispatch("opencode")
@@ -2952,6 +3587,816 @@ class Reclaim(unittest.TestCase):
         nxt.write_text("# r2\n")
         self.env.run("done", "--report", str(nxt), dispatch=dispatch)
         self.assertEqual([m["type"] for m in self.env.json("wait", "--timeout", "2")["messages"]], ["done", "done"])
+
+
+class InterruptHandoff(unittest.TestCase):
+    """Control-plane interruption and host handoff keep attempts auditable and fenced."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+
+    def status(self, dispatch):
+        return self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+
+    def test_interrupt_is_unknown_and_fences_the_old_attempt(self):
+        dispatch = self.env.dispatch()
+        old_attempt = self.status(dispatch)["attempt"]
+
+        result = self.env.json("interrupt", dispatch)
+
+        self.assertEqual((result["operation"], result["result"]), ("interrupt", "accepted"))
+        view = self.status(dispatch)
+        self.assertEqual((view["status"], view["rounds"][0]["state"]), ("unknown", "unknown"))
+        self.assertEqual(view["audit"][0]["operation"], "interrupt")
+        self.env.report.write_text("# old\n")
+        rejected = self.env.run("done", "--report", str(self.env.report), "--attempt", old_attempt, dispatch=dispatch)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("no longer accepted", rejected.stderr)
+
+    def test_uncertain_interrupt_is_not_replayed(self):
+        dispatch = self.env.dispatch()
+        before = len([c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]])
+
+        result = self.env.json("interrupt", dispatch, env={"FAKE_FAIL": "send-keys"})
+        repeated = self.env.run("interrupt", dispatch, env={"FAKE_FAIL": "send-keys"})
+        audit = self.status(dispatch)["audit"][-1]["id"]
+        reconciled = self.env.json("reconcile", dispatch, str(audit), "--result", "unknown",
+                                   "--actor", "operator-1", "--evidence", "interrupt-uncertain")
+
+        self.assertEqual(result["result"], "uncertain")
+        self.assertNotEqual(repeated.returncode, 0)
+        self.assertIn("lifecycle_reconcile_required", repeated.stderr)
+        self.assertEqual(reconciled["result"], "unknown")
+        self.assertEqual(self.status(dispatch)["status"], "unknown")
+        after = len([c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]])
+        self.assertEqual(after, before)
+
+    def test_uncertain_close_is_not_replayed_until_reconciled(self):
+        dispatch = self.env.dispatch()
+        first = self.env.json("close", dispatch, env={"FAKE_KILL_FAIL": f"wfc-{dispatch}"})
+        repeated = self.env.run("close", dispatch, env={"FAKE_KILL_FAIL": f"wfc-{dispatch}"})
+        audit = self.status(dispatch)["audit"][-1]["id"]
+        reconciled = self.env.json("reconcile", dispatch, str(audit), "--result", "unknown",
+                                   "--actor", "operator-1", "--evidence", "close-uncertain")
+
+        self.assertEqual(first["result"], "uncertain")
+        self.assertNotEqual(repeated.returncode, 0)
+        self.assertIn("lifecycle_reconcile_required", repeated.stderr)
+        self.assertEqual(reconciled["result"], "unknown")
+
+    def complete_and_ack(self, dispatch):
+        self.env.report.write_text("# report\n")
+        receipt = self.env.run("done", "--report", str(self.env.report),
+                               "--attempt", self.status(dispatch)["attempt"], dispatch=dispatch)
+        self.assertEqual(receipt.returncode, 0, receipt.stderr)
+        [done] = self.env.json("wait", "--timeout", "2")["messages"]
+        self.assertEqual(done["messageId"], json.loads(receipt.stdout)["messageId"])
+        self.assertEqual(self.env.json("ack", done["messageId"])["state"], "processed")
+        return self.status(dispatch)
+
+    def test_close_preserves_completed_round_and_receipt(self):
+        for alive in (True, False):
+            with self.subTest(alive=alive):
+                dispatch = self.env.dispatch("claude")
+                before = self.complete_and_ack(dispatch)
+                if not alive:
+                    self.env.end_session(dispatch)
+
+                for _ in range(2):
+                    self.assertEqual(self.env.json("close", dispatch)["result"], "completed")
+                    after = self.status(dispatch)
+                    self.assertEqual(after["rounds"], before["rounds"])
+                    self.assertEqual((after["state"], after["status"], after["backendAlive"]),
+                                     ("done", "completed", False))
+                    self.assertEqual(after["audit"][-1]["result"], "completed")
+                    self.assertEqual([m for m in after["messages"] if m["type"] == "done"],
+                                     [m for m in before["messages"] if m["type"] == "done"])
+
+                late = self.env.run("done", "--report", str(self.env.report), "--message-id", "late",
+                                    "--attempt", before["attempt"], dispatch=dispatch)
+                self.assertIn("no longer accepted", late.stderr)
+                stable = self.env.run("done", "--report", str(self.env.report),
+                                      "--attempt", before["attempt"], dispatch=dispatch)
+                self.assertTrue(json.loads(stable.stdout)["duplicate"])
+                self.assertEqual(self.status(dispatch)["rounds"], before["rounds"])
+                self.assertIn("already finished its task", self.env.run("resume", dispatch).stderr)
+
+    def test_uncertain_close_and_reconcile_keep_completed_round(self):
+        dispatch = self.env.dispatch("claude")
+        before = self.complete_and_ack(dispatch)
+        failure = {"FAKE_KILL_FAIL": f"wfc-{dispatch}"}
+        self.assertEqual(self.env.json("close", dispatch, env=failure)["result"], "uncertain")
+        after = self.status(dispatch)
+        self.assertEqual(after["rounds"], before["rounds"])
+        self.assertEqual((after["status"], after["backendAlive"]), ("completed", True))
+        audit = after["audit"][-1]
+        self.assertEqual((audit["operation"], audit["result"]), ("close", "uncertain"))
+        rejected = self.env.run("continue", dispatch, "--task", str(self.env.task),
+                                "--report", str(self.env.report.with_name("next.md")))
+        self.assertIn("lifecycle_reconcile_required", rejected.stderr)
+        self.assertIn("lifecycle_reconcile_required", self.env.run("close", dispatch).stderr)
+        self.assertEqual(self.env.json("reclaim", "--yes")["sessions"], [])
+        self.assertEqual(self.env.json("status", "--active")["dispatches"][0]["dispatch"], dispatch)
+        named = self.env.run("reclaim", "--dispatch", dispatch, "--yes")
+        self.assertIn("requires reconcile", named.stderr)
+        self.assertTrue(self.status(dispatch)["backendAlive"])
+
+        self.env.end_session(dispatch)
+        self.env.json("reconcile", dispatch, str(audit["id"]), "--result", "accepted",
+                      "--actor", "operator", "--evidence", "confirmed-absent")
+        after = self.status(dispatch)
+        self.assertEqual(after["rounds"], before["rounds"])
+        self.assertEqual((after["status"], after["backendAlive"]), ("completed", False))
+        self.assertEqual(after["audit"][-1]["resolution"]["evidence"], "confirmed-absent")
+
+    def test_close_preserves_recorded_worker_failure(self):
+        for source in ("watchdog", "launch_receipt"):
+            with self.subTest(source=source):
+                dispatch = self.env.dispatch("claude")
+                self.env.end_session(dispatch)
+                if source == "watchdog":
+                    [exited] = self.env.json("wait", "--timeout", "2")["messages"]
+                    self.assertEqual(exited["type"], "exited")
+                else:
+                    receipt = next((self.env.state / "launches").glob(f"*{dispatch}*.json"))
+                    receipt.write_text(json.dumps({"category": "process_exited", "diagnostic": "worker exited",
+                                                   "exitCode": 7}))
+                before = self.status(dispatch)
+                self.assertEqual(before["status"], "failed")
+
+                self.assertEqual(self.env.json("close", dispatch)["result"], "completed")
+                after = self.status(dispatch)
+                self.assertEqual((after["status"], after["rounds"][0]["state"]), ("failed", "failed"))
+                self.assertEqual(after["signals"]["fault"], before["signals"]["fault"])
+                self.assertEqual(after["last"]["type"], "closed")
+
+    def test_exit_during_close_does_not_become_task_failure(self):
+        for resolution in (None, "accepted", "unknown"):
+            with self.subTest(resolution=resolution):
+                dispatch = self.env.dispatch("claude")
+                receipt = next((self.env.state / "launches").glob(f"*{dispatch}*.json"))
+                env = {"FAKE_KILL_RECEIPT": str(receipt)}
+                if resolution:
+                    env["FAKE_KILL_FAIL"] = f"wfc-{dispatch}"
+                expected = "uncertain" if resolution else "completed"
+                self.assertEqual(self.env.json("close", dispatch, env=env)["result"], expected)
+                if resolution:
+                    view = self.status(dispatch)
+                    self.assertEqual((view["status"], view["rounds"][0]["state"]), ("unknown", "unknown"))
+                    self.env.end_session(dispatch)
+                    self.env.json("reconcile", dispatch, str(view["audit"][-1]["id"]),
+                                  "--result", resolution, "--actor", "operator", "--evidence", "checked terminal")
+                    if resolution == "unknown":
+                        view = self.status(dispatch)
+                        self.assertEqual((view["status"], view["rounds"][0]["state"]), ("unknown", "unknown"))
+                        self.assertEqual(self.env.json("close", dispatch)["result"], "completed")
+                after = self.status(dispatch)
+                self.assertEqual((after["status"], after["rounds"][0]["state"]), ("cancelled", "cancelled"))
+                self.assertEqual(after["launch"]["category"], "process_exited")
+
+    def test_close_is_distinct_and_records_cancellation(self):
+        dispatch = self.env.dispatch()
+
+        result = self.env.json("close", dispatch)
+
+        self.assertEqual((result["operation"], result["result"]), ("close", "completed"))
+        view = self.status(dispatch)
+        self.assertEqual((view["status"], view["audit"][-1]["operation"]), ("cancelled", "close"))
+        self.assertFalse(view["tmuxAlive"])
+
+    def test_handoff_changes_host_and_revokes_the_old_attempt(self):
+        dispatch = self.env.dispatch("codex")
+        old_attempt = self.status(dispatch)["attempt"]
+
+        result = self.env.json("handoff", dispatch, "--host", "claude")
+
+        self.assertEqual((result["operation"], result["result"]), ("handoff", "accepted"))
+        view = self.status(dispatch)
+        self.assertEqual((view["host"], view["audit"][-1]["operation"], view["audit"][-1]["result"]),
+                         ("claude", "handoff", "accepted"))
+        self.assertNotEqual(view["attempt"], old_attempt)
+        launches = len([c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]])
+        duplicate = self.env.json("handoff", dispatch, "--host", "claude")
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(len([c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]]), launches)
+        self.env.report.write_text("# handoff\n")
+        stale = self.env.run("done", "--report", str(self.env.report), "--attempt", old_attempt, dispatch=dispatch)
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertIn("no longer accepted", stale.stderr)
+        self.env.json("done", "--report", str(self.env.report), "--attempt", view["attempt"], dispatch=dispatch)
+
+    def test_pending_handoff_after_router_restart_refuses_implicit_retry(self):
+        dispatch = self.env.dispatch()
+        db = sqlite3.connect(self.env.state / "router.db")
+        attempt = self.status(dispatch)["attempt"]
+        db.execute("INSERT INTO lifecycle_event (dispatch, operation, round, attempt, from_attempt, to_attempt, "
+                   "from_host, to_host, result, diagnostic, created) VALUES (?, 'handoff', 1, ?, ?, 'a-pending', "
+                   "'codex', 'claude', 'pending', 'router stopped before tmux result', ?)",
+                   (dispatch, attempt, attempt, time.time()))
+        db.commit()
+        db.close()
+        before = len([c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]])
+
+        result = self.env.run("handoff", dispatch, "--host", "claude")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("lifecycle_reconcile_required", result.stderr)
+        view = self.status(dispatch)
+        self.assertEqual(len(view["rounds"]), 1)
+        self.assertEqual(len([c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]]), before)
+
+    def test_foreign_session_handoff_is_refused_and_audited(self):
+        dispatch = self.env.dispatch()
+        (self.env.sessions / f"wfc-{dispatch}").write_text(json.dumps({"WFC_STATE": "/other/state"}))
+
+        result = self.env.run("handoff", dispatch, "--host", "claude")
+
+        self.assertNotEqual(result.returncode, 0)
+        view = self.status(dispatch)
+        self.assertEqual((view["audit"][-1]["operation"], view["audit"][-1]["result"]), ("handoff", "refused"))
+        self.assertEqual(len(view["rounds"]), 1)
+
+    def test_pending_handoff_round_is_unknown_until_reconciled(self):
+        dispatch = self.env.dispatch()
+        db = sqlite3.connect(self.env.state / "router.db")
+        attempt = self.status(dispatch)["attempt"]
+        db.execute("UPDATE dispatch_round SET state='unknown' WHERE dispatch=? AND attempt=?", (dispatch, attempt))
+        db.execute("INSERT INTO lifecycle_event (dispatch, operation, round, attempt, from_attempt, to_attempt, "
+                   "from_host, to_host, result, diagnostic, created) VALUES (?, 'handoff', 1, ?, ?, ?, "
+                   "'codex', 'claude', 'pending', 'awaiting external result', ?)",
+                   (dispatch, attempt, attempt, attempt, time.time()))
+        db.commit(); db.close()
+
+        view = self.status(dispatch)
+
+        self.assertEqual((view["state"], view["status"], view["lifecycle"]), ("unknown", "unknown", "unknown"))
+
+    def test_reconcile_records_operator_evidence_and_is_idempotent(self):
+        dispatch = self.env.dispatch()
+        db = sqlite3.connect(self.env.state / "router.db")
+        attempt = self.status(dispatch)["attempt"]
+        db.execute("UPDATE dispatch_round SET state='unknown' WHERE dispatch=? AND attempt=?", (dispatch, attempt))
+        db.execute("INSERT INTO lifecycle_event (dispatch, operation, round, attempt, from_attempt, to_attempt, "
+                   "from_host, to_host, result, diagnostic, created) VALUES (?, 'handoff', 1, ?, ?, ?, "
+                   "'codex', 'claude', 'pending', 'awaiting external result', ?)",
+                   (dispatch, attempt, attempt, attempt, time.time()))
+        db.commit(); db.close()
+
+        result = self.env.json("reconcile", dispatch, "1", "--result", "accepted", "--actor", "operator-1",
+                               "--evidence", "tmux-receipt-1")
+        duplicate = self.env.json("reconcile", dispatch, "1", "--result", "accepted", "--actor", "operator-1",
+                                  "--evidence", "tmux-receipt-1")
+        view = self.status(dispatch)
+
+        self.assertFalse(result["duplicate"])
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(view["rounds"][-1]["state"], "running")
+        self.assertEqual(view["audit"][-1]["resolution"]["actor"], "operator-1")
+
+    def test_reconcile_can_record_definitely_not_sent_and_unknown(self):
+        for outcome in ("definitely-not-sent", "unknown", "refused"):
+            with self.subTest(outcome=outcome):
+                env = Env()
+                try:
+                    dispatch = env.dispatch()
+                    db = sqlite3.connect(env.state / "router.db")
+                    attempt = env.json("status", "--dispatch", dispatch)["dispatches"][0]["attempt"]
+                    db.execute("UPDATE dispatch_round SET state='unknown' WHERE dispatch=? AND attempt=?", (dispatch, attempt))
+                    db.execute("INSERT INTO lifecycle_event (dispatch, operation, round, attempt, from_attempt, to_attempt, "
+                               "from_host, to_host, result, diagnostic, created) VALUES (?, 'handoff', 1, ?, ?, ?, "
+                               "'codex', 'claude', 'pending', 'awaiting external result', ?)",
+                               (dispatch, attempt, attempt, attempt, time.time()))
+                    db.commit(); db.close()
+                    env.json("reconcile", dispatch, "1", "--result", outcome, "--actor", "operator-1", "--evidence", "proof")
+                    self.assertEqual(env.json("status", "--dispatch", dispatch)["dispatches"][0]["status"],
+                                     "unknown" if outcome != "accepted" else "online")
+                finally:
+                    env.close()
+
+    def test_pending_resume_blocks_repeat_and_reconcile_can_release_it(self):
+        dispatch = self.env.dispatch("claude")
+        self.env.end_session(dispatch)
+        db = sqlite3.connect(self.env.state / "router.db")
+        attempt = self.status(dispatch)["attempt"]
+        db.execute("UPDATE dispatch_round SET state='unknown' WHERE dispatch=? AND attempt=?", (dispatch, attempt))
+        db.execute("INSERT INTO lifecycle_event (dispatch, operation, round, attempt, from_attempt, to_attempt, "
+                   "from_host, to_host, result, diagnostic, created) VALUES (?, 'resume', 1, ?, ?, ?, "
+                   "'claude', 'claude', 'pending', 'router stopped before resume result', ?)",
+                   (dispatch, attempt, attempt, attempt, time.time()))
+        db.commit(); db.close()
+
+        blocked = self.env.run("resume", dispatch)
+        for command in ("interrupt", "close"):
+            other = self.env.run(command, dispatch)
+            self.assertNotEqual(other.returncode, 0)
+            self.assertIn("lifecycle_reconcile_required", other.stderr)
+        handoff = self.env.run("handoff", dispatch, "--host", "codex")
+        released = self.env.json("reconcile", dispatch, "1", "--result", "accepted", "--actor", "operator-1",
+                                 "--evidence", "resume-receipt-1")
+
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertNotEqual(handoff.returncode, 0)
+        self.assertIn("lifecycle_reconcile_required", blocked.stderr)
+        self.assertIn("lifecycle_reconcile_required", handoff.stderr)
+        self.assertEqual(released["result"], "accepted")
+
+    def test_reconcile_is_fenced_after_owner_takeover(self):
+        scope = "s-r8-owner"
+        first = self.env.json("owner", "acquire", "--scope", scope, "--owner", "first", "--lease", "60")
+        dispatch = self.env.dispatch(extra_args=("--scope", scope, "--owner-token", first["token"]))
+        db = sqlite3.connect(self.env.state / "router.db")
+        attempt = self.status(dispatch)["attempt"]
+        db.execute("UPDATE dispatch_round SET state='unknown' WHERE dispatch=? AND attempt=?", (dispatch, attempt))
+        db.execute("INSERT INTO lifecycle_event (dispatch, operation, round, attempt, from_attempt, to_attempt, "
+                   "from_host, to_host, result, diagnostic, created) VALUES (?, 'handoff', 1, ?, ?, ?, "
+                   "'codex', 'claude', 'pending', 'awaiting external result', ?)",
+                   (dispatch, attempt, attempt, attempt, time.time()))
+        db.commit(); db.close()
+        second = self.env.json("owner", "takeover", "--scope", scope, "--owner", "second")
+        stale = self.env.run("reconcile", dispatch, "1", "--result", "accepted", "--actor", "first",
+                             "--evidence", "old-proof", env={"WFC_CONTROLLER_TOKEN": first["token"]})
+
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertIn("stale_controller_owner", stale.stderr)
+        self.assertNotEqual(second["token"], first["token"])
+        resolved = self.env.json("reconcile", dispatch, "1", "--result", "accepted", "--actor", "second",
+                                 "--evidence", "new-proof", "--owner-token", second["token"])
+        self.assertEqual(resolved["result"], "accepted")
+
+    def test_resume_crash_after_external_launch_leaves_pending_attempt(self):
+        dispatch = self.env.dispatch("claude")
+        self.env.end_session(dispatch)
+        fake = self.env.bin / "tmux"
+        fake.write_text(fake.read_text() + (
+            "if sys.argv[1] == 'new-session' and os.environ.get('FAKE_KILL_PARENT'):\n"
+            "    import signal; os.kill(os.getppid(), signal.SIGKILL)\n"))
+        result = self.env.run("resume", dispatch, env={"FAKE_KILL_PARENT": "1"})
+
+        self.assertEqual(result.returncode, -signal.SIGKILL)
+        view = self.status(dispatch)
+        self.assertEqual((view["status"], view["audit"][-1]["result"], view["rounds"][-1]["state"]),
+                         ("unknown", "pending", "unknown"))
+
+    def test_handoff_model_is_persisted_for_status_and_resume(self):
+        dispatch = self.env.dispatch("codex", extra_args=("--model", "old/model"))
+
+        self.env.json("handoff", dispatch, "--host", "claude", "--model", "new/model")
+
+        self.assertEqual(self.status(dispatch)["model"], "new/model")
+        self.env.end_session(dispatch)
+        self.env.json("resume", dispatch)
+        launches = [c for c in self.env.host_calls() if c[:2] == ["tmux", "new-session"]]
+        self.assertIn("new/model", launches[-1])
+
+    def test_resume_has_its_own_audit_event(self):
+        dispatch = self.env.dispatch("claude")
+        self.env.end_session(dispatch)
+
+        resumed = self.env.json("resume", dispatch)
+
+        self.assertEqual(resumed["resumed"], dispatch)
+        self.assertEqual((self.status(dispatch)["audit"][-1]["operation"],
+                          self.status(dispatch)["audit"][-1]["result"]), ("resume", "accepted"))
+
+class MultiSignalContract(unittest.TestCase):
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+
+    def test_status_exposes_canonical_lifecycle_and_activity(self):
+        dispatch = self.env.dispatch()
+        view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((view["status"], view["lifecycle"], view["signals"]["activity"]),
+                         ("online", "running", "active"))
+        self.assertEqual(view["canonicalStates"],
+                         ["running", "online", "waiting-human", "blocked", "unknown",
+                          "completed", "failed", "cancelled", "reclaimed"])
+
+    def test_repeated_redraw_reaches_a_bounded_turn_timeout(self):
+        alt = self.env.screen.with_name("screen-alt.txt")
+        self.env.screen.write_text("tick-a\n")
+        alt.write_text("tick-b\n")
+        dispatch = self.env.dispatch(env={"FAKE_SCREEN": str(self.env.screen), "FAKE_SCREEN_ALT": str(alt),
+                                          "WFC_MAX_TURN_SECONDS": "0.1"})
+        [message] = self.env.json("wait", "--timeout", "2", "--stall-after", "60",
+                                   env={"FAKE_SCREEN": str(self.env.screen), "FAKE_SCREEN_ALT": str(alt),
+                                        "WFC_MAX_TURN_SECONDS": "0.1"})["messages"]
+        self.assertEqual((message["type"], message["fault"]["category"]), ("unknown", "timeout"))
+
+    def test_uncertain_reply_is_persisted_as_an_input_fault(self):
+        dispatch = self.env.dispatch()
+        self.env.run("ask", "Continue?", dispatch=dispatch)
+        [question] = self.env.json("wait", "--timeout", "1")["messages"]
+        result = self.env.run("reply", str(question["id"]), "yes", env={"FAKE_FAIL": "send-keys"})
+        self.assertNotEqual(result.returncode, 0)
+        view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((view["status"], view["signals"]["fault"]["category"]), ("unknown", "input_uncertain"))
+
+    def test_successful_reply_resets_the_turn_deadline(self):
+        dispatch = self.env.dispatch(env={"WFC_MAX_TURN_SECONDS": "3"})
+        self.env.run("ask", "Continue?", dispatch=dispatch)
+        [question] = self.env.json("wait", "--timeout", "1", env={"WFC_MAX_TURN_SECONDS": "3"})["messages"]
+        self.env.json("reply", str(question["id"]), "yes", env={"WFC_MAX_TURN_SECONDS": "3"})
+        result = self.env.json("wait", "--timeout", "0.2", "--stall-after", "60",
+                               env={"WFC_MAX_TURN_SECONDS": "3"})
+        self.assertNotIn("unknown", [message["type"] for message in result.get("messages", [])])
+
+    def test_timeout_event_keeps_its_fault_after_controller_consumes_it(self):
+        dispatch = self.env.dispatch(env={"WFC_MAX_TURN_SECONDS": "0.1"})
+        self.env.json("wait", "--timeout", "2", "--stall-after", "60",
+                      env={"WFC_MAX_TURN_SECONDS": "0.1"})
+        view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual((view["status"], view["signals"]["fault"]["category"]), ("unknown", "timeout"))
+
+    def test_read_only_reply_is_blocked_and_not_host_active(self):
+        dispatch = self.env.dispatch(env={"FAKE_SCREEN": str(self.env.screen)})
+        self.env.run("ask", "Continue?", dispatch=dispatch)
+        [question] = self.env.json("wait", "--timeout", "1")["messages"]
+        self.env.screen.write_text("This conversation is unavailable. Its cached transcript and draft remain here; input is paused.\n")
+        self.env.run("reply", str(question["id"]), "yes", env={"FAKE_SCREEN": str(self.env.screen)})
+        view = self.env.json("status", "--dispatch", dispatch)["dispatches"][0]
+        self.assertEqual(view["signals"]["fault"]["category"], "permission_required")
+        self.assertFalse(view["signals"]["hostActive"])
+
+
+class OwnerLifecycleFences(unittest.TestCase):
+    """Public CLI regressions for reviewed ownership/lifecycle boundaries."""
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+        self.scope = 's-reviewed-fences'
+        self.owner = self.env.json('owner', 'acquire', '--scope', self.scope, '--owner', 'first')
+        self.dispatch = self.env.dispatch('claude', extra_args=(
+            '--scope', self.scope, '--owner-token', self.owner['token']))
+
+    def credential(self, owner=None):
+        return {'WFC_OWNER_TOKEN': (owner or self.owner)['token'],
+                'WFC_CONTROLLER_TOKEN': (owner or self.owner)['token']}
+
+    def status(self):
+        return self.env.json('status', '--dispatch', self.dispatch)['dispatches'][0]
+
+    def takeover(self):
+        return self.env.json('owner', 'takeover', '--scope', self.scope, '--owner', 'next')
+
+    def inputs(self):
+        return [call for call in self.env.host_calls() if call[:2] in (['tmux', 'paste-buffer'], ['tmux', 'send-keys'])]
+
+    def question(self):
+        result = self.env.run('ask', 'controlled question', '--attempt', self.status()['attempt'],
+                              dispatch=self.dispatch, env=self.credential())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)['message']
+
+    def waiting_reply(self, question, change):
+        lock = os.open(self.env.state / ('input-' + self.dispatch + '.lock'), os.O_RDWR | os.O_CREAT, 0o600)
+        process = None
+        try:
+            wfc_platform.acquire_lock(lock)
+            process = subprocess.Popen([sys.executable, str(ROUTER), 'reply', str(question), 'reviewed answer'],
+                                       env=self.env.router_env(env=self.credential()),
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            deadline = time.monotonic() + 5
+            claimed = False
+            while time.monotonic() < deadline:
+                with sqlite3.connect(self.env.state / 'router.db') as db:
+                    claimed = db.execute("SELECT 1 FROM message WHERE dispatch=? AND type='reply'", (self.dispatch,)).fetchone()
+                if claimed:
+                    break
+                time.sleep(.01)
+            self.assertTrue(claimed, 'reply never committed its intent before waiting')
+            change()
+            os.close(lock)
+            lock = None
+            stdout, stderr = process.communicate(timeout=15)
+            return process.returncode, stdout, stderr
+        finally:
+            if lock is not None:
+                os.close(lock)
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.communicate()
+
+    def test_waiting_reply_rechecks_owner_and_releases_only_its_unapplied_claim(self):
+        question = self.question()
+        before = self.inputs()
+        next_owner = []
+        code, _, error = self.waiting_reply(question, lambda: next_owner.append(self.takeover()))
+        self.assertNotEqual(code, 0)
+        self.assertIn('stale_controller_owner', error)
+        self.assertEqual(self.inputs(), before)
+        self.assertFalse(any(m['type'] == 'reply' for m in self.status()['messages']))
+        sent = self.env.run('reply', str(question), 'current answer', env=self.credential(next_owner[0]))
+        self.assertEqual(sent.returncode, 0, sent.stderr)
+        self.assertEqual(len([m for m in self.status()['messages'] if m['type'] == 'reply']), 1)
+
+    def test_waiting_reply_rechecks_writable_attempt(self):
+        question = self.question()
+        before = self.inputs()
+        def fence():
+            # Model a recovered durable fence while the CLI is waiting; no backend effect.
+            with sqlite3.connect(self.env.state / 'router.db') as db:
+                db.execute("UPDATE dispatch_round SET state='unknown' WHERE dispatch=?", (self.dispatch,))
+        code, _, error = self.waiting_reply(question, fence)
+        self.assertNotEqual(code, 0)
+        self.assertIn('no longer accepted', error)
+        self.assertEqual(self.inputs(), before)
+        self.assertFalse(any(m['type'] == 'reply' for m in self.status()['messages']))
+
+    def uncertain_interrupt(self):
+        interrupted = self.env.json('interrupt', self.dispatch, env={**self.credential(), 'FAKE_FAIL': 'send-keys'})
+        self.assertEqual(interrupted['result'], 'uncertain')
+        return self.status()['audit'][-1]['id']
+
+    def test_nudge_requires_reconciliation_and_a_writable_attempt(self):
+        audit = self.uncertain_interrupt()
+        before = self.inputs()
+        refused = self.env.run('nudge', self.dispatch, '--text', 'must not arrive', env=self.credential())
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('lifecycle_reconcile_required', refused.stderr)
+        self.assertEqual(self.inputs(), before)
+        self.env.json('reconcile', self.dispatch, str(audit), '--result', 'unknown', '--actor', 'operator',
+                      '--evidence', 'interrupt not confirmed', env=self.credential())
+        still_fenced = self.env.run('nudge', self.dispatch, '--text', 'still must not arrive', env=self.credential())
+        self.assertNotEqual(still_fenced.returncode, 0)
+        self.assertIn('not writable', still_fenced.stderr)
+        self.assertEqual(self.inputs(), before)
+        self.assertFalse(any(m['type'] == 'nudge' for m in self.status()['messages']))
+        self.env.end_session(self.dispatch)
+        self.env.json('resume', self.dispatch, env=self.credential())
+        eligible = self.env.run('nudge', self.dispatch, '--text', 'eligible now', env=self.credential())
+        self.assertEqual(eligible.returncode, 0, eligible.stderr)
+
+    def test_nudge_checks_pending_audit_even_if_round_appears_running(self):
+        self.uncertain_interrupt()
+        with sqlite3.connect(self.env.state / 'router.db') as db:
+            db.execute("UPDATE dispatch_round SET state='running' WHERE dispatch=?", (self.dispatch,))
+        before = self.inputs()
+        refused = self.env.run('nudge', self.dispatch, '--text', 'must not arrive', env=self.credential())
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('lifecycle_reconcile_required', refused.stderr)
+        self.assertEqual(self.inputs(), before)
+
+    def test_resolve_fences_mutation_and_duplicate_before_audit_changes(self):
+        message = self.question()
+        with sqlite3.connect(self.env.state / 'router.db') as db:
+            # Controlled external-delivery uncertainty, as in independent public probe.
+            db.execute("UPDATE message SET state='unknown', delivered=0 WHERE id=?", (message,))
+            digest = db.execute('SELECT body_hash FROM message WHERE id=?', (message,)).fetchone()[0]
+        args = ('resolve', str(message), '--actor', 'operator', '--reason', 'verified delivery',
+                '--evidence', 'controlled external receipt', '--body-hash', digest)
+        current = self.takeover()
+        before = next(m for m in self.status()['messages'] if m['id'] == message)
+        rejected = self.env.run(*args, env=self.credential())
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn('stale_controller_owner', rejected.stderr)
+        self.assertEqual(next(m for m in self.status()['messages'] if m['id'] == message), before)
+        accepted = self.env.json(*args, '--owner-token', current['token'])
+        self.assertEqual(accepted['state'], 'received')
+        wrong_digest = list(args)
+        wrong_digest[-1] = '0' * 64
+        refused_digest = self.env.run(*wrong_digest, env=self.credential(current))
+        self.assertNotEqual(refused_digest.returncode, 0)
+        self.assertIn('conflicts', refused_digest.stderr)
+        stale_duplicate = self.env.run(*args, env=self.credential())
+        self.assertNotEqual(stale_duplicate.returncode, 0)
+        self.assertIn('stale_controller_owner', stale_duplicate.stderr)
+        duplicate = self.env.json(*args, env=self.credential(current))
+        self.assertTrue(duplicate['duplicate'])
+        self.assertEqual(duplicate['statusVersion'], accepted['statusVersion'])
+        with sqlite3.connect(self.env.state / 'router.db') as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM message_resolution WHERE message=?', (message,)).fetchone()[0], 1)
+        wrong_scope = self.env.json('owner', 'acquire', '--scope', 'another-scope', '--owner', 'unrelated')
+        refused = self.env.run(*args, env=self.credential(wrong_scope))
+        self.assertIn('stale_controller_owner', refused.stderr)
+        expired = self.env.json('owner', 'takeover', '--scope', self.scope, '--owner', 'expired', '--lease', '-1')
+        self.assertIn('stale_controller_owner', self.env.run(*args, env=self.credential(expired)).stderr)
+
+    def test_current_owner_reconciles_real_earlier_generation_audit(self):
+        audit_id = self.uncertain_interrupt()
+        with sqlite3.connect(self.env.state / 'router.db') as db:
+            generation = db.execute('SELECT owner_generation FROM lifecycle_event WHERE id=?', (audit_id,)).fetchone()[0]
+        self.assertEqual(generation, self.owner['generation'])
+        current = self.takeover()
+        args = ('reconcile', self.dispatch, str(audit_id), '--result', 'unknown', '--actor', 'new-operator',
+                '--evidence', 'controlled old interrupt outcome')
+        stale = self.env.run(*args, env=self.credential())
+        self.assertIn('stale_controller_owner', stale.stderr)
+        resolved = self.env.run(*args, env=self.credential(current))
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        self.assertEqual(json.loads(resolved.stdout)['result'], 'unknown')
+        with sqlite3.connect(self.env.state / 'router.db') as db:
+            original, resolver = db.execute('SELECT owner_generation, resolution_owner_generation FROM lifecycle_event WHERE id=?',
+                                            (audit_id,)).fetchone()
+        self.assertEqual(original, generation)
+        self.assertEqual(resolver, current['generation'])
+        self.assertTrue(self.env.json(*args, env=self.credential(current))['duplicate'])
+        self.assertIn('stale_controller_owner', self.env.run(*args, env=self.credential()).stderr)
+
+    def test_current_owner_reconciled_resume_proof_is_consumed_once(self):
+        self.env.end_session(self.dispatch)
+        fake = self.env.bin / 'tmux'
+        fake.write_text(fake.read_text() + (
+            "if sys.argv[1] == 'new-session' and os.environ.get('FAKE_KILL_PARENT'):\n"
+            "    import signal; os.kill(os.getppid(), signal.SIGKILL)\n"))
+        crashed = self.env.run('resume', self.dispatch, env={**self.credential(), 'FAKE_KILL_PARENT': '1'})
+        self.assertEqual(crashed.returncode, -signal.SIGKILL)
+        event = self.status()['audit'][-1]
+        self.assertEqual((event['operation'], event['result'], event['ownerGeneration']),
+                         ('resume', 'pending', self.owner['generation']))
+        # The operator confirms this fixture-owned previous writer is absent.
+        self.env.end_session(self.dispatch)
+        current = self.takeover()
+        self.env.json('reconcile', self.dispatch, str(event['id']), '--result', 'accepted',
+                      '--actor', 'new-operator', '--evidence', 'controlled previous writer confirmed absent',
+                      env=self.credential(current))
+        resumed = self.env.json('resume', self.dispatch, env=self.credential(current))
+        self.assertEqual(resumed['result'], 'accepted')
+        preserved = next(audit for audit in self.status()['audit'] if audit['id'] == event['id'])
+        self.assertEqual(preserved['ownerGeneration'], self.owner['generation'])
+        self.assertEqual(preserved['resolution']['ownerGeneration'], current['generation'])
+        self.assertTrue(preserved['resolution']['consumedAt'])
+        self.assertNotEqual(self.status()['attempt'], event['attempt'])
+
+
+    def test_submission_fences_its_scope_without_holding_the_global_database_writer(self):
+        question = self.question()
+        other_owner = self.env.json('owner', 'acquire', '--scope', 'unrelated-worker', '--owner', 'other')
+        other = self.env.dispatch('claude', extra_args=('--scope', 'unrelated-worker', '--owner-token', other_owner['token']))
+        ready = self.env.bin.parent / 'paste-blocked'
+        release = self.env.bin.parent / 'paste-release'
+        fake = self.env.bin / 'tmux'
+        fake.write_text(fake.read_text() + (
+            "if sys.argv[1] == 'send-keys' and '-l' in sys.argv and os.environ.get('FAKE_BLOCK_INPUT'):\n"
+            "    from pathlib import Path\n"
+            "    Path(os.environ['FAKE_BLOCK_READY']).write_text('blocked')\n"
+            "    while not Path(os.environ['FAKE_BLOCK_RELEASE']).exists(): time.sleep(.01)\n"))
+        sender = subprocess.Popen([sys.executable, str(ROUTER), 'reply', str(question), 'controlled blocked input'],
+                                  env=self.env.router_env(env={**self.credential(), 'FAKE_BLOCK_INPUT': '1',
+                                      'FAKE_BLOCK_READY': str(ready), 'FAKE_BLOCK_RELEASE': str(release)}),
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        takeover = None
+        try:
+            deadline = time.monotonic() + 5
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertTrue(ready.exists(), 'controlled paste never reached its blocking point')
+            takeover = subprocess.Popen([sys.executable, str(ROUTER), 'owner', 'takeover', '--scope', self.scope],
+                                        env=self.env.router_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            # An unrelated worker must be able to report while that input is stalled.
+            callback = self.env.run('ask', 'unrelated callback', dispatch=other,
+                                    env=self.credential(other_owner), timeout=2)
+            self.assertEqual(callback.returncode, 0, callback.stderr)
+            self.assertIsNone(takeover.poll(), 'takeover committed while an authorized input was in flight')
+            release.touch()
+            _, error = sender.communicate(timeout=15)
+            self.assertEqual(sender.returncode, 0, error)
+            output, error = takeover.communicate(timeout=15)
+            self.assertEqual(takeover.returncode, 0, error)
+            self.assertGreater(json.loads(output)['generation'], self.owner['generation'])
+        finally:
+            release.touch()
+            for process in (sender, takeover):
+                if process is not None:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate()
+
+
+    def test_continue_serializes_takeover_through_preliminary_read_and_task_input(self):
+        self.env.report.write_text('controlled completed round')
+        self.env.json('done', '--report', str(self.env.report), '--attempt', self.status()['attempt'],
+                      dispatch=self.dispatch, env=self.credential())
+        task = self.env.task.with_name('controlled-next.md')
+        task.write_text('controlled next task')
+        report = self.env.report.with_name('controlled-next.md')
+        ready, release = (self.env.bin.parent / name for name in ('capture-ready', 'capture-release'))
+        observed = self.env.bin.parent / 'input-generations.jsonl'
+        fake = self.env.bin / 'tmux'
+        fake.write_text(fake.read_text() + (
+            "if sys.argv[1] == 'capture-pane' and os.environ.get('FAKE_BLOCK_CAPTURE'):\n"
+            "    from pathlib import Path\n"
+            "    Path(os.environ['FAKE_CAPTURE_READY']).touch()\n"
+            "    while not Path(os.environ['FAKE_CAPTURE_RELEASE']).exists(): time.sleep(.01)\n"
+            "if sys.argv[1] == 'send-keys' and '-l' in sys.argv and os.environ.get('FAKE_INPUT_GENERATIONS'):\n"
+            "    import sqlite3\n"
+            "    with sqlite3.connect(os.path.join(os.environ['WFC_STATE'], 'router.db')) as db:\n"
+            "        generation = db.execute('SELECT generation FROM controller_owner WHERE scope=?', (os.environ['FAKE_OWNER_SCOPE'],)).fetchone()[0]\n"
+            "    open(os.environ['FAKE_INPUT_GENERATIONS'], 'a').write(json.dumps(generation) + '\\n')\n"))
+        sender = subprocess.Popen([sys.executable, str(ROUTER), 'continue', self.dispatch, '--task', str(task),
+                                   '--report', str(report)], env=self.env.router_env(env={**self.credential(),
+                                       'FAKE_BLOCK_CAPTURE': '1', 'FAKE_CAPTURE_READY': str(ready),
+                                       'FAKE_CAPTURE_RELEASE': str(release), 'FAKE_INPUT_GENERATIONS': str(observed),
+                                       'FAKE_OWNER_SCOPE': self.scope}),
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        takeover = None
+        try:
+            deadline = time.monotonic() + 5
+            while not ready.exists() and time.monotonic() < deadline: time.sleep(.01)
+            self.assertTrue(ready.exists(), 'continue never reached preliminary terminal read')
+            self.assertFalse(observed.exists(), 'task input preceded the controlled read')
+            takeover = subprocess.Popen([sys.executable, str(ROUTER), 'owner', 'takeover', '--scope', self.scope],
+                                        env=self.env.router_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            committed_while_blocked = False
+            try:
+                takeover.communicate(timeout=.5)
+                committed_while_blocked = True
+            except subprocess.TimeoutExpired:
+                pass
+            # No SQLite writer may be retained while the terminal read is stalled.
+            other = self.env.dispatch('claude', extra_args=('--scope', 'unrelated-continue-scope'))
+            callback = self.env.run('ask', 'unrelated callback', dispatch=other, timeout=2)
+            self.assertEqual(callback.returncode, 0, callback.stderr)
+            release.touch()
+            _, error = sender.communicate(timeout=15)
+            self.assertEqual(sender.returncode, 0, error)
+            output, error = takeover.communicate(timeout=15)
+            self.assertEqual(takeover.returncode, 0, error)
+            self.assertFalse(committed_while_blocked, 'takeover committed before old-owner task submission finished')
+            self.assertEqual([json.loads(line) for line in observed.read_text().splitlines()], [self.owner['generation']])
+            self.assertGreater(json.loads(output)['generation'], self.owner['generation'])
+            self.assertEqual(self.status()['round'], 2)
+        finally:
+            release.touch()
+            for process in (sender, takeover):
+                if process is not None:
+                    if process.poll() is None: process.kill()
+                    process.communicate()
+
+
+    def test_waiting_continue_revalidates_owner_before_claiming_a_round(self):
+        self.env.report.write_text('controlled completed round')
+        self.env.json('done', '--report', str(self.env.report), '--attempt', self.status()['attempt'],
+                      dispatch=self.dispatch, env=self.credential())
+        task, report = self.env.task.with_name('next.md'), self.env.report.with_name('next.md')
+        task.write_text('controlled next task')
+        before = self.inputs()
+        lock = os.open(self.env.state / ('input-' + self.dispatch + '.lock'), os.O_RDWR | os.O_CREAT, 0o600)
+        sender = None
+        try:
+            wfc_platform.acquire_lock(lock)
+            sender = subprocess.Popen([sys.executable, str(ROUTER), 'continue', self.dispatch, '--task', str(task),
+                                       '--report', str(report)], env=self.env.router_env(env=self.credential()),
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.takeover()
+            os.close(lock)
+            lock = None
+            _, error = sender.communicate(timeout=15)
+            self.assertNotEqual(sender.returncode, 0)
+            self.assertIn('stale_controller_owner', error)
+            self.assertEqual(self.inputs(), before)
+            current = self.status()
+            self.assertEqual(current['round'], 1)
+            self.assertEqual(current['report'], str(self.env.report))
+            self.assertFalse(any(m['type'] == 'continue' for m in current['messages']))
+        finally:
+            if lock is not None: os.close(lock)
+            if sender is not None:
+                if sender.poll() is None: sender.kill()
+                sender.communicate()
+
+    def check_reply_lock_timeout(self, kind):
+        import hashlib
+        question = self.question()
+        other = self.env.json('ask', 'different controlled question', '--attempt', self.status()['attempt'],
+                              dispatch=self.dispatch, env=self.credential())['message']
+        self.env.json('reply', str(other), 'previous applied answer', env=self.credential())
+        [other_claim] = [m for m in self.status()['messages'] if m['type'] == 'reply']
+        before = self.inputs()
+        name = ('input-' + self.dispatch if kind == 'input' else
+                'owner-' + hashlib.sha256(self.scope.encode()).hexdigest()) + '.lock'
+        lock = os.open(self.env.state / name, os.O_RDWR | os.O_CREAT, 0o600)
+        process = None
+        try:
+            wfc_platform.acquire_lock(lock)
+            process = subprocess.Popen([sys.executable, str(ROUTER), 'reply', str(question), 'known unsent answer'],
+                                       env=self.env.router_env(env=self.credential()),
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            # Exercise the real platform lock's 30-second deadline through the public CLI.
+            _, error = process.communicate(timeout=36)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn('input_lock_timeout' if kind == 'input' else 'controller_owner_lock_timeout', error)
+            self.assertEqual(self.inputs(), before)
+            claims = [m for m in self.status()['messages'] if m['type'] == 'reply']
+            self.assertEqual(claims, [other_claim], 'only the timed-out invocation may release its own unsent claim')
+        finally:
+            os.close(lock)
+            if process is not None:
+                if process.poll() is None: process.kill()
+                process.communicate()
+        retry = self.env.run('reply', str(question), 'retry after timeout', env=self.credential())
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        claims = [m for m in self.status()['messages'] if m['type'] == 'reply']
+        self.assertEqual(len(claims), 2)
+        self.assertEqual(next(m for m in claims if m['id'] == other_claim['id']), other_claim)
+
+    def test_input_lock_timeout_releases_only_this_known_unsent_reply_claim(self):
+        self.check_reply_lock_timeout('input')
+
+    def test_scope_lock_timeout_releases_only_this_known_unsent_reply_claim(self):
+        self.check_reply_lock_timeout('owner')
 
 
 if __name__ == "__main__":
