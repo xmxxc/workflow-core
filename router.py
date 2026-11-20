@@ -101,7 +101,7 @@ ADDED_COLUMNS = {
                 "state": "TEXT", "status_version": "INTEGER", "resolver_actor": "TEXT",
                 "resolution_source": "TEXT", "resolution_reason": "TEXT", "resolution_evidence": "TEXT",
                 "resolved_at": "REAL"},
-    "lifecycle_event": {"owner_generation": "INTEGER", "owner_token": "TEXT", "resolver_actor": "TEXT", "resolution_evidence": "TEXT", "resolution_owner_generation": "INTEGER", "resolved_at": "REAL", "consumed_at": "REAL"},
+    "lifecycle_event": {"creator_pid": "INTEGER", "creator_start": "TEXT", "owner_generation": "INTEGER", "owner_token": "TEXT", "resolver_actor": "TEXT", "resolution_evidence": "TEXT", "resolution_owner_generation": "INTEGER", "resolved_at": "REAL", "consumed_at": "REAL"},
     "waiter": {"process_start": "TEXT"},
 }
 
@@ -819,7 +819,11 @@ def cmd_dispatch(args):
                    (json.dumps({"endpoint": endpoint} if args.backend == "herdr" else {"state": "not-started"}), time.time(), dispatch_id))
         create_audit = lifecycle_event(db, dispatch_id, "create", round=1, attempt=attempt, to_attempt=attempt,
                                        to_host=args.host, result="pending", diagnostic=f"{args.backend} create pending")
-        # The attempt exists durably before Herdr can start an external writer.
+        if args.backend == "bundled":
+            pid = os.getpid()
+            db.execute("UPDATE lifecycle_event SET creator_pid = ?, creator_start = ? WHERE id = ?",
+                       (pid, wfc_platform.process_identity(pid), create_audit))
+        # Commit the attempt and its create audit before launching an external writer.
         db.execute("COMMIT")
         try:
             with input_lock(dispatch_id):
@@ -3094,6 +3098,25 @@ def awaiting_answer(db, dispatch_id):
         (dispatch_id, current["current_round"], current["current_attempt"])))
 
 
+def pending_bundled_create(db, row):
+    if row["backend"] == "bundled":
+        return db.execute("SELECT creator_pid, creator_start, created FROM lifecycle_event WHERE dispatch = ? "
+                          "AND round = ? AND to_attempt = ? AND operation = 'create' AND result = 'pending'",
+                          (row["id"], row["current_round"], row["current_attempt"])).fetchone()
+
+
+def pending_create_observation(create, max_turn):
+    # A pending handle describes an unfinished operation, not a worker exit.
+    if create["creator_pid"] and create["creator_start"]:
+        probe = wfc_platform.process_probe(create["creator_pid"])
+        if probe["state"] == "exited" or (probe["state"] == "alive" and probe["identity"] != create["creator_start"]):
+            return backend_result(UNCERTAIN, "bundled creator exited or changed; reconcile the pending create; do not replay")
+    if max_turn and time.time() - create["created"] >= max_turn:
+        return backend_result(UNCERTAIN, "bundled create exceeded the turn deadline; inspect the pending create; do not replay")
+    # Older audits and unreadable process identities cannot prove creator death.
+    return None
+
+
 def check_workers(db, stall_after, scope=None, token=None):
     """Report workers whose execution unit ended, or whose activity stopped changing,
     without `done` or a pending question. A busy TUI redraws a timer or spinner;
@@ -3107,7 +3130,10 @@ def check_workers(db, stall_after, scope=None, token=None):
             continue
         sampled_start = round_started(db, dispatch_id)
         backend = backend_for(row)
-        inspected = backend.inspect(dispatch_id)
+        create = pending_bundled_create(db, row)
+        inspected = pending_create_observation(create, max_turn) if create else backend.inspect(dispatch_id)
+        if inspected is None:
+            continue
         alive = inspected["result"] == "accepted" and inspected.get("alive", False)
         read_view = backend.read(dispatch_id) if alive else None
         backend_fault = inspected if inspected["result"] == UNCERTAIN else None
@@ -3135,6 +3161,8 @@ def check_workers(db, stall_after, scope=None, token=None):
                 pass  # external observations belong to an input/attempt that has moved on
             elif not watched(db, dispatch_id) or reclaimed(db, dispatch_id):
                 pass
+            elif create and not pending_bundled_create(db, current):
+                pass  # the operator or creator settled the audit while we checked its process
             elif backend_fault:
                 prior_fault = db.execute("SELECT outcome, diagnostic FROM fault_event WHERE dispatch = ? AND operation = 'backend'",
                                          (dispatch_id,)).fetchone()

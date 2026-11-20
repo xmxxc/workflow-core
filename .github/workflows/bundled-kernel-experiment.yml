@@ -80,7 +80,7 @@ jobs:
             $records = [regex]::Matches($text, $recordLine)
             if ($records.Count -ne 1) { throw "Expected one D takeover record in $Log" }
             $record = $records[0].Groups[1].Value | ConvertFrom-Json -ErrorAction Stop
-            if ($record.legacy -ne $false -or $record.migrated -ne $false -or
+            if ($record.legacy -ne $false -or $record.migrated -ne $false -or $record.relayBeforeDispatch -ne $true -or
                 $record.programSHA256 -ne (Get-FileHash -Algorithm SHA256 -LiteralPath $Program).Hash) {
               throw "Unexpected D takeover program or mode in $Log"
             }
