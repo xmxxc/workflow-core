@@ -27,6 +27,22 @@ if sys.argv[1] == 'dispatch':
                 time.sleep(.02)
 
     router.bundled_backend.BundledBackend._save = gated_save
+elif sys.argv[1] == 'wait':
+    observe = router.pending_create_observation
+
+    def hold_sample(create, max_turn):
+        sample = observe(create, max_turn)
+        if sample is None:
+            raise AssertionError('expected a pending create observation before releasing the creator')
+        (directory / 'wait-sampled').touch()
+        deadline = time.monotonic() + 15
+        while not (directory / 'commit-sample').exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError('test did not release the sampled wait')
+            time.sleep(.02)
+        return sample
+
+    router.pending_create_observation = hold_sample
 elif sys.argv[1] == 'relay':
     check_workers = router.check_workers
     scanned = False

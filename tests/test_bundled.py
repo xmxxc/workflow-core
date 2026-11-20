@@ -332,6 +332,67 @@ class BundledNative(unittest.TestCase):
         self.assertFalse(Path(str(self.evidence) + '.ready').exists())
         self.assertIn('lifecycle_reconcile_required', self.cli('close', identity[0], success=False).stderr)
 
+    def hold_create_deadline(self):
+        creator = self.gated_dispatch()
+        self.until(lambda: (self.root / 'create-pending').exists())
+        [view] = self.cli('status')['dispatches']
+        self.dispatches.append(view['dispatch'])
+
+        self.env['WFC_MAX_TURN_SECONDS'] = '0.001'
+        stale = self.gated_cli('wait', '--timeout', '0')
+        self.until(lambda: (self.root / 'wait-sampled').exists())
+        self.assertIsNone(creator.poll())
+        return creator, stale, view
+
+    def test_late_create_deadline_cannot_supersede_confirmed_creator_exit(self):
+        creator, stale, view = self.hold_create_deadline()
+        dispatch, attempt = view['dispatch'], view['attempt']
+        [audit] = view['audit']
+        creator.kill()
+        creator.communicate(timeout=5)
+        observer = Path(os.environ.get('WFC_TEST_R3_OBSERVER', self.program))
+        result = subprocess.run([sys.executable, str(observer), 'wait', '--timeout', '0'], env=self.env,
+                                capture_output=True, text=True, encoding='utf-8', timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [death] = json.loads(result.stdout)['messages']
+        self.assertEqual(death['type'], 'unknown')
+        self.assertIn('creator exited', death['message'])
+
+        (self.root / 'commit-sample').touch()
+        out, err = stale.communicate(timeout=10)
+        self.assertIn(stale.returncode, (0, 3), err)
+        late = json.loads(out)['messages']
+        after_late = self.status(dispatch)
+        repeated = self.cli('wait', '--timeout', '0')['messages']
+        final = self.status(dispatch)
+        self.assertEqual((final['attempt'], final['audit']), (attempt, [audit]))
+        self.assertEqual((audit['operation'], audit['result']), ('create', 'pending'))
+        self.assertEqual([(m['message'], m['messageId']) for m in final['messages']],
+                         [(death['message'], death['messageId'])])
+        self.assertEqual(after_late['last']['messageId'], death['messageId'])
+        self.assertEqual((late, repeated), ([], []))
+
+    def test_late_create_deadline_after_success_is_discarded(self):
+        creator, stale, view = self.hold_create_deadline()
+        (self.root / 'scan-complete').touch()
+        created, err = creator.communicate(timeout=15)
+        self.assertEqual(creator.returncode, 0, err)
+        dispatch = json.loads(created)['dispatch']
+        self.assertEqual(dispatch, view['dispatch'])
+        self.until(lambda: Path(str(self.evidence) + '.ready').exists())
+
+        (self.root / 'commit-sample').touch()
+        out, err = stale.communicate(timeout=10)
+        self.assertEqual(stale.returncode, 3, err)
+        self.assertEqual(json.loads(out)['messages'], [])
+        final = self.status(dispatch)
+        self.assertEqual((final['attempt'], final['status'], final['lifecycle']),
+                         (view['attempt'], 'online', 'running'))
+        self.assertTrue(final['backendAlive'])
+        self.assertEqual((final['signals']['fault'], final['messages']), (None, []))
+        [audit] = final['audit']
+        self.assertEqual((audit['id'], audit['result']), (view['audit'][0]['id'], 'accepted'))
+
     def test_standalone_dispatch_reply_done_and_close(self):
         import bundled_runtime
         value = self.dispatch()

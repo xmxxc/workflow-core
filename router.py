@@ -3100,9 +3100,12 @@ def awaiting_answer(db, dispatch_id):
 
 def pending_bundled_create(db, row):
     if row["backend"] == "bundled":
-        return db.execute("SELECT creator_pid, creator_start, created FROM lifecycle_event WHERE dispatch = ? "
+        return db.execute("SELECT id, creator_pid, creator_start, created FROM lifecycle_event WHERE dispatch = ? "
                           "AND round = ? AND to_attempt = ? AND operation = 'create' AND result = 'pending'",
                           (row["id"], row["current_round"], row["current_attempt"])).fetchone()
+
+
+BUNDLED_CREATOR_EXIT = "bundled creator exited or changed; reconcile the pending create; do not replay"
 
 
 def pending_create_observation(create, max_turn):
@@ -3110,11 +3113,33 @@ def pending_create_observation(create, max_turn):
     if create["creator_pid"] and create["creator_start"]:
         probe = wfc_platform.process_probe(create["creator_pid"])
         if probe["state"] == "exited" or (probe["state"] == "alive" and probe["identity"] != create["creator_start"]):
-            return backend_result(UNCERTAIN, "bundled creator exited or changed; reconcile the pending create; do not replay")
+            return backend_result(UNCERTAIN, BUNDLED_CREATOR_EXIT, observation="creator_exit")
     if max_turn and time.time() - create["created"] >= max_turn:
-        return backend_result(UNCERTAIN, "bundled create exceeded the turn deadline; inspect the pending create; do not replay")
+        return backend_result(UNCERTAIN, "bundled create exceeded the turn deadline; inspect the pending create; do not replay",
+                              observation="create_deadline")
     # Older audits and unreadable process identities cannot prove creator death.
     return None
+
+
+def claim_create_observation(db, row, create, observation):
+    # Under the same write transaction as the message. Creator exit is final for this audit.
+    if not db.execute("SELECT 1 FROM lifecycle_event WHERE id = ? AND result = 'pending'", (create["id"],)).fetchone():
+        return False
+    audit = str(create["id"])
+    if watchdog_fault_seen(db, row, "creator_exit", audit):
+        return False
+    if observation == "create_deadline" and watchdog_fault_seen(db, row, observation, audit):
+        return False
+    # R3 could already have posted the exit before it had per-audit watchdog markers.
+    # Each bundled dispatch has just one initial create, even across resumes.
+    if db.execute("SELECT 1 FROM message WHERE dispatch = ? AND recipient = 'controller' "
+                  "AND type = 'unknown' AND json_extract(body, '$.kind') = 'backend_observation' "
+                  "AND json_extract(body, '$.message') = ? LIMIT 1",
+                  (row["id"], BUNDLED_CREATOR_EXIT)).fetchone():
+        remember_watchdog_fault(db, row, "creator_exit", audit)
+        return False
+    remember_watchdog_fault(db, row, observation, audit)
+    return True
 
 
 def check_workers(db, stall_after, scope=None, token=None):
@@ -3161,8 +3186,8 @@ def check_workers(db, stall_after, scope=None, token=None):
                 pass  # external observations belong to an input/attempt that has moved on
             elif not watched(db, dispatch_id) or reclaimed(db, dispatch_id):
                 pass
-            elif create and not pending_bundled_create(db, current):
-                pass  # the operator or creator settled the audit while we checked its process
+            elif create and not claim_create_observation(db, current, create, inspected["observation"]):
+                pass  # a settled audit or a superseded observation
             elif backend_fault:
                 prior_fault = db.execute("SELECT outcome, diagnostic FROM fault_event WHERE dispatch = ? AND operation = 'backend'",
                                          (dispatch_id,)).fetchone()
