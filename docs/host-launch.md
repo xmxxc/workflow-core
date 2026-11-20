@@ -44,7 +44,7 @@ Environment precedence, from lowest to highest:
 2. Top-level config `env`.
 3. Selected host's `env`.
 4. Launcher-owned settings (such as OpenCode's permission configuration), followed
-   by router-owned `WFC_DISPATCH`, `WFC_STATE`, and the current scope owner token.
+   by router-owned `WFC_DISPATCH`, `WFC_STATE`, and a private worker callback credential. The router strips both controller token aliases from the merged host environment.
 
 Bare executables and Unix `#!/usr/bin/env node` runtimes are looked up using this
 final PATH. Relative executable paths and relative PATH entries are relative to

@@ -153,6 +153,7 @@ class BundledBackend:
         try:
             guardian = subprocess.Popen([sys.executable, str(router.PROGRAM), '_bundled-guard', str(spec_path)],
                                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                        env=host_launch.without_router_credentials(os.environ),
                                         **wfc_platform.detached_options())
         except OSError:
             spec_path.unlink(missing_ok=True)

@@ -136,6 +136,7 @@ def create_bundle(prepared, notices, kernel, output, commit):
         else:
             shutil.copy2(source, destination)
     shutil.copy2(ROOT / 'docs/verification/bundled-kernel-experiment.md', bundle / 'WINDOWS-MANUAL.md')
+    shutil.copy2(ROOT / 'docs/verification/windows-bundled-takeover.zh-CN.md', bundle / 'WINDOWS-TAKEOVER.zh-CN.md')
     (bundle / 'COMMIT.txt').write_text(commit + '\n', encoding='ascii')
     index = json.loads((notices / 'sources.json').read_text(encoding='utf-8'))
     metadata = dict(experiment='bundled-kernel', source_commit=commit, source_tree=tree,

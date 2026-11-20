@@ -13,7 +13,7 @@ import time
 import wfc_platform
 
 DIAGNOSTIC_LIMIT = 4096
-_SECRET_NAME = re.compile(r'token|secret|password|passwd|credential|api.?key|authorization|cookie', re.I)
+_SECRET_NAME = re.compile(r'^WFC_WORKER_CALLBACK$|token|secret|password|passwd|credential|api.?key|authorization|cookie', re.I)
 
 
 class HostCommand(list):
@@ -42,6 +42,11 @@ def _environment(value):
     return value
 
 
+def without_router_credentials(env):
+    return {k: v for k, v in env.items()
+            if k.upper() not in ("WFC_CONTROLLER_TOKEN", "WFC_OWNER_TOKEN", "WFC_WORKER_CALLBACK")}
+
+
 def configure(host, command, extra_env, config=None, inherited=None):
     """Inherited env < config env < host env < router/launcher env. Config replaces argv[0]."""
     data = {}
@@ -67,6 +72,8 @@ def configure(host, command, extra_env, config=None, inherited=None):
     settings = data.get('hosts', {}).get(host, {})
     env = {**(os.environ if inherited is None else inherited), **data.get('env', {}),
            **settings.get('env', {}), **extra_env}
+    # Router credentials never enter a worker through inherited or configured env.
+    env = without_router_credentials(env)
     # Runtime argv is a prefix: [runtime, runtime flags, script, host fixed flags, host task flags].
     return HostCommand([*settings.get('runtime', []), *settings.get('command', command[:1]), *command[1:]],
                        len(settings.get('runtime', []))), env
