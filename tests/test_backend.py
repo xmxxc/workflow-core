@@ -123,7 +123,8 @@ class BackendContract(unittest.TestCase):
                             {**other_worker, 'WFC_DISPATCH': first['dispatch']}):
                 with self.assertRaises(SystemExit):
                     cli(*request, env=invalid)
-        for request in (('wait', '--scope', scope, '--timeout', '0'),
+        for request in (('status',), ('status', '--active'), ('status', '--dispatch', first['dispatch']),
+                        ('status', '--dispatch', other['dispatch']), ('wait', '--scope', scope, '--timeout', '0'),
                         ('ack', original['messageId']), ('owner', 'takeover', '--scope', scope)):
             with self.assertRaisesRegex(SystemExit, 'worker_callback_only'):
                 cli(*request, env=worker)

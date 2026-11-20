@@ -1343,6 +1343,76 @@ class ScopedDetachedCodexRelay(unittest.TestCase):
         self.assertEqual(self.queued(), [])
         self.assertEqual(self.messages(dispatch)[0]["state"], "unsent")
 
+    def gated_queue(self, *args, env=None, missing=False):
+        """Hold one real relay at the external queue until the test supplies its outcome."""
+        root = self.env.bin.parent
+        release, entered = root / 'queue-release', root / 'queue-entered'
+        fake = self.env.bin / 'codex'
+        fake.write_text(fake.read_text() + f"""
+if sys.argv[1] == 'queue':
+    open({str(entered)!r}, 'w').close()
+    deadline = time.monotonic() + 15
+    while not os.path.exists({str(release)!r}):
+        if time.monotonic() >= deadline: sys.exit(2)
+        time.sleep(.02)
+    if {missing!r}:
+        print('no rollout found for thread', file=sys.stderr)
+        sys.exit(1)
+""")
+        child = subprocess.Popen([sys.executable, str(ROUTER), 'relay', '--codex', '--for', '15', *args],
+                                 env=self.env.router_env(env={'CODEX_THREAD_ID': self.THREAD, **(env or {})}),
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        def cleanup():
+            release.touch()
+            if child.poll() is None:
+                child.terminate()
+            child.communicate(timeout=5)
+        self.addCleanup(cleanup)
+        self.until(entered.exists)
+        return child, release
+
+    def test_lease_expires_during_confirmed_delivery(self):
+        first = self.env.json('owner', 'acquire', '--scope', self.SCOPE)
+        token = {'WFC_CONTROLLER_TOKEN': first['token']}
+        dispatch = self.env.dispatch(extra_args=('--scope', self.SCOPE), env=token)
+        receipt = self.env.json('done', '--report', str(self.env.report), dispatch=dispatch, env=token)
+        self.env.json('owner', 'renew', '--scope', self.SCOPE, '--lease', '4', env=token)
+        relay, release = self.gated_queue('--scope', self.SCOPE, env=token)
+        self.assertEqual(self.messages(dispatch)[0]['state'], 'unknown')
+        self.until(lambda: not self.env.json('status', '--dispatch', dispatch)['dispatches'][0]['controllerOwner']['active'],
+                   timeout=8)
+        release.touch()
+        _, err = relay.communicate(timeout=5)
+        self.assertIn('stale_controller_owner', err)
+        second = self.env.json('owner', 'takeover', '--scope', self.SCOPE)
+        [stored] = self.messages(dispatch)
+        self.assertEqual((stored['state'], stored['statusVersion']), ('received', 3))
+        ack = self.env.json('ack', receipt['messageId'], env={'WFC_CONTROLLER_TOKEN': second['token']})
+        self.assertEqual(ack['state'], 'processed')
+        self.assertEqual(len(self.queued()), 1)
+
+    def test_global_queue_failure_settles_only_its_outstanding_claims_after_unrelated_acquire(self):
+        import hashlib
+        dispatch = self.env.dispatch()
+        for question in ('checked separately', 'not sent'):
+            self.env.json('ask', question, dispatch=dispatch)
+        relay, release = self.gated_queue(missing=True)
+        self.env.json('owner', 'acquire', '--scope', 'unrelated-scope')
+        checked, pending = self.messages(dispatch)
+        self.assertEqual([checked['state'], pending['state']], ['unknown', 'unknown'])
+        body = {k: checked[k] for k in ('scope', 'role', 'round', 'attempt', 'question', 'options')}
+        digest = hashlib.sha256(json.dumps(body, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        self.env.json('resolve', checked['messageId'], '--source', 'operator', '--actor', 'fixture',
+                      '--reason', 'confirmed separately', '--evidence', 'controlled receipt', '--body-hash', digest)
+        self.env.json('ack', checked['messageId'])
+        self.env.json('ask', 'later batch', dispatch=dispatch)
+        release.touch()
+        relay.communicate(timeout=5)
+        self.assertEqual(relay.returncode, 1)
+        self.assertEqual([(m['state'], m['statusVersion']) for m in self.messages(dispatch)],
+                         [('processed', 4), ('unsent', 3), ('unsent', 1)])
+        self.assertEqual(len(self.queued()), 1)
+
     def test_takeover_waits_for_a_claimed_scoped_queue_call(self):
         first = self.env.json("owner", "acquire", "--scope", self.SCOPE)
         token = {"WFC_CONTROLLER_TOKEN": first["token"]}
@@ -2747,6 +2817,8 @@ class Status(unittest.TestCase):
 
         status = self.env.json("status")
 
+        selected = self.env.json("status", "--dispatch", finished, dispatch=working)
+        self.assertEqual([d["dispatch"] for d in selected["dispatches"]], [finished])
         states = {d["dispatch"]: (d["host"], d["state"], d["tmuxAlive"]) for d in status["dispatches"]}
         self.assertEqual(states, {working: ("codex", "working", True), finished: ("claude", "done", True)})
         self.assertEqual([(m["type"], m["dispatch"]) for m in status["undelivered"]], [("done", finished)])

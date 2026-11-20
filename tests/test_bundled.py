@@ -199,14 +199,14 @@ class BundledNative(unittest.TestCase):
             self.assertEqual((view['status'], view['lifecycle']), ('online', 'running'))
             self.assertFalse(any(m['type'] in ('question', 'done') for m in view['messages']))
             if migration:
-                import sqlite3
-                db = sqlite3.connect((self.root / 'state' / 'router.db').as_uri() + '?mode=ro', uri=True)
-                try:
-                    row = db.execute('SELECT callback_channel, callback_hash FROM dispatch_round '
-                                     'WHERE dispatch=? AND attempt=?', (dispatch, value['attempt'])).fetchone()
-                    self.assertTrue(row == (None, None), 'migration minted an unissued callback grant')
-                finally:
-                    db.close()
+                # Public identifiers alone cannot turn the old assignment into a grant.
+                probe = subprocess.run([sys.executable, str(candidate), 'ask', 'legacy identity only',
+                                        '--attempt', value['attempt']], capture_output=True, text=True, timeout=15,
+                                       env={**self.env, 'WFC_DISPATCH': dispatch, 'WFC_CONTROLLER_TOKEN': ''})
+                self.assertEqual(probe.returncode, 1)
+                self.assertEqual(json.loads(probe.stderr)['error'], 'stale_controller_owner')
+                view = self.status(dispatch)
+                self.assertEqual(view['messages'], [])
         else:
             self.assertFalse(ready['ownerInHost'])
             self.assertEqual(ask['exit'], 0)
@@ -236,6 +236,7 @@ class BundledNative(unittest.TestCase):
         self.assertEqual(view['attempt'], value['attempt'])
         self.assertEqual(self.cli('close', dispatch)['result'], 'completed')
         print('TAKEOVER ' + json.dumps({'legacy': legacy, 'migrated': bool(migration), 'dispatch': dispatch, 'attempt': value['attempt'],
+              'programSHA256': hashlib.sha256(candidate.read_bytes()).hexdigest(),
               'generation': second['generation'], 'ready': ready, 'ask': ask, 'done': done,
               'status': view['status'], 'closed': True}), flush=True)
 

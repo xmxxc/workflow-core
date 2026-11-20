@@ -31,12 +31,13 @@ if ($LASTEXITCODE) { throw '搬迁包验证失败' }
 
 在同一 Windows 测试账号开两个独立顶层聊天 A、B，记录各自的 `CODEX_THREAD_ID`，两者必须不同。选取全新测试目录、新 scope 和已校验的候选包。两个聊天使用同一份 WFC 程序及状态目录，分别在自己的聊天内启动 relay。使用已验证可非交互启动的 Codex host 配置和已信任的测试 worktree。若本机入口为批处理脚本，沿用现有 Windows 实测的显式 runtime/host 启动配置。
 
-在每次 PowerShell 调用中恢复相同的上下文。用本次的实际绝对路径替换下面的示例。仅第一次建目录，若目录已经有 router.db，另取一个新目录。
+在每次 PowerShell 调用中恢复相同的上下文。用本次的实际绝对路径替换下面的示例。仅第一次建目录，若目录已经有 router.db，另取一个新目录。把本次候选程序、试验目录、scope 和已验证的 host 启动配置的绝对路径记入两个聊天共用的试验记录。每个新 turn 从该记录恢复以下变量，再加载本聊天角色的凭据。
 
 ```powershell
 $wfc = 'C:\trial\candidate package\wfc.cmd'
 $trial = 'C:\trial\D-unique-run'
 $scope = 'D-unique-run'
+$launchConfig = (Resolve-Path -LiteralPath 'C:\trial\verified-host.json').Path
 $env:WFC_STATE = "$trial\state"
 $work = "$trial\work"
 $reports = "$trial\reports"
@@ -72,17 +73,24 @@ $owner | Select-Object scope,owner,generation,leaseUntil
 # 将步骤 2 的任务保存为 $work\task.md 后执行
 $job = & $wfc dispatch --backend bundled --host codex --cwd $work --scope $scope --task "$work\task.md" --report "$reports\result.md" --launch-config $launchConfig | ConvertFrom-Json
 if ($LASTEXITCODE) { throw '派发失败' }
+$job | Select-Object scope,dispatch,round,attempt | ConvertTo-Json |
+    Set-Content -LiteralPath "$trial\control\assignment.json" -ErrorAction Stop
 $d = $job.dispatch
 & $wfc status --dispatch $d
 ```
 
 ### B 接替，随后放行同一 worker
 
-1. B 确认 A 的 ready 证据和 scope，再 takeover 一次。B 的 generation 应比 A 大 1。保留同一 dispatch、attempt、宿主 PID/创建身份及 backend generation 的前后记录。B 在自己的聊天中注册 relay 并确认在 waiters 中出现。A 的旧 relay 应退出或记录 stale owner。任何身份不符、未决外发或 relay 注册失败，先停在 gate。
+1. B 确认 A 的 ready 证据和 scope，再 takeover 一次。B 的 generation 应比 A 大 1。保留同一 dispatch、attempt、宿主 PID/创建身份及 backend generation 的前后记录。B 在自己的聊天中注册 relay 并确认在 waiters 中出现。按 A 记录的 PID 和创建身份确认原 relay 已退出，并在 status.waiters 中核对注册已消失。保留 stale owner 日志和两端队列记录。任何身份不符、未决外发或 relay 注册失败，先停在 gate。
 2. A 用保存的 A 凭据执行 `wait --scope $scope --timeout 0` 和 `nudge $d --text D_STALE_PROBE`。预期两次均非零、`stale_controller_owner`，宿主没有该输入。不要认领回 A。
 3. B 在 worktree 写 `release.txt` 后结束自己的 turn，等 relay 唤醒。两个聊天均保留消息记录。新 question 应只进入 B。同一 `messageId` 在账本已经 `received` 后，B 用实际数字 question id 执行一次 `reply`，确认处理后 ACK。worker 正常继续并向 B 回报 done。验收期间不另开 wait 消费 B 的批次。
 
 ```powershell
+# 每个后续 turn 恢复目录和本角色凭据，再从这份公开记录恢复任务身份
+$assignment = Get-Content -Raw -LiteralPath "$trial\control\assignment.json" | ConvertFrom-Json
+if ($assignment.scope -ne $scope -or -not $assignment.dispatch) { throw '任务记录不匹配' }
+$d = $assignment.dispatch
+# B 仅在交接时执行一次 takeover
 $owner = & $wfc owner takeover --scope $scope --owner B --lease 900 | ConvertFrom-Json
 if ($LASTEXITCODE) { throw '接替失败' }
 $env:WFC_CONTROLLER_TOKEN = $owner.token
@@ -91,16 +99,36 @@ $owner | Select-Object scope,owner,generation,leaseUntil
 & $wfc status --dispatch $d
 # 完成注册及 A 拒绝检查后
 Set-Content -LiteralPath "$work\release.txt" -Value D_GO
-# B 被 question 唤醒后
-& $wfc reply $questionId D_GO
-& $wfc ack $questionMessageId
 ```
+
+B 被唤醒后，从该聊天的 relay 信封中取出本次 question 的单条消息对象，原样保存为 `control/question.json`。其中 `id` 是 reply 所需的数字，`messageId` 是 ACK 所需的稳定 ID。恢复本轮 assignment、B 凭据和目录，核对任务身份、问题内容，并在公开 status 中确认同一条消息已 received。仅在首次处理该问题时执行下面的答复。
+
+```powershell
+$q = Get-Content -Raw -LiteralPath "$trial\control\question.json" | ConvertFrom-Json -ErrorAction Stop
+if ($q.type -ne 'question' -or $q.question -ne 'D_GO?' -or $q.scope -ne $scope -or
+    $q.dispatch -ne $d -or $q.round -ne $assignment.round -or $q.attempt -ne $assignment.attempt -or
+    [long]$q.id -lt 1 -or -not $q.messageId) { throw 'question 身份不匹配' }
+$questionId = $q.id
+$questionMessageId = $q.messageId
+$rawReply = & $wfc reply $questionId D_GO
+if ($LASTEXITCODE -ne 0) { throw 'reply 失败或结果不明，停止并保存现场' }
+$reply = $rawReply | ConvertFrom-Json -ErrorAction Stop
+if ($reply.dispatch -ne $d -or $reply.replied -ne $questionId) { throw 'reply 回执不匹配，停止' }
+$reply | Select-Object dispatch,replied | ConvertTo-Json |
+    Set-Content -LiteralPath "$trial\control\reply.json" -ErrorAction Stop
+& $wfc ack $questionMessageId
+if ($LASTEXITCODE -ne 0) { throw 'question ACK 失败，核对原回执' }
+```
+
+若在 reply 与 ACK 之间换 turn，从 `question.json` 恢复两个 ID，从 `reply.json` 恢复已确认的结果，核对 dispatch、replied 和账本中的同一问题后才 ACK。缺少成功结果、ID 不符或现场不明时停止，不重复 reply。收到 done 后，同样将 B 信封中的单条 done 对象保存为 `control/done.json`，后续 turn 据此恢复 `messageId` 和报告位置，并与 assignment 核对。
 
 B 收到 done 后先读取报告并核对内容、路径、dispatch/round/attempt。A 先用自己的旧凭据 ACK 该 done，必须非零且账本仍为 received。B 随后 ACK，得到 processed；B 重复同一 ACK 应为 duplicate 且版本不变。记录两个聊天收到的消息数、稳定 messageId、statusVersion、宿主规范 user 消息里恰好一次答复和全程 PID/创建身份。要求 A 在接替后的新问题、完成消息均为零；B 对每项各收到一次。屏幕回显、仅有报告文件或仅显示 completed 都不足以完成验收。
 
 ### 外部队列与停止条件
 
-scoped relay 先将批次提交为 unknown，再调用外部队列。候选在 scope owner 锁内完成这次调用及结果记账；B 的 takeover 成功返回后，A 的下一次领取会被拒绝。已经被外部队列接受的消息仍可能稍后显示在 A。进程退出、超时或回执不确定时，保留 unknown；B 核对外部聊天和本地消息身份，有独立送达证据才按现有 resolve 流程对账。接替等待 owner 锁超时、队列结果不明、问答重复、attempt 变化、A 收到放行后的消息，或缺少可核实的宿主身份，均停止本轮。不要补发消息、自动重派或反复 takeover。
+scoped relay 先将批次提交为 unknown，再调用外部队列。候选在 scope owner 锁内完成这次调用及结果记账；B 的 takeover 成功返回后，A 的下一次领取会被拒绝。已合法领取的批次按实际外发结果和原消息版本结算，即使租约在调用中到期。已确认接受记为 received，确定未发恢复 unsent，并发 resolve 的结果保留。已经被外部队列接受的消息仍可能稍后显示在 A。进程退出、超时或回执不确定时，保留 unknown；B 核对外部聊天和本地消息身份，有独立送达证据才按现有 resolve 流程对账。接替等待 owner 锁超时、队列结果不明、问答重复、attempt 变化、A 收到放行后的消息，或缺少可核实的宿主身份，均停止本轮。不要补发消息、自动重派或反复 takeover。
+
+若 A 的 detached relay 是由 .3 程序启动，即使 B 已改用候选，A 已启动的进程仍运行旧代码，候选的外发锁无法约束它。保持 release gate 关闭，按记录的 PID 和创建身份确认旧 relay 已退出、waiters 已注销，再核对 A 的聊天及账本中接替前的外发。任一批次仍为 unknown 且没有独立送达证据，应停在该现场。
 
 旧版在途 worker 的凭据不能转换为本次 callback。B 可检查原报告和回执并记录阻塞。若需恢复执行，先确认旧 writer 的归属、完成正常 close 或取得确切退出证据，再由 B 显式 resume；未决 lifecycle 按已有审计和证据处理。新 attempt 须单独核验，原 attempt 的同进程接替结果仍记为阻塞。保留已确认的工作，不重复执行未知副作用。
 

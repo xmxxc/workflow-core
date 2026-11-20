@@ -72,9 +72,20 @@ jobs:
               ConvertTo-Json -Compress | Add-Content -Encoding utf8 "$env:RUNNER_TEMP/evidence/commands.jsonl"
             if ($code -ne 0) { throw "$Name failed with exit $code" }
           }
-          function Assert-NativeCoverage([string]$Log) {
+          function Assert-NativeCoverage([string]$Log, [string]$Program) {
             $text = Get-Content -Raw "$env:RUNNER_TEMP/evidence/$Log.log"
-            foreach ($test in @('standalone_dispatch_reply_done_and_close', 'wrong_nonce_and_generation_cannot_input_or_close',
+            # unittest writes progress to stderr. The stdout record may be on
+            # its own line or between the test name and the following "ok".
+            $recordLine = '(?m)\bTAKEOVER (\{[^\r\n]+\})\r?\n'
+            $records = [regex]::Matches($text, $recordLine)
+            if ($records.Count -ne 1) { throw "Expected one D takeover record in $Log" }
+            $record = $records[0].Groups[1].Value | ConvertFrom-Json -ErrorAction Stop
+            if ($record.legacy -ne $false -or $record.migrated -ne $false -or
+                $record.programSHA256 -ne (Get-FileHash -Algorithm SHA256 -LiteralPath $Program).Hash) {
+              throw "Unexpected D takeover program or mode in $Log"
+            }
+            $text = [regex]::Replace($text, $recordLine, '')
+            foreach ($test in @('inflight_worker_reports_after_takeover', 'standalone_dispatch_reply_done_and_close', 'wrong_nonce_and_generation_cannot_input_or_close',
                 'interrupt_close_resume_replaces_execution_identity', 'close_contains_setsid_descendant',
                 'parent_first_exit_cleans_descendant_and_allows_resume', 'runtime_forced_death_cleans_descendants_without_restarting')) {
               if ($text -notmatch ("(?m)^test_" + $test + " \(test_bundled.BundledNative\.[^\r\n]+\) \.\.\. ok\r?$")) {
@@ -169,7 +180,7 @@ jobs:
             'Controlled tests/fixtures/bundled_worker.py, explicit Python runtime; no model, account, desktop queue or complete Herdr install.'
           }
           Invoke-Checked source-contracts { python -m unittest discover -s tests -p test_bundled.py -v }
-          Invoke-Checked source-coverage { Assert-NativeCoverage source-contracts }
+          Invoke-Checked source-coverage { Assert-NativeCoverage source-contracts "wfc.py" }
           Invoke-Checked packaging-controls { python -m unittest discover -s tests -p test_bundled_experiment_package.py -v }
       - name: Build, zip and verify a newly extracted payload with spaces
         shell: pwsh
@@ -201,7 +212,7 @@ jobs:
           $env:WFC_BUNDLED_TEST_KERNEL = "$env:EXTRACTED/wfc-kernel.exe"
           $env:WFC_BUNDLED_TEST_DISCOVERY = '1'
           Invoke-Checked packaged-contracts { python -m unittest discover -s tests -p test_bundled.py -v }
-          Invoke-Checked packaged-coverage { Assert-NativeCoverage packaged-contracts }
+          Invoke-Checked packaged-coverage { Assert-NativeCoverage packaged-contracts "$env:EXTRACTED/wfc.pyz" }
       - name: Preserve command results and failure diagnostics
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

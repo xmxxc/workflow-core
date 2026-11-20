@@ -3425,11 +3425,14 @@ def cmd_relay(args):
                 outcome = deliver(envelope) if envelope else None
                 if outcome in ("delivered", "failed", "missing"):
                     db.execute("BEGIN IMMEDIATE")
-                    preflight_controller(db, args.scope, owner_token(args), "relay")
+                    # Settle only the claim that crossed the queue boundary. Lease
+                    # changes fence future claims; an explicit resolution wins.
                     received = outcome == "delivered"
                     db.executemany("UPDATE message SET delivered = ?, state = ?, status_version = status_version + 1 "
-                                   "WHERE id = ? AND state = 'unknown' AND status_version = ?",
-                                   [(int(received), "received" if received else "unsent", m["id"], m["statusVersion"])
+                                   "WHERE id = ? AND message_uid = ? AND dispatch = ? AND recipient = 'controller' "
+                                   "AND delivered = 0 AND state = 'unknown' AND status_version = ?",
+                                   [(int(received), "received" if received else "unsent",
+                                     m["id"], m["messageId"], m["dispatch"], m["statusVersion"])
                                     for m in messages])
                     db.execute("COMMIT")
                     if outcome == "missing":
@@ -3682,7 +3685,7 @@ def main(argv):
         p.add_argument("--lease", type=float, default=OWNER_LEASE)
         p.set_defaults(func=cmd_owner, owner_action=("acquire" if action == "claim" else action))
     args = parser.parse_args(argv)
-    if os.environ.get("WFC_WORKER_CALLBACK") and args.command not in ("ask", "done", "status"):
+    if os.environ.get("WFC_WORKER_CALLBACK") and args.command not in ("ask", "done"):
         raise SystemExit(json.dumps({"error": "worker_callback_only", "operation": args.command}))
     return args.func(args) or 0
 
