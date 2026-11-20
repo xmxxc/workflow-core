@@ -75,7 +75,7 @@ elif sys.argv[1] == 'show-environment':
         self.host = self.env.bin.parent / '安装 路径' / '宿主.py'
         self.host.parent.mkdir()
         self.host.write_text('import json, os, sys, time\n'
-                             f'open({str(self.output)!r}, "w").write(json.dumps({{"argv": sys.argv[1:], "path": os.environ["PATH"], "mode": os.environ.get("MODE"), "dispatch": os.environ["WFC_DISPATCH"], "state": os.environ["WFC_STATE"], "keep": os.environ.get("KEEP"), "inherited": os.environ.get("ONLY_INHERITED"), "bytecodeDisabled": sys.dont_write_bytecode, "opencodeConfig": os.environ.get("OPENCODE_CONFIG_CONTENT")}}))\n'
+                             f'open({str(self.output)!r}, "w").write(json.dumps({{"argv": sys.argv[1:], "path": os.environ["PATH"], "mode": os.environ.get("MODE"), "dispatch": os.environ["WFC_DISPATCH"], "state": os.environ["WFC_STATE"], "keep": os.environ.get("KEEP"), "inherited": os.environ.get("ONLY_INHERITED"), "ownerInHost": any(k.upper() in ("WFC_OWNER_TOKEN", "WFC_CONTROLLER_TOKEN") for k in os.environ), "bytecodeDisabled": sys.dont_write_bytecode, "opencodeConfig": os.environ.get("OPENCODE_CONFIG_CONTENT")}}))\n'
                              'time.sleep(1)\n')
         self.host.chmod(0o644)
         self.config = self.env.bin.parent / '启动 配置.json'
@@ -142,11 +142,12 @@ elif sys.argv[1] == 'show-environment':
 
     def test_config_precedence_and_runtime_flags_reach_the_actual_host(self):
         self.config.write_text(json.dumps({
-            'env': {'PATH': '/global', 'MODE': 'global', 'KEEP': 'global'},
+            'env': {'PATH': '/global', 'MODE': 'global', 'KEEP': 'global', 'WFC_OWNER_TOKEN': 'global-test-value'},
             'hosts': {'opencode': {'command': [str(self.host), 'fixed space 中文'],
                                    'runtime': [sys.executable, '-B'],
                                    'env': {'PATH': '/host', 'MODE': 'host',
                                            'WFC_DISPATCH': 'forged-dispatch', 'WFC_STATE': 'forged-state',
+                                           'wfc_controller_token': 'host-test-value',
                                            'OPENCODE_CONFIG_CONTENT': '{"permission": "deny"}'}}}}))
         result = self.dispatch_result('opencode', env={'MODE': 'inherited', 'KEEP': 'inherited',
                                                      'ONLY_INHERITED': 'retained'})
@@ -154,6 +155,7 @@ elif sys.argv[1] == 'show-environment':
         observed = json.loads(self.output.read_text())
         self.assertEqual(observed['argv'][0], 'fixed space 中文')
         self.assertTrue(observed['bytecodeDisabled'])
+        self.assertFalse(observed['ownerInHost'])
         self.assertEqual(observed['path'], '/host')
         self.assertEqual(observed['mode'], 'host')
         self.assertEqual(observed['keep'], 'global')

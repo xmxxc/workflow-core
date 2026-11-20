@@ -1031,7 +1031,7 @@ class CodexQueueCall(unittest.TestCase):
 
     def call_queue(self, windows, result=None, error=None):
         import router
-        with patch.dict(os.environ, {'WFC_QUEUE_TIMEOUT': '7.25'}), \
+        with patch.dict(os.environ, {'WFC_QUEUE_TIMEOUT': '7.25', 'WFC_CONTROLLER_TOKEN': 'controlled'}), \
                 patch.object(router.wfc_platform, 'WINDOWS', windows), \
                 patch.object(router.subprocess, 'CREATE_NO_WINDOW', 0x08000000, create=True), \
                 patch.object(router.subprocess, 'run', return_value=result, side_effect=error) as run:
@@ -1039,7 +1039,9 @@ class CodexQueueCall(unittest.TestCase):
         self.assertEqual(run.call_count, 1)
         self.assertEqual(run.call_args.args, (['codex', 'queue', '--thread', self.THREAD,
                                               '--message', self.TEXT, '--resume'],))
-        return outcome, run.call_args.kwargs
+        options = dict(run.call_args.kwargs)
+        self.assertFalse('WFC_CONTROLLER_TOKEN' in options.pop('env'))
+        return outcome, options
 
     def test_windows_queue_uses_only_create_no_window_and_original_run_contract(self):
         result = subprocess.CompletedProcess([], 0, stdout='', stderr='')
@@ -1340,6 +1342,47 @@ class ScopedDetachedCodexRelay(unittest.TestCase):
         self.assertIn("stale_controller_owner", self.finished(started))
         self.assertEqual(self.queued(), [])
         self.assertEqual(self.messages(dispatch)[0]["state"], "unsent")
+
+    def test_takeover_waits_for_a_claimed_scoped_queue_call(self):
+        first = self.env.json("owner", "acquire", "--scope", self.SCOPE)
+        token = {"WFC_CONTROLLER_TOKEN": first["token"]}
+        dispatch = self.env.dispatch(extra_args=("--scope", self.SCOPE), env=token)
+        started = self.start(env=token, seconds="8")
+        gate = self.env.bin.parent / "release-queue"
+        ready = self.env.bin.parent / "queue-entered"
+        fake = self.env.bin / "codex"
+        fake.write_text(fake.read_text() + f"""
+if sys.argv[1] == 'queue':
+    open({str(ready)!r}, 'w').close()
+    deadline = time.monotonic() + 5
+    while not os.path.exists({str(gate)!r}) and time.monotonic() < deadline:
+        time.sleep(.01)
+    sys.exit(0 if os.path.exists({str(gate)!r}) else 1)
+""")
+        self.env.json("done", "--report", str(self.env.report), dispatch=dispatch, env=token)
+        self.until(ready.exists)
+        self.assertEqual(self.messages(dispatch)[0]["state"], "unknown")
+        contender = subprocess.Popen([sys.executable, str(ROUTER), "owner", "takeover", "--scope", self.SCOPE],
+                                     env=self.env.router_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                contender.wait(timeout=.3)
+            gate.touch()
+            stdout, _ = contender.communicate(timeout=5)
+            self.assertEqual(contender.returncode, 0)
+            second = json.loads(stdout)
+        finally:
+            gate.touch()
+            if contender.poll() is None:
+                contender.kill()
+                contender.communicate()
+        self.assertIn("stale_controller_owner", self.finished(started))
+        [message] = self.messages(dispatch)
+        self.assertEqual(message["state"], "received")
+        self.assertEqual(len(self.queued()), 1)
+        current = {"WFC_CONTROLLER_TOKEN": second["token"]}
+        self.assertEqual(self.env.json("wait", "--scope", self.SCOPE, "--timeout", "0", env=current)["messages"], [])
+        self.assertEqual(self.env.json("ack", message["messageId"], env=current)["state"], "processed")
 
     def test_unknown_delivery_is_not_replayed_by_a_new_detached_child(self):
         dispatch = self.env.dispatch(extra_args=("--scope", self.SCOPE))

@@ -514,7 +514,7 @@ for line in sys.stdin:
 
     def interactive_host(self):
         program = str(PROGRAM)
-        self.host.write_text(r'''import json,os,sqlite3,subprocess,sys,time,uuid
+        self.host.write_text(r'''import json,os,re,sqlite3,subprocess,sys,time,uuid
 from pathlib import Path
 state=Path(os.environ['WFC_STATE']); dispatch=os.environ['WFC_DISPATCH']
 program=PROGRAM
@@ -541,7 +541,9 @@ for line in sys.stdin:
         if time.monotonic()>deadline:raise RuntimeError('next round not committed')
         time.sleep(.01)
     Path(row['report']).write_text('# controlled result\n',encoding='utf-8')
-    subprocess.run([sys.executable,program,'done','--report',row['report'],'--attempt',row['current_attempt']],check=True)
+    ref = re.search(r'--callback-ref ([0-9a-f]{64})', line)
+    subprocess.run([sys.executable,program,'done','--report',row['report'],'--attempt',row['current_attempt'],
+                    *(['--callback-ref',ref.group(1)] if ref else [])],check=True)
     finished=True
 '''.replace('PROGRAM', repr(program)), encoding='utf-8')
 

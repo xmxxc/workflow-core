@@ -175,7 +175,8 @@ def rpc(program, payload):
         return {'result': 'refused', 'category': 'herdr_config', 'diagnostic': 'WFC_HERDR_TIMEOUT must be in (0, 60]'}
     try:
         result = subprocess.run([sys.executable, str(program), '_herdr-call'],
-                                input=json.dumps(payload).encode('utf-8'), capture_output=True, timeout=timeout)
+                                input=json.dumps(payload).encode('utf-8'), capture_output=True, timeout=timeout,
+                                env=host_launch.without_router_credentials(os.environ))
         value = json.loads(result.stdout)
         if result.returncode or not isinstance(value, dict) or value.get('result') not in (
                 'accepted', 'uncertain', 'refused', 'definitely-not-sent'):

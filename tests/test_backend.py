@@ -8,6 +8,8 @@ from unittest.mock import patch
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -79,6 +81,68 @@ class BackendContract(unittest.TestCase):
         # removing the fixture, as Windows forbids deleting an open database.
         gc.collect()
         self.tmp.cleanup()
+
+    def test_callback_grants_are_limited_to_the_current_assignment(self):
+        import re
+        def cli(*argv, env=None):
+            if argv[0] not in ('dispatch', 'continue'):
+                result = subprocess.run([sys.executable, str(router.PROGRAM), *argv], env={**os.environ, **(env or {})},
+                                        capture_output=True, text=True, timeout=10)
+                if result.returncode:
+                    raise SystemExit(result.stderr)
+                return json.loads(result.stdout)
+            with patch.dict(os.environ, env or {}), redirect_stdout(io.StringIO()) as output:
+                router.main(list(argv))
+                return json.loads(output.getvalue())
+
+        scope = 'callback-scope'
+        owner_a = cli('owner', 'acquire', '--scope', scope)['token']
+        controller = {'WFC_CONTROLLER_TOKEN': owner_a, 'WFC_OWNER_TOKEN': owner_a}
+        report = self.cwd / 'report'
+        report.write_text('controlled', encoding='utf-8')
+        with patch.object(self.fake, 'create', wraps=self.fake.create) as create:
+            def dispatch():
+                result = cli('dispatch', '--host', 'codex', '--backend', 'fake', '--scope', scope,
+                             '--cwd', str(self.cwd), '--task', 'task', '--report', str(report), env=controller)
+                host = create.call_args.args[3]
+                self.assertFalse(any(name in host for name in controller))
+                self.assertFalse(any(value in str(create.call_args.args[2])
+                                     for value in (owner_a, host['WFC_WORKER_CALLBACK'])))
+                return result, {name: host[name] for name in ('WFC_DISPATCH', 'WFC_WORKER_CALLBACK')}
+            first, worker = dispatch()
+            other, other_worker = dispatch()
+        self.assertFalse(cli('ask', 'documented first-round shorthand', env=other_worker)['duplicate'])
+        owner_b = cli('owner', 'takeover', '--scope', scope)['token']
+        args = ('--attempt', first['attempt'])
+        ask = ('ask', 'controlled?', '--message-id', 'first-question', *args)
+        done = ('done', '--report', str(report), '--message-id', 'first-done', *args)
+        for request in (ask, done):
+            original = cli(*request, env=worker)
+            self.assertEqual(cli(*request, env=worker)['messageId'], original['messageId'])
+            for invalid in ({'WFC_DISPATCH': first['dispatch'], **controller},
+                            {**other_worker, 'WFC_DISPATCH': first['dispatch']}):
+                with self.assertRaises(SystemExit):
+                    cli(*request, env=invalid)
+        for request in (('wait', '--scope', scope, '--timeout', '0'),
+                        ('ack', original['messageId']), ('owner', 'takeover', '--scope', scope)):
+            with self.assertRaisesRegex(SystemExit, 'worker_callback_only'):
+                cli(*request, env=worker)
+        next_report = self.cwd / 'next-report'
+        with patch.object(self.fake, 'submit', wraps=self.fake.submit) as send:
+            cli('continue', first['dispatch'], '--task', 'next', '--report', str(next_report),
+                env={'WFC_CONTROLLER_TOKEN': owner_b})
+            brief = send.call_args.args[1]
+        attempt = re.search(r'--attempt (a-[a-f0-9]{12})', brief).group(1)
+        ref = re.search(r'--callback-ref ([a-f0-9]{64})', brief).group(1)
+        for request in (ask, done, ('ask', 'controlled?', '--attempt', attempt)):
+            with self.assertRaisesRegex(SystemExit, 'invalid_worker_callback'):
+                cli(*request, env=worker)
+        current = ('ask', 'controlled?', '--attempt', attempt, '--callback-ref', ref)
+        with self.assertRaisesRegex(SystemExit, 'invalid_worker_callback'):
+            cli(*current, env={**other_worker, 'WFC_DISPATCH': first['dispatch']})
+        with self.assertRaisesRegex(SystemExit, 'conflicts'):
+            cli(*current, '--message-id', 'first-question', env=worker)
+        self.assertFalse(cli(*current, env=worker)['duplicate'])
 
     def test_current_backend_uncertainty_overrides_question_but_preserves_terminal_facts(self):
         db = router.connect()

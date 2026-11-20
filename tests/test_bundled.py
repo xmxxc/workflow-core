@@ -67,7 +67,7 @@ class BundledNative(unittest.TestCase):
         self.evidence = self.root / 'descendant.pid'
         self.launch = self.root / 'launch.json'
         self.env = {key: value for key, value in os.environ.items()
-                    if key not in ('WFC_DISPATCH', 'WFC_OWNER_TOKEN', 'WFC_STATE', 'WFC_LAUNCH_CONFIG')}
+                    if key not in ('WFC_DISPATCH', 'WFC_OWNER_TOKEN', 'WFC_CONTROLLER_TOKEN', 'WFC_WORKER_CALLBACK', 'WFC_STATE', 'WFC_LAUNCH_CONFIG')}
         self.env.update(WFC_STATE=str(self.root / 'state'), CODEX_HOME=str(self.root / 'codex-home'), PYTHONUTF8='1',
                         WFC_BUNDLED_DIAGNOSTICS='1',
                         WFC_BUNDLED_KERNEL=str(Path(os.environ['WFC_BUNDLED_TEST_KERNEL']).resolve()))
@@ -80,7 +80,7 @@ class BundledNative(unittest.TestCase):
     def config(self, mode=''):
         self.launch.write_text(json.dumps({'hosts': {'codex': {
             'runtime': [sys.executable, '-u'], 'command': [str(ROOT / 'tests/fixtures/bundled_worker.py')],
-            'env': {'WFC_TEST_PROGRAM': str(self.program), 'WFC_TEST_REPORT': str(self.report),
+            'env': {'WFC_TEST_PROGRAM': str(getattr(self, 'worker_program', self.program)), 'WFC_TEST_REPORT': str(self.report),
                     'WFC_TEST_EVIDENCE': str(self.evidence), 'WFC_TEST_MODE': mode}}}}), encoding='utf-8')
 
     def cli(self, *args, success=True):
@@ -156,6 +156,89 @@ class BundledNative(unittest.TestCase):
         self.tmp.cleanup()
         self.assertFalse(survivors, 'test-owned processes required emergency cleanup: ' + str(survivors))
 
+    def test_inflight_worker_reports_after_takeover(self):
+        import hashlib
+        migration = os.environ.get('WFC_TEST_DOT3_LAUNCH')
+        candidate = self.program
+        legacy = os.environ.get('WFC_TEST_DOT3_BASELINE') == '1' or bool(migration)
+        if migration:
+            # The original process and environment survive. Its callback executable
+            # and B's owner command now open the release-created DB using the candidate.
+            self.program = Path(migration).resolve()
+            self.worker_program = candidate
+        if legacy:
+            self.assertEqual(hashlib.sha256(self.program.read_bytes()).hexdigest(),
+                             'e9b9c07384d2710ea59e163940706a5146ef60594a02057b80ca52c32b59bea6')
+        scope = 'takeover-fixture'
+        first = self.cli('owner', 'acquire', '--scope', scope, '--owner', 'A', '--lease', '120')
+        self.env['WFC_CONTROLLER_TOKEN'] = first['token']
+        value = self.dispatch('takeover', '--scope', scope)
+        dispatch = value['dispatch']
+        self.handle(dispatch)
+        def evidence(action):
+            path = Path(str(self.evidence) + '.' + action)
+            self.until(lambda: path.exists() and path.stat().st_size)
+            return json.loads(path.read_text(encoding='utf-8'))
+        ready = evidence('ready')
+        self.assertEqual(ready['attempt'], value['attempt'])
+        before = self.status(dispatch)
+        self.assertEqual((before['status'], before['lifecycle']), ('online', 'running'))
+        self.assertFalse(self.report.exists())
+        self.program = candidate
+        second = self.cli('owner', 'takeover', '--scope', scope, '--owner', 'B', '--lease', '120')
+        self.env['WFC_CONTROLLER_TOKEN'] = second['token']
+        self.assertEqual(second['generation'], first['generation'] + 1)
+        Path(str(self.evidence) + '.release').touch()
+        ask = evidence('ask')
+        if legacy:
+            self.assertTrue(ready['ownerInHost'])
+            done = evidence('done')
+            for reply in (ask, done):
+                self.assertEqual((reply['exit'], reply['error']), (1, 'stale_controller_owner'))
+            view = self.status(dispatch)
+            self.assertEqual((view['status'], view['lifecycle']), ('online', 'running'))
+            self.assertFalse(any(m['type'] in ('question', 'done') for m in view['messages']))
+            if migration:
+                import sqlite3
+                db = sqlite3.connect((self.root / 'state' / 'router.db').as_uri() + '?mode=ro', uri=True)
+                try:
+                    row = db.execute('SELECT callback_channel, callback_hash FROM dispatch_round '
+                                     'WHERE dispatch=? AND attempt=?', (dispatch, value['attempt'])).fetchone()
+                    self.assertTrue(row == (None, None), 'migration minted an unissued callback grant')
+                finally:
+                    db.close()
+        else:
+            self.assertFalse(ready['ownerInHost'])
+            self.assertEqual(ask['exit'], 0)
+            self.assertTrue(ask['stableRetry'])
+            self.env['WFC_CONTROLLER_TOKEN'] = first['token']
+            rejected = self.cli('wait', '--scope', scope, '--timeout', '1', success=False)
+            self.assertIn('stale_controller_owner', rejected.stderr)
+            rejected = self.cli('nudge', dispatch, '--text', 'unused', success=False)
+            self.assertIn('stale_controller_owner', rejected.stderr)
+            self.env['WFC_CONTROLLER_TOKEN'] = second['token']
+            [question] = self.cli('wait', '--scope', scope, '--timeout', '5')['messages']
+            self.assertEqual(question['messageId'], ask['messageId'])
+            self.cli('reply', str(question['id']), 'finish controlled task')
+            done = evidence('done')
+            self.assertEqual(done['exit'], 0)
+            self.assertTrue(done['stableRetry'])
+            [received] = self.cli('wait', '--scope', scope, '--timeout', '5')['messages']
+            self.assertEqual(received['messageId'], done['messageId'])
+            self.env['WFC_CONTROLLER_TOKEN'] = first['token']
+            rejected = self.cli('ack', done['messageId'], success=False)
+            self.assertIn('stale_controller_owner', rejected.stderr)
+            self.env['WFC_CONTROLLER_TOKEN'] = second['token']
+            self.assertEqual(self.cli('ack', done['messageId'])['state'], 'processed')
+            view = self.status(dispatch)
+            self.assertEqual(view['status'], 'completed')
+        self.assertEqual((ask['pid'], done['pid']), (ready['pid'], ready['pid']))
+        self.assertEqual(view['attempt'], value['attempt'])
+        self.assertEqual(self.cli('close', dispatch)['result'], 'completed')
+        print('TAKEOVER ' + json.dumps({'legacy': legacy, 'migrated': bool(migration), 'dispatch': dispatch, 'attempt': value['attempt'],
+              'generation': second['generation'], 'ready': ready, 'ask': ask, 'done': done,
+              'status': view['status'], 'closed': True}), flush=True)
+
     def test_standalone_dispatch_reply_done_and_close(self):
         import bundled_runtime
         value = self.dispatch()
@@ -188,10 +271,13 @@ class BundledNative(unittest.TestCase):
         self.assertFalse(self.status(dispatch)['backendAlive'])
 
     def test_continue_reuses_owned_execution_and_accepts_new_round_reply(self):
-        value = self.dispatch('record-only')
+        scope = 'continued-host'
+        owner = self.cli('owner', 'acquire', '--scope', scope, '--lease', '180')
+        self.env['WFC_CONTROLLER_TOKEN'] = owner['token']
+        value = self.dispatch('continue-callback', '--scope', scope)
         dispatch = value['dispatch']
         handle = self.handle(dispatch)
-        question = self.question()
+        [question] = self.cli('wait', '--scope', scope, '--timeout', '5')['messages']
         self.cli('reply', str(question['id']), 'finish initial round')
         applied = Path(str(self.evidence) + '.applied')
         self.until(lambda: applied.exists())
@@ -215,23 +301,27 @@ class BundledNative(unittest.TestCase):
         import zipfile
         from unittest.mock import patch
         callback_program = self.program if zipfile.is_zipfile(self.program) else ROOT / 'router.py'
+        import re
+        received_brief = marker.read_text(encoding='utf-8')
+        ref = re.search(r'--callback-ref ([0-9a-f]{64})', received_brief).group(1)
         with patch.dict(os.environ, {'WFC_STATE': self.env['WFC_STATE']}), patch.object(router, 'PROGRAM', callback_program):
             expected_brief = router.worker_brief(dispatch, task.resolve(), report.resolve(),
-                                                opening='[router] New task for you', attempt=status['attempt'])
-        received_brief = marker.read_text(encoding='utf-8')
+                                                opening='[router] New task for you', attempt=status['attempt'], callback_ref=ref)
         self.assertEqual(received_brief, expected_brief)
         brief_digest = hashlib.sha256(received_brief.encode('utf-8')).hexdigest()
         self.assertEqual(brief_digest, hashlib.sha256(expected_brief.encode('utf-8')).hexdigest())
         second = self.handle(dispatch)
         self.assertEqual((second['generation'], second['service'], second['kernel']),
                          (handle['generation'], handle['service'], handle['kernel']))
-        question = self.cli('ask', 'controlled next-round question', '--attempt', status['attempt'])
+        [question] = [m for m in self.cli('wait', '--scope', scope, '--timeout', '5')['messages']
+                      if m.get('question') == 'controlled next-round question']
+        self.assertEqual(question['attempt'], status['attempt'])
         long_reply = ('复验路径-中文-42 Ω😀 ' + 'xyz-123456789 ' * 140 +
                       '\x1b[31mCSI-ORDER\x1b[0m ATTEMPT-TAIL:' + status['attempt'])
-        self.cli('reply', str(question['message']), long_reply)
+        self.cli('reply', str(question['id']), long_reply)
         self.until(lambda: applied.read_text() == 'once\nonce\n')
         recorded = [json.loads(line) for line in Path(str(self.evidence) + '.input.jsonl').read_text(encoding='utf-8').splitlines()]
-        self.assertEqual(recorded[-1], f"[router] Answer to question {question['message']}: {long_reply}")
+        self.assertEqual(recorded[-1], f"[router] Answer to question {question['id']}: {long_reply}")
         import bundled_runtime
         self.until(lambda: 'UNICODE_RECEIVED:复验路径-中文-42 Ω😀' in
                    bundled_runtime.call(handle, 'read').get('data', {}).get('text', ''))
