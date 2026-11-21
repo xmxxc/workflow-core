@@ -81,6 +81,15 @@ def capture_launch():
                 (dest/'prepared.json').write_text(json.dumps(data),encoding='utf-8')
         host_launch.write_private = observed
     elif sys.argv[1:2] == ['_host-run']:
+        sys.path.insert(0, os.environ['PROBE_PYZ'])
+        import host_launch
+        publish=host_launch.write_private
+        def record_started(path,value):
+            publish(path,value)
+            if value.get('category')=='started' and value.get('pid') and value.get('processStart'):
+                (dest/'host-started.json').write_text(json.dumps({k:value[k] for k in ('pid','processStart','at')}),
+                                                     encoding='utf-8')
+        host_launch.write_private=record_started
         def audit(event, args):
             if event == 'subprocess.Popen':
                 import subprocess

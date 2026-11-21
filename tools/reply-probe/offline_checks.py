@@ -58,3 +58,14 @@ with TemporaryDirectory() as d:
     except IndexError:pass
     else:raise AssertionError('subagent accepted')
 print('PASS fixed worker callback sequence, ancillary requests, exact wrapped user text, projection, duplicate, subagent')
+
+from windows_probe import tracked_identities
+sample = {'guardian':{'pid':5,'creation':'w:5'},'kernel':{'pid':6,'creation':'w:6'},
+          'service':{'pid':7,'creation':'w:7'}}
+exit_only = {'category':'process_exited','exitCode':1}
+assert [p['role'] for p in tracked_identities(sample,exit_only,{})]==['guardian','kernel','service']
+recorded = {'pid':8,'processStart':'w:8'}
+assert tracked_identities(sample,exit_only,recorded)[-1]=={'role':'host','pid':8,'creation':'w:8'}
+assert tracked_identities(sample,recorded,{}) == tracked_identities(sample,exit_only,recorded)
+assert tracked_identities({},exit_only,{}) == []
+print('PASS public early exit receipt with missing pid, captured creation identity, missing roles')

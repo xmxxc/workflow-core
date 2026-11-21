@@ -74,6 +74,108 @@ def rollout(home, job, work):
     return reports
 
 
+def settings_probe(codex, env, work):
+    """Ask the pinned app server about this scratch project's layer and Windows sandbox. No thread."""
+    import queue
+    received = queue.Queue()
+    command = [str(codex), 'app-server', '--listen', 'stdio://']
+    server = subprocess.Popen(command, env=env, cwd=work, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, encoding='utf-8', errors='replace')
+    def drain():
+        try:
+            for line in server.stdout:
+                try:
+                    reply = json.loads(line)
+                except ValueError:
+                    continue
+                if 'id' in reply:
+                    received.put(reply)
+        finally:
+            received.put(None)
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
+    def send(message):
+        server.stdin.write(json.dumps(message)+'\n')
+        server.stdin.flush()
+    def query(seq, method, params=None):
+        req = {'id':seq, 'method':method}
+        if params is not None:
+            req['params'] = params
+        send(req)
+        end = time.monotonic() + 10
+        while True:
+            reply = received.get(timeout=max(.01, end-time.monotonic()))
+            if reply is None:
+                raise ValueError('app-server EOF')
+            if reply.get('id') != seq:
+                if time.monotonic() >= end:
+                    raise TimeoutError(method)
+                continue
+            if 'error' in reply:
+                return None, dict(code=reply['error'].get('code'), message=safe_text(reply['error'].get('message',''))[:180])
+            return reply['result'], None
+    result = {}
+    try:
+        _, error = query(1,'initialize',{'clientInfo':{'name':'wfc_probe','title':'WFC probe','version':'1'},
+                                          'capabilities':{'experimentalApi':True}})
+        if error:
+            result['initialize_error'] = error
+        else:
+            send({'method':'initialized'})
+            view, error = query(2,'config/read',{'cwd':str(work),'includeLayers':True})
+            if error:
+                result['config_read_error'] = error
+            else:
+                cfg = view['config']
+                result['configured_windows_sandbox'] = (cfg.get('windows') or {}).get('sandbox')
+                result['effective_project_marker'] = (cfg.get('tui') or {}).get('animations') is False
+                result['project_layers'] = []
+                for layer in view.get('layers') or []:
+                    src = layer['name']
+                    if src.get('type') == 'project' and Path(src['dotCodexFolder']).resolve() == (work/'.codex').resolve():
+                        result['project_layers'].append(dict(disabled=bool(layer.get('disabledReason')),
+                            disabled_reason=safe_text(layer.get('disabledReason') or '')[:240],
+                            contains_marker=(layer.get('config',{}).get('tui') or {}).get('animations') is False))
+            ready, error = query(3,'windowsSandbox/readiness')
+            if error:
+                result['readiness_error'] = error
+            else:
+                result['readiness'] = ready.get('status')
+            requirements, error = query(4,'configRequirements/read')
+            if error:
+                result['requirements_error'] = error
+            else:
+                result['allowed_implementations'] = (requirements.get('requirements') or {}).get('allowedWindowsSandboxImplementations')
+    except (OSError, TimeoutError, ValueError, KeyError, queue.Empty) as e:
+        result['rpc_failure'] = type(e).__name__
+    finally:
+        try:
+            server.stdin.close()
+        except OSError:
+            pass
+        try:
+            server.wait(timeout=4)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait(timeout=4)
+        reader.join(2)
+        server.stdout.close()
+        result['app_server_exit'] = server.returncode
+    return result
+
+
+def tracked_identities(handle, launch, captured):
+    tracked = []
+    for role in ('guardian','kernel','service'):
+        p = handle.get(role) or {}
+        if p.get('pid') and p.get('creation'):
+            tracked.append(dict(role=role,pid=p['pid'],creation=p['creation']))
+    host = launch if launch.get('pid') and launch.get('processStart') else captured
+    if host.get('pid') and host.get('processStart'):
+        tracked.append(dict(role='host',pid=host['pid'],creation=host['processStart']))
+    return tracked
+
+
 def main(args):
     require(os.name=='nt' and sys.version_info>=(3,11), 'requires native Windows and Python 3.11+')
     pkg, codex, out = (p.resolve() for p in (args.package,args.codex,args.out))
@@ -92,7 +194,9 @@ def main(args):
                   kernel_sha256=KERNEL_SHA,codex_sha256=filehash(codex),args_sha256=sha('D_GO'),
                   expected=EXPECTED,expected_sha256=sha(EXPECTED),reply_invocations=0,screens={},tracked=[])
     with tempfile.TemporaryDirectory(prefix='wfc-reply-') as tmp:
-        root = Path(tmp)
+        alias_root = Path(tmp)
+        root = alias_root.resolve(strict=True)
+        require(os.path.samefile(alias_root,root), "temp path file identity")
         work, home, state = root/'work',root/'codex',root/'state'
         for p in (work,home,state,root/'profile',root/'roaming',root/'local',root/'tmp'):
             p.mkdir()
@@ -197,6 +301,30 @@ def main(args):
                 '[mcp_servers.wfcprobe]\ncommand = '+json.dumps(sys.executable)+'\nargs = ['+json.dumps(str(helper))+']\n'
                 'env_vars = ["WFC_STATE","WFC_DISPATCH","WFC_WORKER_CALLBACK","PROBE_WORK","PROBE_PYZ","PYTHONUTF8"]\n'
                 f'[projects.{json.dumps(str(work))}]\ntrust_level = "trusted"\n',encoding='utf-8')
+            # Compare two spelling-only variants in the same synthetic directory. Both
+            # config reads use the canonical worker cwd and the same provider settings.
+            cfgfile = home/'config.toml'
+            canonical_config = cfgfile.read_text(encoding='utf-8')
+            alias_work = alias_root/'work'
+            require(os.path.samefile(alias_work,work),'workspace file identity')
+            health['path_identity'] = dict(alias=str(alias_work),canonical=str(work),samefile=True)
+            probe_folder = work/'.codex'
+            probe_folder.mkdir()
+            marker = probe_folder/'config.toml'
+            marker.write_text('[tui]\nanimations = false\n', encoding='utf-8')
+            observations={}
+            health['project_trust_checks']=observations
+            try:
+                if str(alias_work) != str(work):
+                    cfgfile.write_text(canonical_config.replace('[projects.'+json.dumps(str(work))+']',
+                        '[projects.'+json.dumps(str(alias_work))+']'), encoding='utf-8')
+                    observations['alias_key']=settings_probe(codex,env,work)
+                cfgfile.write_text(canonical_config,encoding='utf-8')
+                observations['canonical_key']=settings_probe(codex,env,work)
+            finally:
+                cfgfile.write_text(canonical_config,encoding='utf-8')
+                marker.unlink()
+                probe_folder.rmdir()
             # Exercise the same child cwd and profile through read-only commands. No conversation is opened.
             probe=subprocess.run([codex,'mcp','get','wfcprobe','--json'],cwd=work,env=env,
                 capture_output=True,encoding='utf-8',errors='replace',timeout=15)
@@ -229,8 +357,16 @@ def main(args):
             s=status()
             handle=s['backendHandle']
             snapshot=bundled_runtime.read_json(handle['snapshot'])
-            result['tracked']=[handle[k] for k in ('guardian','kernel','service')]+[
-                dict(pid=s['launch']['pid'],creation=s['launch']['processStart'])]
+            started_file=out/'host-started.json'
+            started=json.loads(started_file.read_text()) if started_file.is_file() else {}
+            launch=s.get('launch') or {}
+            result['tracked']=tracked_identities(handle,launch,started)
+            result['missing_process_identities']=sorted({'guardian','kernel','service','host'}-
+                                                         {p['role'] for p in result['tracked']})
+            if launch.get('category')=='process_exited':
+                raise RuntimeError('native host exited before takeover; exit code '+str(launch.get('exitCode')))
+            require(len(result['tracked'])==4 and launch.get('pid') and launch.get('processStart'),
+                    'incomplete live process identity at startup')
             result['identity_a']=ident(s)
             capture('initial')
             until(initial_ready,45,'initial worker model request')

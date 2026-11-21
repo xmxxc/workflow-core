@@ -33,7 +33,7 @@ jobs:
         run: |
           $ErrorActionPreference='Stop'
           Set-Location tools/reply-probe
-          if ((Get-FileHash SHA256SUMS).Hash -ne '188f42df06b3f083b25c09efb2be0a6b7809ce759057753ee143758f69f70447') {throw 'Manifest mismatch'}
+          if ((Get-FileHash SHA256SUMS).Hash -ne '560ef3622b1d098b7bfd77ce6a7acb8726410a139341baafcb8f134713e7799e') {throw 'Manifest mismatch'}
           foreach ($row in Get-Content SHA256SUMS) {
             $sum,$path=$row -split '  ',2
             if ((Get-FileHash -LiteralPath $path).Hash -ne $sum) {throw "Hash mismatch $path"}
@@ -45,4 +45,48 @@ jobs:
         with:
           name: idle-observation
           path: ${{ runner.temp }}/trial/evidence/
+          retention-days: 7
+  collector:
+    runs-on: windows-2022
+    timeout-minutes: 8
+    env:
+      PYTHONUTF8: '1'
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: core.autocrlf
+      GIT_CONFIG_VALUE_0: 'false'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - name: Fetch fixed candidate
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download 44753578583 -R xmxxc/workflow-core -n internal-bundled-experiment-2409c40b469e0e40bd5c55326df3d5ebb86ca81b -D "$env:RUNNER_TEMP/input"
+          exit $LASTEXITCODE
+      - name: Exercise downloaded desktop collector
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          if ((Get-FileHash tools/windows-desktop-short-r1.zip).Hash -ne '117b40a72ff07ad0c93109a7a2883ecf9c4402cf970c6d58bc5b0734f1e15dac') {throw 'ZIP hash'}
+          Expand-Archive -LiteralPath tools/windows-desktop-short-r1.zip -DestinationPath "$env:RUNNER_TEMP/desktop"
+          Set-Location tools/desktop-ci
+          if ((Get-FileHash SHA256SUMS).Hash -ne 'df8ca7481766f64f59b42a21c2958d64b3943347b12565198047ad2614b1fd89') {throw 'CI manifest'}
+          foreach ($row in Get-Content SHA256SUMS) {
+            $sum,$path=$row -split '  ',2
+            if ((Get-FileHash -LiteralPath $path).Hash -ne $sum) {throw "Hash mismatch $path"}
+          }
+          python -X utf8 -m unittest discover -s "$env:RUNNER_TEMP/desktop" -p test_desktop_evidence.py -v
+          if ($LASTEXITCODE) {exit $LASTEXITCODE}
+          ./run-native.ps1 -CandidateZip "$env:RUNNER_TEMP/input/wfc-kernel-experiment-2409c40b469e0e40bd5c55326df3d5ebb86ca81b-windows-x64.zip" -DesktopTools "$env:RUNNER_TEMP/desktop" -Trial "$env:RUNNER_TEMP/collector"
+          exit $LASTEXITCODE
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: collector-evidence
+          path: ${{ runner.temp }}/collector/evidence/
           retention-days: 7
