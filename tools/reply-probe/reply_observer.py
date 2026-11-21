@@ -49,3 +49,43 @@ def install():
             sink.write(json.dumps(event) + '\n')
         return result
     bundled_runtime.call = observed
+
+
+def safe_text(value):
+    # Only controlled process output. Never export raw environment, protocol frames or specs.
+    value = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', str(value))
+    value = re.sub(r'(?i)\b[0-9a-f]{48,}\b|\b(?:sk|ghp)[-_][A-Za-z0-9_-]+', '<redacted>', value)
+    value = re.sub(r'(?i)((?:authorization|bearer|cookie|password|secret|api[_-]?key|WFC_WORKER_CALLBACK|WFC_CONTROLLER_TOKEN)[\s"\':=]+)[^\s,;]+', r'\1<redacted>', value)
+    return value
+
+
+def capture_launch():
+    dest = Path(os.environ['PROBE_STARTUP'])
+    if sys.argv[1:2] == ['dispatch']:
+        sys.path.insert(0, os.environ['PROBE_PYZ'])
+        import host_launch
+        write = host_launch.write_private
+        def observed(path, value):
+            write(path, value)
+            if str(path).endswith('.host.spec'):
+                import subprocess
+                argv = value['argv']
+                brief = argv[-1]
+                data = dict(argv=[*argv[:-1],'<worker brief>'], brief_sha256=sha(brief),
+                            brief_chars=len(brief), cwd=value['cwd'],
+                            windows_cmdline_sha256=sha(subprocess.list2cmdline(argv)),
+                            dirs={k:value['env'].get(k) for k in (
+                                'CODEX_HOME','HOME','USERPROFILE','APPDATA','LOCALAPPDATA','TEMP','WFC_STATE')},
+                            worker_grant=bool(value['env'].get('WFC_WORKER_CALLBACK')),
+                            has_owner=bool(value['env'].get('WFC_CONTROLLER_TOKEN')))
+                (dest/'prepared.json').write_text(json.dumps(data),encoding='utf-8')
+        host_launch.write_private = observed
+    elif sys.argv[1:2] == ['_host-run']:
+        def audit(event, args):
+            if event == 'subprocess.Popen':
+                import subprocess
+                exe, argv, cwd, _ = args
+                line = argv if isinstance(argv,str) else subprocess.list2cmdline(argv)
+                (dest/'spawn.json').write_text(json.dumps(dict(executable=exe, cwd=str(cwd),
+                    windows_cmdline_sha256=sha(line))),encoding='utf-8')
+        sys.addaudithook(audit)

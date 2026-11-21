@@ -33,7 +33,7 @@ jobs:
         run: |
           $ErrorActionPreference='Stop'
           Set-Location tools/reply-probe
-          if ((Get-FileHash SHA256SUMS).Hash -ne '7d9c3a046e317255291c49f0ba5fed58e40ed217ddd7b2e05568d9ee2c895c65') {throw 'Manifest mismatch'}
+          if ((Get-FileHash SHA256SUMS).Hash -ne '188f42df06b3f083b25c09efb2be0a6b7809ce759057753ee143758f69f70447') {throw 'Manifest mismatch'}
           foreach ($row in Get-Content SHA256SUMS) {
             $sum,$path=$row -split '  ',2
             if ((Get-FileHash -LiteralPath $path).Hash -ne $sum) {throw "Hash mismatch $path"}

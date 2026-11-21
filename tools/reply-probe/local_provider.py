@@ -50,6 +50,7 @@ class Provider(ThreadingHTTPServer):
         self.after_ask = threading.Event()
         self.ask_returned = threading.Event()
         self.opened = threading.Event()
+        self.transport = []
         self.stages = set()
         self.lock = threading.Lock()
         self.error = None
@@ -121,7 +122,21 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def do_GET(self):
+        # Record negotiation attempts separately from parsed model requests.
+        path=self.path.partition('?')[0]
+        self.server.transport.append(dict(at=time.monotonic(),method='GET',path=path[:120],
+                                          upgrade=self.headers.get('Upgrade','')[:30]))
+        if path=='/wfc-probe-health':
+            self.send_response(204)
+            self.end_headers()
+        else:
+            self.send_error(404)
+
     def do_POST(self):
+        self.server.transport.append(dict(at=time.monotonic(),method='POST',path=self.path.partition('?')[0][:120],
+            encoding=self.headers.get('Content-Encoding','')[:30],length=self.headers.get('Content-Length','')[:20],
+            transfer=self.headers.get('Transfer-Encoding','')[:30]))
         size = int(self.headers.get('Content-Length', '0'))
         if self.path != '/v1/responses' or not 0 < size < 4_000_000:
             return self.send_error(400)

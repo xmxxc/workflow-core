@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 from local_provider import Provider, user
-from reply_observer import bottom, EXPECTED, sha
+from reply_observer import bottom, EXPECTED, safe_text, sha
 
 HERE = Path(__file__).resolve().parent
 COMMIT = '2409c40b469e0e40bd5c55326df3d5ebb86ca81b'
@@ -79,6 +79,7 @@ def main(args):
     pkg, codex, out = (p.resolve() for p in (args.package,args.codex,args.out))
     pyz = pkg/'wfc.pyz'
     require(filehash(pyz)==PYZ_SHA and filehash(pkg/'wfc-kernel.exe')==KERNEL_SHA, 'candidate package mismatch')
+    require(filehash(codex)=='6f267830b029ee25d9339864aa867cd45de9f8fd4c5ea007d2e63c13a0c66d36','native digest')
     require((pkg/'COMMIT.txt').read_text().strip()==COMMIT, 'candidate commit mismatch')
     manifest = json.loads((pkg/'BUNDLED-MANIFEST.json').read_text())
     require(filehash(pkg/'wfc.cmd')==manifest['files']['wfc.cmd'], 'candidate entry mismatch')
@@ -100,7 +101,18 @@ def main(args):
         env.update(PATH=str(Path(sys.executable).parent)+';'+os.environ['PATH'],HOME=str(root/'profile'),
                    USERPROFILE=str(root/'profile'),APPDATA=str(root/'roaming'),LOCALAPPDATA=str(root/'local'),
                    TMP=str(root/'tmp'),TEMP=str(root/'tmp'),CODEX_HOME=str(home),WFC_STATE=str(state),TERM='xterm-256color',
-                   PYTHONUTF8='1',PROBE_PYZ=str(pyz),PROBE_WORK=str(work))
+                   PYTHONUTF8='1',WFC_BUNDLED_DIAGNOSTICS='1',PROBE_PYZ=str(pyz),PROBE_WORK=str(work))
+        hooks=root/'hooks'
+        hooks.mkdir()
+        shutil.copy2(HERE/'reply_observer.py',hooks/'reply_observer.py')
+        (hooks/'sitecustomize.py').write_text(
+            "import os, sys\n"
+            "if sys.argv[1:2] == ['reply'] and 'PROBE_TRACE' in os.environ:\n"
+            "    from reply_observer import install\n    install()\n"
+            "elif sys.argv[1:2] in (['dispatch'], ['_host-run']) and 'PROBE_STARTUP' in os.environ:\n"
+            "    from reply_observer import capture_launch\n    capture_launch()\n", encoding='ascii')
+        health={}
+        result['preflight']=health
         def cli(*params, extra=None, timeout=28):
             proc=subprocess.run([str(pkg/'wfc.cmd'), *map(str,params)], env={**env,**(extra or {})}, cwd=work,
                                 capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=timeout)
@@ -132,6 +144,46 @@ def main(args):
         def capture(label):
             v=bundled_runtime.call(snapshot,'read')
             result['screens'][label]=dict(at=time.monotonic(),result=v['result'],**bottom(v.get('data',{}),router))
+        def startup_state():
+            # Direct reads of this isolated generation's files survive closure of its RPC endpoint.
+            receipt_path=Path(handle['receipt'])
+            snap_path=Path(handle['snapshot'])
+            receipt=bundled_runtime.read_json(receipt_path)
+            snap=bundled_runtime.read_json(snap_path)
+            record=dict(at=time.monotonic(),launch={k:safe_text(receipt[k]) if k=='diagnostic' else receipt[k]
+                for k in ('category','diagnostic','exitCode','pid','processStart','at') if k in receipt},
+                state=snap.get('state'),cleanup=snap.get('cleanup'))
+            if snap.get('final_screen'):
+                record['final_viewport']=safe_text(snap['final_screen'])[:24000]
+            return record
+        def initial_ready():
+            if provider.opened.is_set():
+                return True
+            if time.monotonic()>=initial_ready.next_at:
+                initial_ready.next_at=time.monotonic()+.5
+                record=startup_state()
+                events=result.setdefault('startup_observations',[])
+                if record['state']=='active':
+                    reply=bundled_runtime.call(snapshot,'read')
+                    record['read']=reply['result']
+                    record['viewport']=safe_text(reply.get('data',{}).get('text',''))[:24000]
+                    record['diagnostic']=safe_text(reply.get('diagnostic',''))
+                signature={k:v for k,v in record.items() if k!='at'}
+                if signature!=initial_ready.previous and len(events)<40:
+                    events.append(record)
+                    initial_ready.previous=signature
+                if record['state'] in ('exited','faulted','closed'):
+                    raise RuntimeError('host ended during startup; see startup_observations and preclose')
+                if record['launch'].get('exitCode') is not None:
+                    # The supervisor writes exitCode just before the service publishes final_screen.
+                    if initial_ready.exit_seen is None:
+                        initial_ready.exit_seen=time.monotonic()
+                    elif time.monotonic()-initial_ready.exit_seen>3:
+                        raise RuntimeError('host exit receipt without terminal cleanup snapshot yet')
+            return False
+        initial_ready.exit_seen=None
+        initial_ready.previous=None
+        initial_ready.next_at=0
         try:
             result['codex_version']=subprocess.check_output([str(codex),'--version'],cwd=work,env=env,
                                                              text=True,timeout=12).strip()
@@ -145,13 +197,33 @@ def main(args):
                 '[mcp_servers.wfcprobe]\ncommand = '+json.dumps(sys.executable)+'\nargs = ['+json.dumps(str(helper))+']\n'
                 'env_vars = ["WFC_STATE","WFC_DISPATCH","WFC_WORKER_CALLBACK","PROBE_WORK","PROBE_PYZ","PYTHONUTF8"]\n'
                 f'[projects.{json.dumps(str(work))}]\ntrust_level = "trusted"\n',encoding='utf-8')
+            # Exercise the same child cwd and profile through read-only commands. No conversation is opened.
+            probe=subprocess.run([codex,'mcp','get','wfcprobe','--json'],cwd=work,env=env,
+                capture_output=True,encoding='utf-8',errors='replace',timeout=15)
+            health['mcp_get_exit']=probe.returncode
+            health['mcp_get_stderr']=safe_text(probe.stderr)[:1200]
+            if probe.returncode==0:
+                entry=json.loads(probe.stdout)
+                transport=entry.get('transport') or {}
+                health['fixture_config_read']=entry.get('name')=='wfcprobe' and transport.get('args')==[str(helper)]
+            from urllib.request import ProxyHandler, build_opener
+            # No inherited proxy for the loopback health observation.
+            with build_opener(ProxyHandler({})).open(
+                    f'http://127.0.0.1:{provider.server_port}/wfc-probe-health',timeout=3) as check:
+                health['stub_http']=check.status
+            health['config_sha256']=filehash(home/'config.toml')
+            health['dirs_exist']=all(Path(env[k]).is_dir() for k in
+                ('HOME','USERPROFILE','APPDATA','LOCALAPPDATA','CODEX_HOME','WFC_STATE','TMP','TEMP'))
+            health['auth_file_present']=(home/'auth.json').exists()
+            require(health['stub_http']==204 and health['dirs_exist'] and not health['auth_file_present'],'isolation preflight')
             (work/'task.md').write_text('Use the controlled callback tool to ask D_GO? and end your turn. '
                                        'On reply, use the same tool to finish.\n',encoding='utf-8')
             save(work/'launch.json',{'hosts':{'codex':{'command':[str(codex),'--no-daemon']}}})
             a=cli('owner','acquire','--scope','probe','--owner','A','--lease','300')
             env['WFC_CONTROLLER_TOKEN']=a['token']
             job=cli('dispatch','--backend','bundled','--host','codex','--scope','probe','--model','controlled',
-                    '--task',work/'task.md','--cwd',work,'--report',work/'report.md','--launch-config',work/'launch.json')
+                    '--task',work/'task.md','--cwd',work,'--report',work/'report.md','--launch-config',work/'launch.json',
+                    extra=dict(PYTHONPATH=str(hooks),PROBE_STARTUP=str(out)))
             result['assignment']={k:job[k] for k in ('scope','dispatch','round','attempt')}
             save(work/'assignment.json',result['assignment'])
             s=status()
@@ -161,7 +233,7 @@ def main(args):
                 dict(pid=s['launch']['pid'],creation=s['launch']['processStart'])]
             result['identity_a']=ident(s)
             capture('initial')
-            until(provider.opened.is_set,45,'initial worker model request')
+            until(initial_ready,45,'initial worker model request')
             b=cli('owner','takeover','--scope','probe','--owner','B','--lease','300')
             env['WFC_CONTROLLER_TOKEN']=b['token']
             result['identity_b']=ident(status())
@@ -191,10 +263,6 @@ def main(args):
             result['before']=until(before,16,'requested reply timing and bound worker rollout')
             require(not result['before']['exact'],'unexpected preexisting reply')
             capture('before_reply')
-            hooks=root/'hooks'
-            hooks.mkdir()
-            shutil.copy2(HERE/'reply_observer.py',hooks/'reply_observer.py')
-            (hooks/'sitecustomize.py').write_text('from reply_observer import install\ninstall()\n',encoding='ascii')
             result['reply_invocations']+=1
             result['reply_at']=time.monotonic()
             try:
@@ -237,6 +305,11 @@ def main(args):
                             result['partial_launch']={k:launch[k] for k in ('category','exitCode','diagnostic') if k in launch}
                         except Exception:
                             result['partial_launch']={'category':'unavailable'}
+                    if 'handle' in locals():
+                        try:
+                            result['preclose']=startup_state()
+                        except (OSError, ValueError, KeyError) as err:
+                            result['preclose_read_error']=type(err).__name__
                     result['close']=cli('close',job['dispatch'])['result']
                     view=cli('status','--dispatch',job['dispatch'])
                     result['closed_view']=dict(alive=view['dispatches'][0]['backendAlive'],waiters=len(view['waiters']))
@@ -253,7 +326,23 @@ def main(args):
                 provider.shutdown()
                 provider.server_close()
                 thread.join(3)
-                result.update(stub=provider.records,stub_error=provider.error,stub_stopped=not thread.is_alive())
+                if 'handle' in locals():
+                    path=Path(handle['snapshot'])
+                    for role in ('runtime','guardian'):
+                        trace=path.with_suffix('.'+role+'.trace.json')
+                        if trace.is_file():
+                            result.setdefault('lifecycle_trace',{})[role]=bundled_runtime.read_json(trace)['events']
+                log=home/'log'/'codex-tui.log'
+                if log.is_file():
+                    with log.open('rb') as source:
+                        source.seek(max(log.stat().st_size-65536,0))
+                        lines=source.read(65536).decode('utf-8','replace').splitlines()
+                    result['startup_log_issues']=[safe_text(line)[:1000] for line in lines
+                        if ('WARN' in line or 'ERROR' in line) and not any(v in line.lower() for v in
+                            ('headers','auth.json','instructions','tool arguments','shell snapshot','env_vars'))][-30:]
+                if (out/'spawn.json').is_file() and (out/'prepared.json').is_file():
+                    result['launch_command_hash_matches']=json.loads((out/'spawn.json').read_text())['windows_cmdline_sha256']==json.loads((out/'prepared.json').read_text())['windows_cmdline_sha256']
+                result.update(transport=provider.transport,stub=provider.records,stub_error=provider.error,stub_stopped=not thread.is_alive())
                 save(out/'result.json',result)
         row,=result['rollouts']
         require(row['version']=='0.164.0' and row['session']==result['before']['session'] and len(row['exact'])==1,

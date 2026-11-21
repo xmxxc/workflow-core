@@ -24,7 +24,7 @@ if ($native.name -ne '@openai/codex' -or $native.version -ne '0.164.0-win32-x64'
 $tgz = "$trialDir/native.tgz"
 Invoke-WebRequest -Uri $native.dist.tarball -OutFile $tgz -TimeoutSec 120
 $sri = 'sha512-' + [Convert]::ToBase64String([Convert]::FromHexString((Get-FileHash -Algorithm SHA512 -LiteralPath $tgz).Hash))
-if ($sri -cne $native.dist.integrity) { throw 'Native npm integrity' }
+if ($sri -cne $native.dist.integrity -or $sri -cne 'sha512-urWPhwh9YavuoAPIkmVYKBTtd5OtGVL4Ki0Fb28dhK/Mz6Pt4LSy+gbRrZFz5+RXrw9ubvXuXDCcd8beYcWhDg==') { throw 'Native npm integrity' }
 & tar.exe -xzf $tgz -C $trialDir
 if ($LASTEXITCODE) { throw 'Native extraction failed' }
 $bins = @(Get-ChildItem -LiteralPath "$trialDir/package/vendor" -Filter codex.exe -Recurse -File |
