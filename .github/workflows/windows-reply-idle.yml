@@ -1,0 +1,48 @@
+name: Windows single reply observation
+on:
+  push:
+    branches: ['experiment/windows-reply-idle-36']
+permissions:
+  contents: read
+  actions: read
+jobs:
+  observe:
+    runs-on: windows-2022
+    timeout-minutes: 8
+    env:
+      PYTHONUTF8: '1'
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: core.autocrlf
+      GIT_CONFIG_VALUE_0: 'false'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - name: Fetch fixed candidate
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download 44753578583 -R xmxxc/workflow-core -n internal-bundled-experiment-2409c40b469e0e40bd5c55326df3d5ebb86ca81b -D "$env:RUNNER_TEMP/input"
+          exit $LASTEXITCODE
+      - name: Observe one public reply
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          Set-Location tools/reply-probe
+          if ((Get-FileHash SHA256SUMS).Hash -ne '7d9c3a046e317255291c49f0ba5fed58e40ed217ddd7b2e05568d9ee2c895c65') {throw 'Manifest mismatch'}
+          foreach ($row in Get-Content SHA256SUMS) {
+            $sum,$path=$row -split '  ',2
+            if ((Get-FileHash -LiteralPath $path).Hash -ne $sum) {throw "Hash mismatch $path"}
+          }
+          ./run.ps1 -CandidateZip "$env:RUNNER_TEMP/input/wfc-kernel-experiment-2409c40b469e0e40bd5c55326df3d5ebb86ca81b-windows-x64.zip" -Trial "$env:RUNNER_TEMP/trial" -Mode idle
+          exit $LASTEXITCODE
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: idle-observation
+          path: ${{ runner.temp }}/trial/evidence/
+          retention-days: 7
