@@ -69,6 +69,15 @@ class BoundRollout(unittest.TestCase):
         self.assertEqual(got["turn_context"][1]["model"],{"sha256":sha(SECRET)})
         self.assertNotIn(SECRET,json.dumps(got))
 
+    def test_completed_user_item_is_a_projection_only(self):
+        for role in ('UserMessage','AgentMessage'):
+            self.rows.append({'type':'event_msg','payload':{'type':'item_completed',
+                'item':{'type':role,'content':[{'type':'text','text':EXPECTED}]}}})
+        self.save()
+        result = self.read()
+        self.assertEqual(result['projected'], [4])
+        self.assertEqual(result['exact'], [])
+
     def test_multipart_and_nontext_user_content(self):
         self.rows.extend([canonical(EXPECTED),canonical(EXPECTED)])
         self.rows[-2]["payload"]["content"]=[{"type":"input_text","text":s} for s in [EXPECTED[:8],EXPECTED[8:]]]

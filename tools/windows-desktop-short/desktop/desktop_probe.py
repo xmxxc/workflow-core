@@ -13,14 +13,10 @@ import subprocess
 import sys
 import tempfile
 import time
-from uuid import UUID
+from uuid import UUID, uuid4
 from contextlib import closing
 
 HERE = Path(__file__).resolve().parent
-CANDIDATE = '2409c40b469e0e40bd5c55326df3d5ebb86ca81b'
-PAYLOAD = {'wfc.pyz': 'ba60b239aeb48b6014cf4f7b4925ce2897db4c8d0ad3e131c60603a0ab87d914',
-           'wfc-kernel.exe': 'ac383ae828e21dc3fa33d306d895ccf188917fccdac3ef2c10b642f3271cfa15',
-           'wfc.cmd': 'e8f1ce5cda54cb6a40395e1492ea62f98f0827067a15f6ac5a42602f6cf688fa'}
 NATIVE_SHA = '6f267830b029ee25d9339864aa867cd45de9f8fd4c5ea007d2e63c13a0c66d36'
 ANSWER = 'D_GO'
 QUESTION = 'D_GO?'
@@ -187,17 +183,21 @@ def one_reply(plan_file):
         runpy.run_path(plan['pyz'],run_name='__main__')
 
 
-def run_trial(package, host_command, worker_home, trial_parent, *, kind, cli_version, cli_sha256):
+def run_trial(package, host_command, worker_home, trial_parent, *, kind, cli_version, cli_sha256,
+              worker_term=None, model=None, effort=None, worker_scratch=False, candidate=None, pyz_sha=None,
+              copy_callback_program=False):
     import desktop_evidence as evidence
     import startup
     from desktop_evidence import EvidenceError
+    from launch_short import package_binding
     check(kind in ('desktop','native_collector_fixture'), 'unknown run kind')
     package = Path(package).resolve(strict=True)
     worker_home = Path(worker_home).resolve(strict=True)
     parent = Path(trial_parent).resolve(strict=True)
-    for name,digest in PAYLOAD.items():
+    identity, payload = package_binding(candidate, pyz_sha)
+    for name,digest in payload.items():
         check(file_sha(package/name) == digest, 'candidate file hash mismatch: '+name)
-    check((package/'COMMIT.txt').read_text().strip() == CANDIDATE, 'candidate commit mismatch')
+    check((package/'COMMIT.txt').read_text().strip() == identity, 'candidate commit mismatch')
     if kind == 'desktop':
         check(cli_version=='codex-cli 0.164.0' and cli_sha256==NATIVE_SHA, 'independent Codex identity mismatch')
     pyz = package/'wfc.pyz'
@@ -205,23 +205,39 @@ def run_trial(package, host_command, worker_home, trial_parent, *, kind, cli_ver
     import bundled_runtime
     import router
     import wfc_platform
-    trial = Path(tempfile.mkdtemp(prefix='wfc-desktop-short-',dir=parent)).resolve()
+    import host_launch
+    if worker_scratch:
+        # Match the Windows takeover fixture's per-user scratch workspace.
+        # Python 3.13 mkdtemp gives the sandbox a different DACL from a normal workspace.
+        trial = Path(tempfile.gettempdir()).resolve() / ('wfc-desktop-short-' + uuid4().hex)
+        trial.mkdir(exist_ok=False)
+    else:
+        trial = Path(tempfile.mkdtemp(prefix='wfc-desktop-short-',dir=parent)).resolve()
     (trial/'.gitignore').write_text('*\n',encoding='ascii')
     print('Trial '+str(trial),flush=True)
     work, out, state, router_home = (trial/n for n in ('work','evidence','private-state','router-home'))
-    for p in (work,out,state,router_home):
+    for p in (work,state):
         p.mkdir()
+    for p in (out,router_home):
+        p.mkdir(mode=0o700)
     # Remove inherited WFC capabilities, route selectors and caller thread identity.
     env = {k:v for k,v in os.environ.items() if not k.upper().startswith('WFC_') and k.upper()!='CODEX_THREAD_ID'}
+    if worker_scratch:
+        for key in ('CODEX_WINDOWS_REGISTERED_CORE','CODEX_APP_RUNTIME_CLI_PATH',
+                    'CODEX_APP_TOOLS_PIPE_PATH','CODEX_WINDOWS_SANDBOX_PACKAGE_FAMILY'):
+            env.pop(key, None)
     env.update(WFC_STATE=str(state),CODEX_HOME=str(router_home),PYTHONUTF8='1',
                PATH=str(Path(sys.executable).parent)+os.pathsep+env.get('PATH',''))
     parent_thread = os.environ.get('CODEX_THREAD_ID')
+    host_env = {'CODEX_HOME': str(worker_home)}
+    if worker_term is not None:
+        host_env['TERM'] = worker_term
     scope = trial.name
-    result = dict(kind=kind, candidate=CANDIDATE, package_sha256=PAYLOAD, cli_version=cli_version,
+    result = dict(kind=kind, candidate=identity, package_sha256=payload, cli_version=cli_version,
                   cli_sha256=cli_sha256, os=platform.platform(), python=sys.version.split()[0],
                   verdict='blocked', cwd={'role':'trial/work','sha256':startup.sha(str(work)),
-                                        'parent_is_invocation_cwd':parent == Path.cwd().resolve()},
-                  launch_inputs={'model_flag':False, 'effort_flag':False, 'explicit_runtime':False,
+                                        'parent_is_invocation_cwd':trial.parent == Path.cwd().resolve()},
+                  launch_inputs={'model_flag':bool(model), 'effort_flag':bool(effort), 'explicit_runtime':False,
                       'worker_home_source':('isolated-fixture' if kind!='desktop' else
                                             'CODEX_HOME' if os.environ.get('CODEX_HOME') else 'default-home'),
                       'worker_home_sha256':startup.sha(str(worker_home)),
@@ -229,7 +245,12 @@ def run_trial(package, host_command, worker_home, trial_parent, *, kind, cli_ver
                           'invocation_project':(parent/'.codex'/'config.toml').is_file(),
                           'worker_project':(work/'.codex'/'config.toml').is_file()},
                       'inherited':startup.env_view(os.environ), 'router':startup.env_view(env),
-                      'host_env_overrides':['CODEX_HOME']},
+                      'host_env_overrides':list(host_env),
+                      'term_source':'host override' if worker_term else 'inherited',
+                      'model_source':'dispatch --model' if model else 'host configuration/default',
+                      'requested_model':model,
+                      'effort_source':'dispatch --effort' if effort else 'host configuration/default',
+                      'requested_effort':effort},
                   screens={}, tracked={},reply_invocations=0,
                   cleanup={'confirmed':False},receipts={})
     job, handle, bound_file, session, expected = None,None,None,None,None
@@ -241,6 +262,9 @@ def run_trial(package, host_command, worker_home, trial_parent, *, kind, cli_ver
         proc = subprocess.run(cmd,env=env,cwd=work,capture_output=True,encoding='utf-8',errors='replace',timeout=timeout)
         if args[0]=='dispatch' and proc.returncode:
             result['dispatch_error']={'exit_code':proc.returncode,'stderr':startup.words(proc.stderr)}
+            host_launch.write_private(trial/'dispatch-local.json', {
+                'scope':scope, 'exit_code':proc.returncode, 'diagnostic':startup.local_excerpt(proc.stderr),
+            })
         check(proc.returncode == 0, f'public {args[0]} exited {proc.returncode}')
         return json.loads(proc.stdout)
 
@@ -301,8 +325,13 @@ def run_trial(package, host_command, worker_home, trial_parent, *, kind, cli_ver
 
     try:
         shutil.copy2(Path(__file__),work/'desktop_probe.py')
+        callback_pyz = pyz
+        if copy_callback_program:
+            # A ZIP is extracted in the controller's private temp directory.
+            callback_pyz = Path(shutil.copy2(pyz, work/'wfc.pyz'))
+            check(file_sha(callback_pyz) == payload['wfc.pyz'], 'worker program copy differs')
         write_json(work/'launch.json',{'hosts':{'codex':{'command':list(map(str,host_command)),
-                                                       'env':{'CODEX_HOME':str(worker_home)}}}})
+                                                       'env':host_env}}})
         ask_cmd = "& '"+str(Path(sys.executable)).replace("'","''")+"' .\\desktop_probe.py --worker "
         (work/'task.md').write_text(
             "This disposable one-chat test uses the bundled worker callback. From your assigned cwd, "
@@ -312,10 +341,11 @@ def run_trial(package, host_command, worker_home, trial_parent, *, kind, cli_ver
             "record done and end the turn.\n\n"+ask_cmd+"finish\n",encoding='utf-8')
         save()
         job=cli('dispatch','--backend','bundled','--host','codex','--scope',scope,'--cwd',work,
-                '--task',work/'task.md','--report',work/'report.md','--launch-config',work/'launch.json',timeout=22)
+                '--task',work/'task.md','--report',work/'report.md','--launch-config',work/'launch.json',
+                *(['--model', model] if model else []), *(['--effort', effort] if effort else []), timeout=22)
         result['assignment']={k:job[k] for k in ('dispatch','attempt','round','scope')}
         write_json(work/'assignment.json',{**result['assignment'],'state':str(state),'router_home':str(router_home),
-                                           'pyz':str(pyz)})
+                                           'pyz':str(callback_pyz)})
         s=public_status()
         collect_processes(s)
         result['launch']={k:s['launch'][k] for k in ('pid','processStart','category','exitCode') if k in (s.get('launch') or {})}
@@ -365,7 +395,13 @@ def run_trial(package, host_command, worker_home, trial_parent, *, kind, cli_ver
         check(startup.matching_launch(startup_view) and
               observed_roles.get('worker')==result['tracked']['worker'],
               'prepared command, actual spawn or worker start evidence did not match')
-        plan=trial/'reply-plan.json'
+        if worker_term is not None:
+            check(startup_view['spawn']['env']['TERM'].get('value') == worker_term, 'worker TERM mismatch')
+        context = (before.get('turn_context') or [{}])[-1]
+        for key, requested in (('model',model),('effort',effort)):
+            if requested is not None:
+                check(context.get(key) == requested, 'worker turn context differs from requested '+key)
+        plan=router_home/'reply-plan.json'
         write_json(plan,dict(pyz=str(pyz),question=q['id'],trace=str(trace_file),generation=h['generation'],
                              dispatch=job['dispatch'],attempt=job['attempt'],worker=result['tracked']['worker']))
         result['reply_invocations']=1
@@ -423,6 +459,10 @@ def run_trial(package, host_command, worker_home, trial_parent, *, kind, cli_ver
                                              "AND operation='create' ORDER BY created DESC LIMIT 1",(d,)).fetchone()
                         if fault:
                             result['create_fault']=startup.receipt_view({'category':fault[0],'diagnostic':fault[1]})
+                            local_path = trial/'dispatch-local.json'
+                            host_launch.write_private(local_path, {
+                                **startup.read(local_path), **dbview, 'create_fault':startup.local_excerpt(fault[1]),
+                            })
                         database_handle=json.loads(raw_handle) if raw_handle else {}
                         if handle and database_handle:
                             bind(all(handle[k]==database_handle.get(k) for k in ('unit','attempt','generation')),
@@ -465,7 +505,8 @@ def run_trial(package, host_command, worker_home, trial_parent, *, kind, cli_ver
                 if handle and handle.get('snapshot'):
                     try:
                         view, roles = startup.preclose(state,job,handle,bundled_runtime,
-                                                  startup_failed=bool(result.get('error')) and not result['reply_invocations'])
+                                                  startup_failed=bool(result.get('error')) and not result['reply_invocations'],
+                                                  local_path=trial/'startup-local.json')
                         result['startup']=view
                         for role, ident in roles.items():
                             record_identity(role, ident or {})
@@ -566,6 +607,13 @@ if __name__=='__main__':
         parser.add_argument('--package',required=True,type=Path)
         parser.add_argument('--codex',required=True,type=Path)
         parser.add_argument('--trial-parent',type=Path,default=Path.cwd())
+        parser.add_argument('--worker-term', choices=['dumb','xterm-256color'])
+        parser.add_argument('--model', choices=['gpt-6.1-sol'])
+        parser.add_argument('--effort', choices=['high'])
+        parser.add_argument('--copy-callback-program', action='store_true')
+        parser.add_argument('--worker-scratch', action='store_true')
+        parser.add_argument('--candidate-id')
+        parser.add_argument('--pyz-sha256')
         args=parser.parse_args()
         check(os.name=='nt' and sys.version_info>=(3,9),'native Windows with Python 3.9+ is required')
         exe=args.codex.resolve(strict=True)
@@ -575,5 +623,8 @@ if __name__=='__main__':
         check(raw=='codex-cli 0.164.0','native CLI version differs')
         home=Path(os.environ.get('CODEX_HOME') or Path.home()/'.codex')
         _,result=run_trial(args.package,[str(exe),'--no-daemon'],home,args.trial_parent,
-                           kind='desktop',cli_version=raw,cli_sha256=digest)
+                           kind='desktop',cli_version=raw,cli_sha256=digest,worker_term=args.worker_term,
+                           model=args.model,effort=args.effort,worker_scratch=args.worker_scratch,
+                           copy_callback_program=args.copy_callback_program,
+                           candidate=args.candidate_id,pyz_sha=args.pyz_sha256)
         sys.exit(0 if result['verdict']=='consumed' else 1)

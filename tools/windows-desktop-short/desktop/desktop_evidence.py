@@ -129,6 +129,15 @@ def read_rollout(path, *, session, cwd, dispatch, attempt, expected, closed=Fals
             if kind == "event_msg":
                 if sub == "user_message" and p.get("message") == expected:
                     out["projected"].append(number)
+                if sub == "item_completed":
+                    item = p.get("item")
+                    if isinstance(item, dict) and item.get("type") == "UserMessage":
+                        parts = item.get("content")
+                        if isinstance(parts, list) and parts and all(
+                                isinstance(part, dict) and part.get("type") == "text" and
+                                isinstance(part.get("text"), str) for part in parts):
+                            if "".join(part["text"] for part in parts) == expected:
+                                out["projected"].append(number)
                 if sub in ("task_started","task_complete","turn_aborted","error"):
                     out["turns"].append([number, sub, p.get("turn_id"), row.get("timestamp")])
         after = os.fstat(stream.fileno())

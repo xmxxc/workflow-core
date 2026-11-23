@@ -159,6 +159,19 @@ def supervisor(pyz, spec):
 
     def launch(argv, **kwargs):
         actual = entry(argv, kwargs['cwd'], kwargs['env'])
+        # Save only recognized host arguments. The brief and arbitrary arguments can contain secrets.
+        display = []
+        for value, token in zip(argv, actual['argv']):
+            role = token['role']
+            if role in OPTIONS or role in ('executable','directory') and Path(value).is_absolute():
+                display.append(value)
+            elif value in ('gpt-6.1-sol', 'model_reasoning_effort=high'):
+                display.append(value)
+            else:
+                display.append('<' + role + '>')
+        host_launch.write_private(dest/'launch-local.json', {
+            'argv':display, 'cwd':str(kwargs['cwd']), 'TERM':actual['env']['TERM'].get('value'),
+        })
         put(dest/'spawn.json', {**actual,'observed_ns':time.time_ns()})
         return start(argv, **kwargs)
 
@@ -202,7 +215,21 @@ def receipt_view(row):
     return out
 
 
-def preclose(state, job, handle, runtime, *, startup_failed=False):
+def local_excerpt(text):
+    import host_launch
+    if not isinstance(text, str):
+        return None
+    # Remove terminal escapes before syntax-based credential redaction.
+    text = re.sub(r'\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~])', '', text)
+    text = host_launch.sanitize(text, os.environ)
+    text = re.sub(r'\b[A-Za-z0-9_-]{32,}\b', '<redacted>', text)
+    text = re.sub(r"""(?ix)(?:[A-Z]:[\\/]|\\\\)[^:\r\n"'<>|]*?
+                      (?=\s+(?:could\s+not|cannot|was\s+not|is\s+not|failed\s+to|does\s+not)\b
+                         |[:\r\n"'<>|]|$)""", '<local path>', text)
+    return '\n'.join(line.strip() for line in text.splitlines() if line.strip())[:1200]
+
+
+def preclose(state, job, handle, runtime, *, startup_failed=False, local_path=None):
     snapfile, receiptfile, dest = sources(state, job, handle)
     receipt = read(receiptfile)
     snap = read(snapfile)
@@ -232,6 +259,22 @@ def preclose(state, job, handle, runtime, *, startup_failed=False):
                   'creation': creation if isinstance(creation,str) and re.fullmatch(
                         r'windows:[0-9]+|linux:[a-f0-9-]+:[0-9]+',creation) else None}
     state_label = snap.get('state') if bound(snap) else None
+    if local_path and state_label is not None:
+        import host_launch
+        local = {
+            'dispatch': job['dispatch'], 'attempt': job['attempt'], 'generation': handle['generation'],
+            'launch':read(dest/'launch-local.json'),
+        }
+        if startup_failed:
+            local['diagnostic'] = local_excerpt(receipt.get('diagnostic'))
+            if signed and state_label == 'exited':
+                local['final_screen'] = local_excerpt(snap.get('final_screen'))
+            elif state_label == 'active':
+                reply = runtime.call(snap, 'read')
+                if reply.get('result') == 'accepted':
+                    lines = (reply.get('data', {}).get('text') or '').splitlines()
+                    local['live_screen'] = local_excerpt('\n'.join(lines[-15:]))
+        host_launch.write_private(local_path, local)
     view = {'observed_ns':time.time_ns(), 'generation': handle['generation'], 'prepared': prepared, 'spawn': spawn,
             'started_receipt': start_view, 'snapshot_state': state_label if state_label in
                 ('active','exited','closed','faulted') else 'unavailable',

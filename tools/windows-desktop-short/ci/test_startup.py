@@ -78,6 +78,29 @@ class StartupTests(unittest.TestCase):
         shutil.rmtree(self.state)
         self.assertFalse(self.rfile.exists())
 
+    def test_prelaunch_failure_retains_local_stderr_after_cleanup(self):
+        import desktop_probe
+        def cli(argv, **kwargs):
+            if 'dispatch' in argv:
+                return subprocess.CompletedProcess(argv, 1, '', r'C:\local\settings.json: invalid field; token=SECRET')
+            self.assertEqual(argv[-1], 'status')
+            return subprocess.CompletedProcess(argv, 0, '{"dispatches":[]}', '')
+        desktop_probe.platform.platform()
+        with patch.object(subprocess, 'run', side_effect=cli):
+            trial, result = desktop_probe.run_trial(Path(self.pyz).parent, ['fixture'], self.root, self.root,
+                kind='native_collector_fixture', cli_version='fixture', cli_sha256='fixture')
+        local = startup.read(trial/'dispatch-local.json')
+        self.assertEqual(local['scope'], trial.name)
+        self.assertIn('invalid field', local['diagnostic'])
+        self.assertNotIn('settings.json', local['diagnostic'])
+        self.assertNotIn('SECRET', local['diagnostic'])
+        self.assertTrue(result['cleanup']['confirmed'])
+        self.assertFalse(result['reply_invocations'])
+
+    def test_path_with_spaces_keeps_unquoted_error_suffix(self):
+        self.assertEqual(startup.local_excerpt(r'C:\local folder\settings.toml could not be opened (os error 5)'),
+                         '<local path> could not be opened (os error 5)')
+
     def test_real_supervisor_started_and_exited_or_success(self):
         for code in (17,0):
             final=self.child(code,True)
@@ -110,8 +133,8 @@ class StartupTests(unittest.TestCase):
     def test_trial_early_close_with_and_without_started_mirror(self):
         import desktop_probe, wfc_platform
         desktop_probe.platform.platform()
-        for mirror in (True,False):
-            home=self.root/('home-'+str(mirror))
+        for mirror, failed_dispatch in ((True,False),(False,False),(True,True)):
+            home=self.root/f'home-{mirror}-{failed_dispatch}'
             home.mkdir()
             calls=[]
             job=dict(self.job,round=1)
@@ -145,6 +168,8 @@ class StartupTests(unittest.TestCase):
                         startup.put(dest/'started.json',ident)
                     public.update(job,cwd=str(work),backendHandle=handle,backendAlive=False,
                                   launch=startup.read(rc))
+                    if failed_dispatch:
+                        return subprocess.CompletedProcess(argv, 1, '', 'startup confirmation timed out')
                     value=job
                 elif op=='status':
                     value={'dispatches':[public],'waiters':[]}
@@ -161,6 +186,9 @@ class StartupTests(unittest.TestCase):
                 trial,result=desktop_probe.run_trial(Path(self.pyz).parent,['fixture'],home,self.root,
                             kind='native_collector_fixture',cli_version='fixture',cli_sha256='fixture')
             self.assertEqual(calls.count('close'),1)
+            if failed_dispatch:
+                self.assertEqual(startup.read(trial/'dispatch-local.json')['diagnostic'], 'startup confirmation timed out')
+                self.assertIn('WFC controlled startup sentinel', startup.read(trial/'startup-local.json')['diagnostic'])
             self.assertEqual(result['reply_invocations'],0)
             self.assertEqual(result['verdict'],'blocked')
             self.assertFalse((trial/'evidence'/'inputs.jsonl').exists() or (trial/'private-state').exists())

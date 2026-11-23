@@ -126,9 +126,13 @@ def check(args):
             assert result['verdict']=='blocked' and result['reply_invocations']==0
             assert not (args.evidence/'inputs.jsonl').exists()
             assert start['receipt']['category']=='process_exited' and start['receipt']['exit_code']==17
-            assert 'fixture-startup-sentinel' in start['receipt']['diagnostic']['signals']
-            assert 'fixture-startup-sentinel' in start['natural_final_screen']['signals'] and start['signed_end']
+            assert start['receipt']['diagnostic']['signals'] == []
+            assert start['natural_final_screen']['signals'] == [] and start['signed_end']
             assert 'SENSITIVE_FIXTURE_CONTENT' not in (args.evidence/'result.json').read_text()
+            private = json.loads((trial/'startup-local.json').read_text(encoding='utf-8'))
+            for field in ('diagnostic', 'final_screen'):
+                assert 'terminal initialization stalled' in private[field]
+                assert 'SENSITIVE_FIXTURE_CONTENT' not in private[field]
         else:
             assert result['verdict']=='consumed' and result['reply_invocations']==1
             assert len(result['closed_rollout']['exact'])==1 and result['writes_confirmed']
@@ -138,8 +142,8 @@ def check(args):
 
 if __name__=='__main__':
     if sys.argv[1:2]==['early']:
-        print('WFC controlled startup sentinel SENSITIVE_FIXTURE_CONTENT',flush=True)
-        print('WFC controlled startup sentinel SENSITIVE_FIXTURE_CONTENT',file=sys.stderr,flush=True)
+        for stream in (sys.stdout, sys.stderr):
+            print(r'C:\fixture\config.toml: terminal initialization stalled; token=SENSITIVE_FIXTURE_CONTENT',file=stream,flush=True)
         time.sleep(.25)
         sys.exit(17)
     if sys.argv[1:2]==['worker']:
