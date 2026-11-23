@@ -1,16 +1,12 @@
-# Windows 便携分发与验收
+# Windows x64 便携分发与验收
 
-这是 #10 的 Windows 预发布测试版，版本为 0.4.7-rc.4。它包含 #30 的 Codex 回复提交修复和 #31 的 scoped detached relay 修复；短复测见随包的 `CODEX-Windows.md`（[源码版](verification/windows-codex-rc4.md)）。原生 Windows 固定候选的无人值守 Codex A 与 owner 接替后完成 D 仍待验收。[rc.2 实测记录](https://github.com/xmxxc/workflow-core/blob/b361b9e0e2447063515a57cb23e466f414cbf102/docs/verification/windows-opencode-rc2-20261115.md)记录 OpenCode 自动首派、问答、完成、同会话 resume、continue 和 300.011 秒 relay。包内保留 `OPENCode-Windows.md` 与 `CLOSE-Windows.md` 的历史步骤，重测时将其包路径和版本检查改为 rc.4。默认后端仍为 tmux；Windows 派发显式选择 `--backend herdr`。
+从 [v0.4.7 发布页](https://github.com/xmxxc/workflow-core/releases/tag/v0.4.7) 下载 `wfc-v0.4.7-windows-x64.zip` 和 `SHA256SUMS`。按随包 `INSTALL.md` 中的 PowerShell 步骤校验、解压整个目录，用 PATH 上的 Python 3.9+ 启动 `.\wfc\wfc.cmd --version`，应输出 `wfc 0.4.7`。
 
-## 下载
+平台包包含 `wfc.pyz`、`wfc.cmd`、同目录的 `wfc-kernel.exe`、依赖声明及许可证。派发时显式选择 `--backend bundled --host codex` 或 `--host opencode`，宿主另行安装和登录。Win11 下载候选包已通过真实 Codex 单聊天测试，双聊天接替记录及对应交付件比对见 [#44](https://github.com/xmxxc/workflow-core/issues/44)。
 
-从 [v0.4.7-rc.4 发布页](https://github.com/xmxxc/workflow-core/releases/tag/v0.4.7-rc.4) 下载 `wfc-v0.4.7-rc.4-windows-x64.zip`，解压后在目录内使用 `wfc.cmd`。`SHA256SUMS` 提供校验和，`COMMIT.txt` 记录构建源码；此 ZIP 包含 WFC Python payload 与启动入口，依赖按下文单独安装。
+## 单独构建 Python 入口及可选 Herdr 后端
 
-## 安装与启动
-
-依赖：原生 Windows x64、Python 3.9+、用户单独安装并启动的 Herdr 0.9.5（protocol 22），以及用户已登录的 Codex 和其需要的 Node runtime。CI 使用 Python 3.9/3.12 检查平台层，Herdr 合同使用 Python 3.12。真实 Windows Codex 版本待实机验收记录，不能把受控宿主版本当作 Codex 版本。安装 Python 时让 `python --version` 能从当前终端找到正确解释器。
-
-从同一源码构建，无 WSL、shebang 或 executable bit 前提：
+以下命令在 Windows 上从源码构建 Python 入口。若选择 `--backend herdr`，另行安装并启动 Herdr 0.9.5（protocol 22）。
 
 ```powershell
 python build.py --windows-dir 'C:\Tools\WFC candidate'
@@ -56,8 +52,8 @@ $server = Start-Process -FilePath 'D:\Tools\herdr.exe' -ArgumentList 'server' -P
 
 空格和 Unicode 路径由原生 CI 验证；常见本地盘符随 Windows runner 路径覆盖。UNC 和网络共享上的状态锁、ACL 与终端 cwd 未验证，暂不列入支持范围，应使用本地磁盘。不要从 Windows 结果推导 Unix 后端迁移；Unix tmux 继续保留。
 
-## 可重复证据与待验收项
+## Herdr 后端的验证范围
 
 CI 执行源码和打包 payload 两套真实 Herdr 合同，受控 Python 宿主覆盖派发、ask/reply/done/continue、interrupt/close/resume、迟到 attempt、owner 接替、只读拒绝、共享 pane 安全回收与服务重启。Unix 丢响应 proxy 另覆盖 uncertain 后不重放；Windows 命名管道版本不声称覆盖该故障注入。打包测试逐字节核对模块与源码，并从 cmd 和 Windows PowerShell 启动 Unicode/空格目录中的入口。
 
-真实 Windows 验收需记录 OS/机器、候选 commit、Python/Herdr/Codex 版本和脱敏后的逐步结果，完成：真实宿主派发→问题唤醒→回答→done→continue→退出/resume→接替→回收，以及重复请求、worker 崩溃、router/Herdr 重启、权限拒绝、未知输入、关闭启动终端。验证无双 writer、消息确认和显式 reconcile，最后由用户核对。该清单的未验项目保持 pending，不以自动合同代替实机结果；发生缺陷保留可复现证据，另开具体问题。
+Herdr 后端的补充验收需记录 OS/机器、候选 commit、Python/Herdr/Codex 版本和脱敏后的逐步结果，完成：真实宿主派发→问题唤醒→回答→done→continue→退出/resume→接替→回收，以及重复请求、worker 崩溃、router/Herdr 重启、权限拒绝、未知输入、关闭启动终端。验证无双 writer、消息确认和显式 reconcile，最后由用户核对。该清单的未验项目保持 pending，不以自动合同代替实机结果；发生缺陷保留可复现证据，另开具体问题。

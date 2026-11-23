@@ -1,6 +1,6 @@
 # workflow-core
 
-> 开发候选已包含 Windows 核心层、可选 Herdr 后端和便携启动入口，参见 [Windows 分发与验收](docs/windows-distribution.md)。真实 Windows Codex 验收仍待完成；下文发布版 tmux 支持范围仍为基线。
+> WFC v0.4.7 为 Linux x64 和原生 Windows x64 提供内置执行核心。Windows 11 已用下载候选包验证真实 Codex worker；双聊天接替沿用已与候选包逐件比对的实测记录。[安装与校验](docs/release-install.md) · [Windows 验收记录](https://github.com/xmxxc/workflow-core/issues/44)
 
 ![wfc · workflow-core：一个总控终端向三个 worker 终端派发任务，消息沿箭头传回](docs/assets/banner.png)
 
@@ -10,7 +10,7 @@
 
 [English](README.md) · **简体中文**
 
-**`wfc` 是一个轻量的路由器，连接 AI 编程总控和它派给 Codex、Claude Code、OpenCode 的 worker。** worker 通过 `wfc` 汇报或提问，然后进入睡眠；总控睡在 `wfc wait` 上（或由 `wfc relay` 唤醒），直到某个 worker 发来消息。整个工具只有一个命令，除了 Python 和 tmux 之外没有其他依赖。
+**`wfc` 是一个轻量的路由器，连接 AI 编程总控和它派给 Codex、Claude Code、OpenCode 的 worker。** worker 通过 `wfc` 汇报或提问，然后进入睡眠；总控睡在 `wfc wait` 上（或由 `wfc relay` 唤醒），直到某个 worker 发来消息。默认后端使用 tmux，平台包另附可选的执行核心。
 
 ## 目录
 
@@ -88,17 +88,19 @@ sequenceDiagram
 
 ### 环境要求
 
-- Linux 或 macOS（Windows 请用 WSL2）
-- Python 3.9 或更高版本
-- tmux
-- 要派发到的宿主 CLI：[Codex](https://github.com/openai/codex)、[Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[OpenCode](https://opencode.ai)
+- Python 3.9 或更高版本（含 SQLite），以及已安装、已登录的宿主 CLI。
+- Linux 和 macOS 的默认后端需要 tmux，可派发 Codex、Claude Code 和 OpenCode。
+- Linux x64 或 Windows x64 的平台包可用 `--backend bundled` 派发 Codex 或 OpenCode。Linux 还需要带 `cgroup.kill` 的可写委派 cgroup v2 子树。可选的 Herdr 后端需要另行安装 Herdr 服务。
 
 ### 安装
 
-从[最新 Release](https://github.com/xmxxc/workflow-core/releases/latest) 下载 `wfc` 和 `wfc.sha256`，校验后把 `wfc` 放到 `PATH` 上：
+从 [v0.4.7 发布页](https://github.com/xmxxc/workflow-core/releases/tag/v0.4.7) 下载 `SHA256SUMS` 和平台包：Linux x64 选 `wfc-v0.4.7-linux-x64.tar.gz`，Windows x64 选 `wfc-v0.4.7-windows-x64.zip`。核对压缩包的 SHA-256 后解压整个目录，运行 `./wfc/wfc --version` 或 `.\wfc\wfc.cmd --version`，应显示 `wfc 0.4.7`。[安装指南](docs/release-install.md) 提供两端的校验命令、bundled 设置和独立 `wfc.pyz` 用法。
+
+沿用 tmux 单文件安装时，下载 `wfc` 和 `wfc.sha256`：
 
 ```sh
-sha256sum -c wfc.sha256
+sha256sum -c wfc.sha256  # macOS 用 shasum -a 256 -c wfc.sha256
+mkdir -p ~/.local/bin
 install -m 755 wfc ~/.local/bin/wfc
 wfc --version
 ```
@@ -361,7 +363,6 @@ Claude Code 和 OpenCode 仍然只按一次回车。它们的输入框量过（C
 - **Codex 和 OpenCode 没有会话标题**（见[标签与标题](#标签与标题)）。
 - **必须是同一个 tmux 服务器。** 总控和它的 worker 必须共用 tmux 服务器和 `TMUX_TMPDIR`。
 - **升级后，运行中的等待进程仍是旧代码**，重启后才会更新。
-- **不支持原生 Windows**；请使用 WSL2。
 
 ## 与 super-coding 的关系
 
@@ -371,11 +372,11 @@ Claude Code 和 OpenCode 仍然只按一次回车。它们的输入框量过（C
 
 ## 项目状态与路线图
 
-当前发行版在 Linux/macOS 上通过 tmux 调度 Codex、Claude Code 和 OpenCode 的交互式 worker；原生 Windows 支持仍是后续候选。
+Linux 和 macOS 默认使用 tmux。Linux 和原生 Windows x64 的平台包可显式选择 bundled 后端。实测范围见[平台验收记录](docs/verification/python-router-closeout.zh-CN.md)。
 
 2026-11-13 用户确认的方向是小而完整的 router 基础层：执行身份、可靠消息、观察、中断和恢复。工人、流程政策与外壳建立在其上，super-coding 是当前工作流层。票据扫描、审查门禁和发布决定由调用方负责。
 
-下一步见 [Router 定位与补齐顺序](docs/router-foundation.md)、[源码比较](docs/router-sources-20261113.md)及 [Windows 评估](docs/windows-router-assessment-20261113.md)。所提后端与协议路线尚未实施或在 Windows 验证。新会话从[文档索引](docs/README.md)和[研究验证记录](docs/research-validation-20261113.md)恢复。
+下一步见 [Router 定位与补齐顺序](docs/router-foundation.md)、[源码比较](docs/router-sources-20261113.md)及 [Windows 评估](docs/windows-router-assessment-20261113.md)。新会话从[文档索引](docs/README.md)和[研究验证记录](docs/research-validation-20261113.md)恢复。
 
 ## 开发与发布
 
@@ -397,7 +398,7 @@ python3 build.py                        # 生成 dist/wfc
 ### CI 与发布
 
 - **CI**（`.github/workflows/ci.yml`）在每次推送到 main 和每个 pull request 时，在 Ubuntu 和 macOS 上用 Python 3.9 和 3.12 运行测试并构建。
-- **发布**（`.github/workflows/release.yml`）：先在 `wfc.py` 里设置 `VERSION`，再推送对应的标签（如 `v0.1.0`）。工作流会运行测试、构建 `wfc` 及其 SHA-256，并作为 GitHub Release 发布。下载后用 `sha256sum -c wfc.sha256` 校验。
+- **发布**使用与源码版本一致的标签。工作流验证 Linux 和 Windows 解压包后，发布两个平台包、单文件 Python 程序及 SHA-256 校验和。
 
 ### 文档
 

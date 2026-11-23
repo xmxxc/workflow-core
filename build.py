@@ -21,8 +21,9 @@ def build(out):
     with tempfile.TemporaryDirectory() as tmp:
         staging = Path(tmp) / "wfc"
         staging.mkdir()
-        for module in MODULES:
+        for module in (*MODULES, "LICENSE"):
             shutil.copy2(ROOT / module, staging / module)
+        shutil.copy2(ROOT / "docs/release-install.md", staging / "INSTALL.md")
         (staging / "__main__.py").write_text("import sys\nimport wfc\n\nsys.exit(wfc.main())\n")
         out.parent.mkdir(parents=True, exist_ok=True)
         zipapp.create_archive(staging, out, interpreter="/usr/bin/env python3", compressed=True)
@@ -38,13 +39,14 @@ def build_windows(directory):
     (directory / "wfc.cmd").write_bytes(
         b'@echo off\r\npython "%~dp0wfc.pyz" %*\r\nexit /b %errorlevel%\r\n')
     shutil.copy2(ROOT / "LICENSE", directory / "LICENSE")
+    shutil.copy2(ROOT / "docs/release-install.md", directory / "INSTALL.md")
     return directory
 
 
-def add_companion(directory, binary, notices):
+def copy_companion(directory, binary, notices):
     """Package explicitly supplied build/notice outputs; never download a runtime."""
     directory, binary, notices = Path(directory), Path(binary), Path(notices)
-    if not binary.is_file() or not notices.is_dir() or not any(notices.rglob('*')):
+    if not binary.is_file() or not notices.is_dir() or not any(p.is_file() for p in notices.rglob('*')):
         raise ValueError('bundled kernel requires a binary and a populated dependency notice directory')
     if any(path.is_symlink() for path in notices.rglob('*')):
         raise ValueError('kernel notice bundle must not contain symlinks')
@@ -55,6 +57,11 @@ def add_companion(directory, binary, notices):
         raise ValueError('bundled companion destination already exists; use a fresh distribution directory')
     shutil.copy2(binary, target)
     shutil.copytree(notices, notice_target)
+
+
+def add_companion(directory, binary, notices):
+    directory = Path(directory)
+    copy_companion(directory, binary, notices)
     shutil.copy2(ROOT / 'docs/bundled-backend.md', directory / 'BUNDLED-EXPERIMENTAL.md')
     manifest = {'experiment': 'bundled-kernel',
                 'upstream_commit': 'ee5bfb5041bb3e4a49d591c72308aae3c81ecdde',

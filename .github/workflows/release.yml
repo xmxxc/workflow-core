@@ -3,57 +3,172 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'tools/package_release.py'
+      - 'tools/package_bundled_experiment.py'
+      - 'build.py'
+      - 'wfc.py'
+      - 'LICENSE'
+      - 'docs/release-install.md'
+      - 'docs/windows-distribution.md'
+      - 'experiments/herdr-kernel-prototype/**'
+      - 'tests/test_release_package.py'
+      - 'tests/test_distribution.py'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  test:
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          python-version: "3.12"
-      - name: Test
-        run: python -m unittest discover -s tests
-      - name: Check the tag matches wfc's version
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - name: Check the release tag
+        if: github.event_name == 'push'
+        run: test "v$(python -c 'import wfc; print(wfc.VERSION)')" = "$GITHUB_REF_NAME"
+      - run: python -m unittest discover -s tests
+
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            platform: windows-x64
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-24.04
+            platform: linux-x64
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      RUSTUP_TOOLCHAIN: '1.96.1'
+      TARGET: ${{ matrix.target }}
+      PLATFORM: ${{ matrix.platform }}
+      PYTHONUTF8: '1'
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: core.autocrlf
+      GIT_CONFIG_VALUE_0: 'false'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: herdrdev/herdr
+          ref: ee5bfb5041bb3e4a49d591c72308aae3c81ecdde
+          path: upstream
+          persist-credentials: false
+      - uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943
+        with:
+          version: '0.16.0'
+      - name: Set the build cache path
+        run: printf 'CARGO_HOME=%s/bundled-cargo\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Build the locked kernel and collect its target notices
         run: |
-          version="$(python -c 'import wfc; print(wfc.VERSION)')"
-          test "v${version}" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != v${version}"; exit 1; }
-      - name: Build
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          python experiments/herdr-kernel-prototype/prepare.py --source upstream --scratch prepared
+          curl --fail --location --retry 3 --max-time 60 -o pinned-zlib.tar.gz https://deps.files.ghostty.org/zlib-1220fed0c74e1019b3ee29edae2051788b080cd96e90d56836eea857b0b966742efb.tar.gz
+          echo '17e88863f3600672ab49182f217281b6fc4d3c762bde361935e436a95214d05c  pinned-zlib.tar.gz' | sha256sum -c -
+          (
+            cd prepared/vendor/libghostty-vt
+            zlib_hash=$(zig fetch ../../../pinned-zlib.tar.gz | tr -d '\r')
+            test "$zlib_hash" = 'N-V-__8AAB0eQwD-0MdOEBmz7intriBReIsIDNlukNVoNu6o'
+          )
+          cargo build --manifest-path prepared/Cargo.toml --release --locked --target "$TARGET"
+          python experiments/herdr-kernel-prototype/collect_notices.py prepared "$TARGET" notices
+      - name: Package and verify the extracted release
         run: |
-          python build.py --out dist/wfc
-          dist/wfc --version
-          python build.py --windows-dir dist/windows
-          cp dist/windows/wfc.pyz dist/wfc.pyz
-          cp docs/windows-distribution.md dist/windows/README-Windows.md
-          cp docs/herdr-backend.md docs/host-launch.md docs/windows-core.md dist/windows/
-          cp docs/verification/windows-opencode-release.md dist/windows/OPENCode-Windows.md
-          cp docs/verification/windows-close-rc3.md dist/windows/CLOSE-Windows.md
-          cp docs/verification/windows-codex-rc4.md dist/windows/CODEX-Windows.md
-          git rev-parse HEAD > dist/windows/COMMIT.txt
-          python - <<'PYZIP'
-          import os, zipfile
-          from pathlib import Path
-          root = Path("dist/windows")
-          target = Path("dist") / ("wfc-" + os.environ["GITHUB_REF_NAME"] + "-windows-x64.zip")
-          with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-              for path in sorted(root.iterdir()):
-                  archive.write(path, "wfc/" + path.name)
-          PYZIP
-          python dist/wfc.pyz --version
-          (cd dist && sha256sum wfc > wfc.sha256 && sha256sum wfc wfc.pyz "wfc-${GITHUB_REF_NAME}-windows-x64.zip" > SHA256SUMS)
-      - name: Publish the release
+          python tools/package_release.py create --prepared prepared --notices notices --platform "$PLATFORM" --commit "$GITHUB_SHA" --output dist
+          (cd dist && sha256sum wfc-v* > "$PLATFORM.sha256" && sha256sum -c "$PLATFORM.sha256")
+          mkdir 'relocated package'
+          if [[ "$PLATFORM" == windows-x64 ]]; then
+            python -m zipfile -e dist/*.zip 'relocated package'
+            app='wfc.pyz'
+          else
+            tar -xzf dist/*.tar.gz -C 'relocated package'
+            app=wfc
+            'relocated package/wfc/wfc' --version
+          fi
+          python tools/package_release.py verify --directory 'relocated package/wfc' --platform "$PLATFORM" --commit "$GITHUB_SHA"
+          test "$(python "relocated package/wfc/$app" --version)" = "wfc $(python -c 'import wfc; print(wfc.VERSION)')"
+      - name: Native Windows contracts through the extracted launcher and companion
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & '.\relocated package\wfc\wfc.cmd' --version
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & '.\relocated package\wfc\wfc.cmd' --help
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $env:WFC_TEST_PROGRAM = (Resolve-Path 'relocated package/wfc/wfc.pyz').Path
+          $env:WFC_BUNDLED_TEST_KERNEL = (Resolve-Path 'relocated package/wfc/wfc-kernel.exe').Path
+          $env:WFC_BUNDLED_TEST_DISCOVERY = '1'
+          python -m unittest discover -s tests -p test_bundled.py -v
+      - name: Native Linux contracts through the extracted launcher and companion
+        if: runner.os == 'Linux'
+        run: |
+          sudo systemd-run --wait --pipe --collect --uid="$(id -u)" -p Delegate=yes \
+            -p "WorkingDirectory=$PWD" --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
+            --setenv="WFC_TEST_PROGRAM=$PWD/relocated package/wfc/wfc" \
+            --setenv="WFC_BUNDLED_TEST_KERNEL=$PWD/relocated package/wfc/wfc-kernel" \
+            --setenv=WFC_BUNDLED_TEST_DISCOVERY=1 bash -ec '
+              export WFC_BUNDLED_CGROUP_ROOT="/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)"
+              python -m unittest discover -s tests -p test_bundled.py -v'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push'
+    needs: [test, native]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Publish verified release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          flags=(--title "wfc ${GITHUB_REF_NAME}")
-          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
-            flags+=(--prerelease --latest=false)
-          fi
+          mkdir dist
+          cd dist
+          for platform in linux-x64 windows-x64; do
+            gh run download "$GITHUB_RUN_ID" --name "release-$platform" --dir .
+            sha256sum -c "$platform.sha256"
+          done
+          linux="wfc-$GITHUB_REF_NAME-linux-x64.tar.gz"
+          windows="wfc-$GITHUB_REF_NAME-windows-x64.zip"
+          tar -xzOf "$linux" wfc/wfc > wfc
+          chmod 755 wfc
+          unzip -p "$windows" wfc/wfc.pyz > wfc.pyz
+          cp ../LICENSE .
+          cp ../docs/release-install.md INSTALL.md
+          sha256sum wfc > wfc.sha256
+          sha256sum wfc wfc.pyz "$linux" "$windows" LICENSE INSTALL.md wfc.sha256 > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          flags=(--title "wfc ${GITHUB_REF_NAME}" --verify-tag)
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then flags+=(--prerelease --latest=false); fi
           notes=(--generate-notes)
-          if [[ -f "docs/releases/${GITHUB_REF_NAME}.md" ]]; then
-            notes=(--notes-file "docs/releases/${GITHUB_REF_NAME}.md")
+          if [[ -f "../docs/releases/${GITHUB_REF_NAME}.md" ]]; then
+            notes=(--notes-file "../docs/releases/${GITHUB_REF_NAME}.md")
           fi
-          gh release create "${GITHUB_REF_NAME}" dist/wfc dist/wfc.pyz dist/wfc.sha256 dist/SHA256SUMS "dist/wfc-${GITHUB_REF_NAME}-windows-x64.zip" "${flags[@]}" "${notes[@]}"
+          gh release create "$GITHUB_REF_NAME" wfc wfc.pyz "$linux" "$windows" LICENSE INSTALL.md wfc.sha256 SHA256SUMS "${flags[@]}" "${notes[@]}"

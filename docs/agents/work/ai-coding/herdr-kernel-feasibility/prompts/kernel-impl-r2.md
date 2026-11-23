@@ -2,7 +2,7 @@
 
 Continue existing prototype; do not restart research or broaden into production fixes. Controller read r1 report/evidence and accepts its honest feasibility limits. The fixed source and ownership rules from r1 remain. Formal source: sibling issue-26-source.md.
 
-Controller has now installed rustfmt in the isolated Rust1.96.1 toolchain (`/tmp/wfc-kernel-tools`); initial missing-formatter failure remains historical evidence, not a final passed check.
+Controller has now installed rustfmt in the isolated Rust1.96.1 toolchain (`$WFC_TOOLCHAIN_DIR`); initial missing-formatter failure remains historical evidence, not a final passed check.
 
 Required:
 1. Format ONLY authored Rust (`experiments/herdr-kernel-prototype/src/main.rs`) using rustfmt1.96.1, without formatting/modifying any selected upstream source. Keep upstream hashes unchanged. Do not expand lifecycle features or repair the three known containment gaps in this round; they are important findings for the ownership decision.

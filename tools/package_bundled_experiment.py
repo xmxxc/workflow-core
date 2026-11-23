@@ -72,8 +72,13 @@ def verify_bundle(directory, commit):
             or metadata['source_commit'] != commit or metadata['target'] != TARGET
             or metadata['source_tree'] != manifest['source_tree']):
         raise ValueError('inconsistent package identity')
+    verify_notices(directory, manifest['files'], TARGET)
+    return metadata
+
+
+def verify_notices(directory, files, target):
     index = json.loads((directory / 'bundled-notices/sources.json').read_text(encoding='utf-8'))
-    if (index['target'] != TARGET or index['cargo_lock_sha256'] != digest(directory / 'bundled-notices/Cargo.lock')
+    if (index['target'] != target or index['cargo_lock_sha256'] != digest(directory / 'bundled-notices/Cargo.lock')
             or not index['cargo']):
         raise ValueError('notice target/lock differs from native build')
     for record in index['cargo']:
@@ -81,24 +86,20 @@ def verify_bundle(directory, commit):
             raise ValueError('Cargo dependency has no notices')
         for name in record['notices']:
             path = 'bundled-notices/cargo/' + record['name'] + '-' + record['version'] + '/' + name
-            if path not in manifest['files']:
+            if path not in files:
                 raise ValueError('missing indexed Cargo notice: ' + path)
     for record in index['zig_materialized']:
         for name in record['notices']:
             path = 'bundled-notices/zig/' + record['package_hash'] + '/' + name
-            if path not in manifest['files']:
+            if path not in files:
                 raise ValueError('missing indexed Zig notice: ' + path)
-    return metadata
 
 
 def git(*args):
     return subprocess.check_output(['git', '-C', str(ROOT), *args], text=True).strip()
 
 
-def create_bundle(prepared, notices, kernel, output, commit):
-    if git('rev-parse', 'HEAD') != commit or git('diff', 'HEAD', '--name-only'):
-        raise ValueError('build requires a clean tracked tree at the candidate commit')
-    tree = git('rev-parse', 'HEAD^{tree}')
+def add_provenance(prepared, notices, bundle):
     authored = ROOT / 'experiments/herdr-kernel-prototype'
     extraction = json.loads((prepared / 'extraction.json').read_text(encoding='utf-8'))
     if extraction['source_commit'] != PIN:
@@ -117,12 +118,6 @@ def create_bundle(prepared, notices, kernel, output, commit):
             compiled[name] = digest(path)
     if (not compiled or (notices / 'Cargo.lock').read_bytes() != (prepared / 'Cargo.lock').read_bytes()):
         raise ValueError('notice lock differs from compiled source')
-    output.mkdir(parents=True, exist_ok=False)
-    bundle = output / 'wfc'
-    subprocess.run([sys.executable, str(ROOT / 'build.py'), '--windows-dir', str(bundle),
-                    '--bundled-kernel', str(kernel), '--kernel-notices', str(notices)], check=True, timeout=120)
-    manifest = json.loads((bundle / MANIFEST).read_text(encoding='utf-8'))
-    check_files(bundle, manifest['files'])
     provenance = bundle / 'bundled-notices/provenance'
     provenance.mkdir()
     shutil.copy2(prepared / 'extraction.json', provenance / 'extraction.json')
@@ -135,6 +130,19 @@ def create_bundle(prepared, notices, kernel, output, commit):
             shutil.copytree(source, destination)
         else:
             shutil.copy2(source, destination)
+
+
+def create_bundle(prepared, notices, kernel, output, commit):
+    if git('rev-parse', 'HEAD') != commit or git('diff', 'HEAD', '--name-only'):
+        raise ValueError('build requires a clean tracked tree at the candidate commit')
+    tree = git('rev-parse', 'HEAD^{tree}')
+    output.mkdir(parents=True, exist_ok=False)
+    bundle = output / 'wfc'
+    subprocess.run([sys.executable, str(ROOT / 'build.py'), '--windows-dir', str(bundle),
+                    '--bundled-kernel', str(kernel), '--kernel-notices', str(notices)], check=True, timeout=120)
+    manifest = json.loads((bundle / MANIFEST).read_text(encoding='utf-8'))
+    check_files(bundle, manifest['files'])
+    add_provenance(prepared, notices, bundle)
     shutil.copy2(ROOT / 'docs/verification/bundled-kernel-experiment.md', bundle / 'WINDOWS-MANUAL.md')
     shutil.copy2(ROOT / 'docs/verification/windows-bundled-takeover.zh-CN.md', bundle / 'WINDOWS-TAKEOVER.zh-CN.md')
     (bundle / 'COMMIT.txt').write_text(commit + '\n', encoding='ascii')
