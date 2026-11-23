@@ -25,11 +25,11 @@
 
 | 真机路径 | 通过条件 |
 | --- | --- |
-| 1. 派发 | A 先注册本聊天的 relay，再用 bundled/Codex 派发。记录 dispatch、round、attempt、backend generation、worker PID 及创建身份、宿主会话；worker 在目标目录读取本轮任务。 |
+| 1. 派发 | A 在新 scope 执行 `owner acquire` 并保存当代凭据，用该凭据在自己的聊天注册同 scope 的 relay，确认 waiter 出现，再以同一 owner 用 bundled/Codex 派发。记录 dispatch、round、attempt、backend generation、worker PID 及创建身份、宿主会话；worker 在目标目录读取本轮任务。 |
 | 2. 原聊天唤醒 | A 结束当前 turn，worker 提问后由 relay 自动唤醒原聊天。核对聊天投递记录与账本中的同一 messageId，避免另起 wait 消费通知。 |
 | 3. 问答和完成 | A 对收到的问题公开 reply 一次；原 worker 会话有且仅有一条匹配的正式用户消息。报告内容和路径匹配 attempt，done 的 messageId 经 ACK 成为 processed。 |
-| 4. 接替 | 在新现场让 B 接替在途任务。owner generation 加一，原 worker、会话、attempt 和 backend generation 保持。B 的一次 reply 被原 worker 正式消费一次，B 各收到一次 question/done，A 各收零次。旧 A 的 wait、nudge、done ACK 均被拒。 |
-| 5. 重复回执 | B 对同一 done 的首次 ACK 到 processed；再次 ACK 标记 duplicate，messageId、状态版本和报告保持一致。核对账本中仅有一个逻辑 done。 |
+| 4. 接替 | 在新现场重复第 1 项，让 worker 就绪后等待放行。B 在自己的聊天对同一 scope 执行 `owner takeover`，用新凭据注册自己的 scoped relay。确认 B 的 waiter 已出现、A 的 relay 和 waiter 已退出，再放行原 worker 提问。owner generation 加一，worker、会话、attempt 和 backend generation 保持。B 的一次 reply 被原 worker 正式消费一次，B 各收到一次 question/done，A 各收零次。A 用原凭据执行 wait、nudge、done ACK 均被拒。 |
+| 5. 重复回执 | 在 B 收到 done、A 的旧凭据 ACK 被拒后，核对账本仍为 received。B 对同一 done 的首次 ACK 到 processed；再次 ACK 标记 duplicate，messageId、状态版本和报告保持一致。核对账本中仅有一个逻辑 done。 |
 | 6. 清理 | 由当前 owner 关闭本次 dispatch。保存签名回执，核对 worker、service、kernel、guardian 和 relay 的 PID/创建身份已退出，waiter 为零，试验子 cgroup 最终移除。保留脱敏证据和每次运行结果。 |
 
 Linux 真机六项由维护者另起总控执行。Rust 可复用表中的输入、身份字段与通过条件做行为对照。
