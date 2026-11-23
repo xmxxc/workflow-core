@@ -12,7 +12,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 import package_release as release
-from collect_notices import UUCODE, UUCODE_LICENSES, UUCODE_SOURCE, XORG_RGB, copy_supplemental_notices
+from collect_notices import SIMDUTF, UUCODE, UUCODE_LICENSES, UUCODE_SOURCE, XORG_RGB, copy_supplemental_notices
 from package_bundled_experiment import digest
 
 
@@ -57,7 +57,7 @@ class StableArchives(unittest.TestCase):
                         zig_materialized=[dict(package_hash='example', notices=['LICENSE']),
                                           dict(package_hash=UUCODE, source=UUCODE_SOURCE,
                                                notices=list(UUCODE_LICENSES))],
-                        embedded_data=[XORG_RGB])))
+                        embedded_data=[XORG_RGB], vendored_native=[SIMDUTF])))
                     with patch.object(release, 'git', side_effect=lambda *args: commit if args[0] == 'rev-parse' else ''):
                         archive = release.create(prepared, notices, trial / 'dist', platform, commit)
                         checksum = digest(archive)
@@ -92,14 +92,18 @@ class StableArchives(unittest.TestCase):
         original_manifest = manifest_path.read_bytes()
         index_path = directory / 'bundled-notices/sources.json'
         original_index = index_path.read_bytes()
-        for name in ('licenses/LICENSE_Bjoern_Hoehrmann', 'licenses/LICENSE_unicode', 'xorg-rgb/COPYING'):
+        for name in ('licenses/LICENSE_Bjoern_Hoehrmann', 'licenses/LICENSE_unicode', 'xorg-rgb/COPYING',
+                     'simdutf/LICENSE-simdutf-MIT', 'simdutf/NOTICE-simdutf-isadetection'):
             with self.subTest(notice=name):
                 index = json.loads(original_index)
                 if name.startswith('licenses/'):
                     index['zig_materialized'][1]['notices'].remove(name)
                     relative = f'zig/{UUCODE}/{name}'
-                else:
+                elif name == 'xorg-rgb/COPYING':
                     index.pop('embedded_data')
+                    relative = name
+                else:
+                    index.pop('vendored_native')
                     relative = name
                 notice = directory / 'bundled-notices' / relative
                 contents = notice.read_bytes()

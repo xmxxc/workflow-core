@@ -16,7 +16,7 @@ Dispatch `d-969b8acd`，scope `s-c06dfe74`。
 
 1. 首轮 attempt `a-8d1a237b6bcb`：真实 OpenCode 进程已启动；初始 brief 留在输入框，wait 回传 stalled。测试者检查终端后补一次 Enter，约 6 秒后收到 question `WFC_WINDOWS_READY`。`reply 2 ready` 后收到 done，`reports/result.md` 包含 `WFC_WINDOWS_PASS`。
 2. `continue` 复用同一会话，attempt `a-5ea31d32b443`。延时 15 秒后写入 `reports/relay.md`，包含 `WFC_RELAY_PASS`，并提交 done。
-3. `relay --codex --scope s-c06dfe74 --for 45` 返回 0，消息 6 变为 received。只读查询 Codex 队列确认该 done 已入当前 thread `01a1db2b-ecf3-7ee0-aaf0-c3f08a2a072f`。
+3. `relay --codex --scope s-c06dfe74 --for 45` 返回 0，消息 6 变为 received。只读查询 Codex 队列确认该 done 已入当前聊天（别名 `thread-windows-opencode`）。
 4. controller 上一回合结束后，桌面将原始 router 消息投递到同一聊天并触发新回合。controller 检查报告后执行 `ack m-6be20cf986864787a228459f33d999a9`，返回 `processed`、`statusVersion: 4`、`duplicate: false`。
 5. `close` 返回 completed；专用 Herdr server 已停止，测试文件与状态保留。
 

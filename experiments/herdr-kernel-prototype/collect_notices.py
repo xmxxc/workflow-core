@@ -20,11 +20,19 @@ RGB_NOTICE = 'xorg-rgb/COPYING'
 XORG_RGB = dict(name='X.Org rgb', version='1.1.0', notices=[RGB_NOTICE],
                 source='https://www.x.org/releases/individual/app/rgb-1.1.0.tar.xz',
                 source_archive_sha256='fc03d7f56e5b2a617668167f8927948cce54f93097e7ccd9f056077f479ed37b')
+SIMDUTF_NOTICES = {
+    'simdutf/LICENSE-simdutf-MIT': 'fc8dbc04e03ad4efc08a647ffe7f995b811a95bc04c0e85a56d5277c6593fa5f',
+    'simdutf/NOTICE-simdutf-isadetection': '204bbed08ddeeecb362b4da36d3479a0167b7356a9d6024a24f9833affbe228a',
+}
+SIMDUTF = dict(name='simdutf', version='9.0.0', notices=list(SIMDUTF_NOTICES),
+               source='https://raw.githubusercontent.com/simdutf/simdutf/v9.0.0/LICENSE-MIT',
+               source_header='vendor/libghostty-vt/pkg/simdutf/vendor/simdutf.h')
 SUPPLEMENTAL_NOTICES = {
     f'zig/{UUCODE}/{name}': ('uucode/' + name, digest)
     for name, digest in UUCODE_LICENSES.items()
 }
 SUPPLEMENTAL_NOTICES[RGB_NOTICE] = (RGB_NOTICE, '1d08eb3384f5dedc7735bcfae1aa58cb64643ca9389edce3312b1c3cefbfdaa7')
+SUPPLEMENTAL_NOTICES.update({name: (name, digest) for name, digest in SIMDUTF_NOTICES.items()})
 
 
 def checked_notice(path, expected):
@@ -52,6 +60,8 @@ def verify_supplemental_notices(directory, index):
         raise ValueError('missing pinned uucode notice index')
     if XORG_RGB not in index.get('embedded_data', []):
         raise ValueError('missing pinned X.Org rgb notice index')
+    if SIMDUTF not in index.get('vendored_native', []):
+        raise ValueError('missing pinned simdutf notice index')
 
 
 def notices(directory):
@@ -115,11 +125,11 @@ def collect(prepared, target, out, wfc_license):
             # Zig omits the two licenses referenced by uucode's LICENSE.md.
             record.update(source=UUCODE_SOURCE, notices=sorted(set(files) | UUCODE_LICENSES.keys()))
         zig.append(record)
-    # Ghostty embeds the X.Org rgb data in addition to the Zig dependencies.
+    # Ghostty embeds X.Org rgb data and vendors simdutf outside Zig's package cache.
     copy_supplemental_notices(out)
     shutil.copyfile(vendor / 'LICENSE', out / 'LICENSE-Ghostty')
     shutil.copyfile(prepared / 'LICENSE', out / 'LICENSE-Herdr')
-    index = dict(target=target, cargo=records, zig_materialized=zig, embedded_data=[XORG_RGB],
+    index = dict(target=target, cargo=records, zig_materialized=zig, embedded_data=[XORG_RGB], vendored_native=[SIMDUTF],
                  cargo_lock_sha256=hashlib.sha256((prepared / 'Cargo.lock').read_bytes()).hexdigest(),
                  scope='Cargo target metadata including build dependencies. Zig package directories describe fetched inputs, not a link map.')
     verify_supplemental_notices(out, index)

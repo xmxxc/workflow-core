@@ -9,7 +9,7 @@
 - Fixed Herdr0.9.5 source `<pinned-herdr-checkout>`, commit `ee5bfb5041bb3e4a49d591c72308aae3c81ecdde`. No edits or upstream publication.
 - Workflow: `super-coding/skills/super-coding/SKILL.md` read; existing roles `docs/agents/roles.md`: Codex `gpt-6.1-sol` / high, separate implementation/review WFC dispatch. Research skill background source investigation is supplemental, not an independent review.
 - WFC command `python3 <candidate-dir>/wfc.pyz`, version0.4.7-rc.1 (fixed d8e0695 payload); state `<private-state>`.
-- Controller thread `01a1dd4c-05e6-7942-bd2d-2ce16cbc2836`; unique relay pid1592555, log `<state>/relay.log`, no parallel wait. Started from controller environment; first real delivery into this chat confirmed by receipt of exited message m-50728b8621a948c281517cd88745d478. Do not touch any other range's relay.
+- Controller thread alias `thread-herdr-feasibility`; unique relay pid1592555, log `<state>/relay.log`, no parallel wait. Started from controller environment; first real delivery into this chat confirmed by receipt of exited message m-50728b8621a948c281517cd88745d478. Do not touch any other range's relay.
 - Minimal durable notes only; no new factory logging infrastructure.
 
 ## Tasks

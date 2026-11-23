@@ -4,6 +4,8 @@ Question (#9): does a shell command run by Codex see the current thread's id, so
 
 Setup: codex-cli 0.167.0, Linux, `CODEX_HOME` unset (so `~/.codex`). The probe ran in a throwaway git directory under a temporary dir, which was deleted afterwards. Two model calls in total, with no quota errors.
 
+The transcript uses `thread-exec-probe` for the same recorded thread throughout. For a rerun, set `PROBE_THREAD` to the session ID printed by the first command.
+
 ## 1. `codex exec`
 
 ```sh
@@ -14,14 +16,14 @@ timeout 120 codex -a never exec -s workspace-write --skip-git-repo-check \
 Key output:
 
 ```
-session id: 01a1c045-6cbc-7130-9daa-d087275fb216
+session id: thread-exec-probe
 exec
 /bin/bash -lc 'echo "T=$CODEX_THREAD_ID S=$CODEX_SESSION_ID"' in .../probe.o8I5
  succeeded in 0ms:
-T=01a1c045-6cbc-7130-9daa-d087275fb216 S=01a1c045-6cbc-7130-9daa-d087275fb216
+T=thread-exec-probe S=thread-exec-probe
 ```
 
-Rollout: `~/.codex/sessions/2026/11/09/rollout-2026-11-09T06-25-37-01a1c045-6cbc-7130-9daa-d087275fb216.jsonl`. Its first line (`session_meta`) has `id` = `session_id` = `01a1c045-6cbc-7130-9daa-d087275fb216`, `source` `"exec"` and `originator` `codex_exec`.
+Rollout: `~/.codex/sessions/2026/11/09/rollout-2026-11-09T06-25-37-thread-exec-probe.jsonl`. Its first line (`session_meta`) has `id` = `session_id` = `thread-exec-probe`, `source` `"exec"` and `originator` `codex_exec`.
 
 So **`CODEX_THREAD_ID` and `CODEX_SESSION_ID` are both set, and both equal the rollout's first-line `id`.** The rollout's file name ends with the same id.
 
@@ -29,10 +31,10 @@ So **`CODEX_THREAD_ID` and `CODEX_SESSION_ID` are both set, and both equal the r
 
 ```sh
 timeout 120 codex -a never exec -s workspace-write --skip-git-repo-check \
-  resume 01a1c045-6cbc-7130-9daa-d087275fb216 'Run the same command again; output only.'
+  resume "$PROBE_THREAD" 'Run the same command again; output only.'
 ```
 
-Key output: `T=01a1c045-6cbc-7130-9daa-d087275fb216 S=01a1c045-6cbc-7130-9daa-d087275fb216`. Codex wrote no new rollout. It appended to the same file, so there was still exactly one rollout with that id.
+Key output: `T=thread-exec-probe S=thread-exec-probe`. Codex wrote no new rollout. It appended to the same file, so there was still exactly one rollout with that id.
 
 So **after a resume, the id is unchanged, and it is still the original rollout's id.** The interactive `codex resume` (TUI) was not run. It is expected to behave the same way, but this was not measured.
 
