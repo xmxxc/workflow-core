@@ -93,6 +93,7 @@ def verify_notices(directory, files, target):
             path = 'bundled-notices/zig/' + record['package_hash'] + '/' + name
             if path not in files:
                 raise ValueError('missing indexed Zig notice: ' + path)
+    return index
 
 
 def git(*args):

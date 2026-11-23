@@ -14,7 +14,9 @@ from package_bundled_experiment import (
 )
 
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / 'experiments/herdr-kernel-prototype'))
 import build
+from collect_notices import verify_supplemental_notices
 from wfc import VERSION
 
 TARGETS = {'linux-x64': 'x86_64-unknown-linux-gnu', 'windows-x64': 'x86_64-pc-windows-msvc'}
@@ -38,7 +40,8 @@ def verify(directory, platform, commit):
         raise ValueError('release identity mismatch')
     files = manifest['files']
     check_files(directory, files)
-    verify_notices(directory, files, target)
+    index = verify_notices(directory, files, target)
+    verify_supplemental_notices(directory / 'bundled-notices', index)
     windows = platform == 'windows-x64'
     program = 'wfc.pyz' if windows else 'wfc'
     required = {program, 'wfc-kernel.exe' if windows else 'wfc-kernel', 'LICENSE', 'INSTALL.md',

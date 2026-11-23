@@ -1,0 +1,2 @@
+# Keep the exact bytes pinned by the notice collector.
+/experiments/herdr-kernel-prototype/licenses/** -text
