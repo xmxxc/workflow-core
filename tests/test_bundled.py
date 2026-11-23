@@ -6,11 +6,44 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class BundledSelection(unittest.TestCase):
+    def test_codex_receives_one_enter_outside_the_paste_burst(self):
+        from bundled_backend import BundledBackend
+        backend = BundledBackend()
+        answer = '[router] Answer to question 1: D_GO'
+        elapsed = 0.0
+        composer = 'Ask Codex to do anything'
+        writes = []
+
+        def advance(seconds):
+            nonlocal elapsed
+            elapsed += seconds
+
+        def input_event(dispatch, op, *, text):
+            nonlocal composer
+            writes.append(text)
+            if text == '\r':
+                if elapsed >= 0.5:
+                    composer = 'Ask Codex to do anything'
+            else:
+                composer = answer
+            return {'result': 'accepted'}
+
+        def read(dispatch):
+            return {'result': 'accepted', 'screen': f'› {composer}\n\n  model · cwd'}
+
+        with patch.object(backend, 'read', read), patch.object(backend, '_call', input_event), \
+                patch('bundled_backend.time.sleep', advance):
+            result = backend.submit('d-test', answer, 'codex')
+        self.assertEqual(writes, ['\x1b[200~' + answer + '\x1b[201~', '\r'])
+        self.assertEqual(result['result'], 'accepted')
+        self.assertEqual(composer, 'Ask Codex to do anything')
+
     def test_missing_companion_is_explicit_and_does_not_launch_host(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
