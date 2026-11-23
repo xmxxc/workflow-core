@@ -2,6 +2,7 @@
 
 新会话从这里恢复产品方向与研究，不依赖旧聊天或临时文件。
 
+- [Python 开发基线与 Linux 真机验收](verification/python-router-closeout.zh-CN.md) 汇总候选提交、Windows 下载与实测结果，以及 Linux 后续通过条件。
 - [Router 定位与补齐顺序](router-foundation.md)：2026-11-13 用户确认的小型通用基础层定位；实现次序、核心/外壳职责、下一步验收条件。
 - [watchdog 通知循环与安全恢复](watchdog-recovery.md)：故障去重、证据保留与积压队列恢复。
 - [核心规格](specs/router-core-foundation-20261113.md)：已确认的任务派发、唤醒、宿主故障和恢复契约。
