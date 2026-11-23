@@ -1,6 +1,6 @@
 # workflow-core
 
-> Development candidate: native Windows core, optional Herdr backend and portable entrypoints are documented in [Windows distribution and acceptance](docs/windows-distribution.md). Real Windows Codex acceptance is pending; the released tmux support scope below remains the baseline.
+> WFC v0.4.7 ships a bundled kernel for Linux x64 and native Windows x64. Windows 11 testing covered a real Codex worker on the downloaded candidate. Two-chat takeover was verified on a previously tested package whose components were compared with that candidate. [Install and verify](docs/release-install.md) · [Windows evidence](https://github.com/xmxxc/workflow-core/issues/44)
 
 ![wfc · workflow-core: one controller terminal dispatching to three worker terminals, with messages flowing back](docs/assets/banner.png)
 
@@ -10,7 +10,7 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
-**`wfc` is a lightweight router between an AI coding controller and the workers it dispatches to Codex, Claude Code and OpenCode.** Workers report or ask through `wfc` and then sleep; the controller sleeps on `wfc wait` (or is woken by `wfc relay`) until one of them has something to say. It ships as a single command with no dependencies beyond Python and tmux.
+**`wfc` is a lightweight router between an AI coding controller and the workers it dispatches to Codex, Claude Code and OpenCode.** Workers report or ask through `wfc` and then sleep; the controller sleeps on `wfc wait` (or is woken by `wfc relay`) until one of them has something to say. The default backend uses tmux. Native packages also include an optional execution kernel.
 
 ## Contents
 
@@ -88,17 +88,19 @@ sequenceDiagram
 
 ### Requirements
 
-- Linux or macOS (on Windows, use WSL2)
-- Python 3.9 or later
-- tmux
-- The host CLIs you dispatch to: [Codex](https://github.com/openai/codex), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [OpenCode](https://opencode.ai)
+- Python 3.9+ with SQLite, and the installed, signed-in host CLI you want to use.
+- For the default tmux backend on Linux or macOS, install tmux. It supports Codex, Claude Code and OpenCode.
+- For `--backend bundled`, use the Linux x64 or Windows x64 package with Codex or OpenCode. Linux requires a writable delegated cgroup v2 subtree with `cgroup.kill`. The optional Herdr backend requires a separate Herdr server.
 
 ### Install
 
-Download `wfc` and `wfc.sha256` from the [latest release](https://github.com/xmxxc/workflow-core/releases/latest), verify the download, and put `wfc` on your `PATH`:
+Download your asset and `SHA256SUMS` from the [v0.4.7 release](https://github.com/xmxxc/workflow-core/releases/tag/v0.4.7). For Linux x64 choose `wfc-v0.4.7-linux-x64.tar.gz`. For Windows x64 choose `wfc-v0.4.7-windows-x64.zip`. Check the archive hash before extracting the entire directory. Run `./wfc/wfc --version` or `.\wfc\wfc.cmd --version` and check for `wfc 0.4.7`. The [installation guide](docs/release-install.md) includes checksum commands, bundled setup and standalone `wfc.pyz` usage.
+
+For the single-file tmux installation, download `wfc` and `wfc.sha256`:
 
 ```sh
-sha256sum -c wfc.sha256
+sha256sum -c wfc.sha256  # macOS: shasum -a 256 -c wfc.sha256
+mkdir -p ~/.local/bin
 install -m 755 wfc ~/.local/bin/wfc
 wfc --version
 ```
@@ -362,7 +364,6 @@ After upgrading `wfc`, a `wait` or `relay` already running is still the old code
 - **No Codex or OpenCode session titles** (see [Labels and titles](#labels-and-titles)).
 - **Same tmux server.** The controller and its workers must share the tmux server and `TMUX_TMPDIR`.
 - **Running waiters keep old code** after an upgrade until restarted.
-- **No native Windows support**; use WSL2.
 
 ## Relationship to super-coding
 
@@ -372,11 +373,11 @@ The design of `super-coding` is recorded here, in `docs/decision-log.md` and `do
 
 ## Project status and roadmap
 
-The current release routes interactive Codex, Claude Code and OpenCode workers through tmux on Linux and macOS; native Windows support remains a proposed next step.
+The default tmux backend runs on Linux and macOS. Linux and native Windows x64 packages support explicit bundled dispatch. See the [platform acceptance record](docs/verification/python-router-closeout.zh-CN.md).
 
 The product direction confirmed on 2026-11-13 is a small, complete router foundation: execution identity, reliable messages, observation, interruption and recovery. Workflow policies, workers and interfaces build on top; super-coding is the current workflow layer. Issue scanning, review gates and release decisions belong to those callers.
 
-Read the [router foundation and implementation order](docs/router-foundation.md), [source comparison](docs/router-sources-20261113.md) and [native Windows assessment](docs/windows-router-assessment-20261113.md). Proposed backends and protocol paths have not been implemented or verified on Windows. The [documentation index](docs/README.md) and [research validation record](docs/research-validation-20261113.md) are the entry points for a new session.
+Read the [router foundation and implementation order](docs/router-foundation.md), [source comparison](docs/router-sources-20261113.md) and [native Windows assessment](docs/windows-router-assessment-20261113.md). The [documentation index](docs/README.md) and [research validation record](docs/research-validation-20261113.md) are the entry points for a new session.
 
 ## Development and releases
 
@@ -398,7 +399,7 @@ python3 build.py                        # writes dist/wfc
 ### CI and releases
 
 - **CI** (`.github/workflows/ci.yml`) runs the tests and a build on Ubuntu and macOS with Python 3.9 and 3.12 for every push to main and every pull request.
-- **Releases** (`.github/workflows/release.yml`): set `VERSION` in `wfc.py`, then push a matching tag (`v0.1.0`). The workflow tests, builds `wfc` with its SHA-256 and publishes them as a GitHub Release. Verify a download with `sha256sum -c wfc.sha256`.
+- **Releases** use a matching version tag. The workflow tests the extracted Linux and Windows packages, then publishes both native archives, the standalone Python commands and their SHA-256 checksums.
 
 ### Documents
 

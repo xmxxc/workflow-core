@@ -5,18 +5,18 @@
 - Formal issue: [#26](https://github.com/xmxxc/workflow-core/issues/26), source snapshot `prompts/issue-26-source.md`; acceptance additions sent in `prompts/kernel-impl-r1-addendum.md`. Do not create duplicate scope issues.
 
 - User-authorized source extraction feasibility research and isolated runnable prototype; no production backend integration, formal takeover, tmux removal, session migration, merge or release.
-- Research branch `codex/herdr-kernel-feasibility`, base `abbc399542ed28dce1c0877667733df9021387a0`; worktree `/home/xmx/.codex/worktrees/windows-dist-10/workflow-core`. PR25 remains branch `codex/opencode-2x-windows`, head d8e0695, CI8/8 passed, artifact14159825535; new candidate Windows actual run still pending user audit/retest.
-- Fixed Herdr0.9.5 source `/tmp/wfc-herdr-source`, commit `ee5bfb5041bb3e4a49d591c72308aae3c81ecdde`. No edits or upstream publication.
-- Workflow: `/opt/super-coding/skills/super-coding/SKILL.md` read; existing roles `/opt/workflow-core/docs/agents/roles.md`: Codex `gpt-6.1-sol` / high, separate implementation/review WFC dispatch. Research skill background source investigation is supplemental, not an independent review.
-- WFC command `python3 /tmp/wfc-opencode2-candidate-local/wfc.pyz`, version0.4.7-rc.1 (fixed d8e0695 payload); state `/home/xmx/.local/state/workflow-core/herdr-kernel-feasibility-20261115`.
-- Controller thread `01a1dd4c-05e6-7942-bd2d-2ce16cbc2836`; unique relay pid1592555, log `<state>/relay.log`, no parallel wait. Started from controller environment; first real delivery into this chat confirmed by receipt of exited message m-50728b8621a948c281517cd88745d478. Do not touch any other range's relay.
+- Research branch `codex/herdr-kernel-feasibility`, base `abbc399542ed28dce1c0877667733df9021387a0`; worktree `<research-checkout>`. PR25 remains branch `codex/opencode-2x-windows`, head d8e0695, CI8/8 passed, artifact14159825535; new candidate Windows actual run still pending user audit/retest.
+- Fixed Herdr0.9.5 source `<pinned-herdr-checkout>`, commit `ee5bfb5041bb3e4a49d591c72308aae3c81ecdde`. No edits or upstream publication.
+- Workflow: `super-coding/skills/super-coding/SKILL.md` read; existing roles `docs/agents/roles.md`: Codex `gpt-6.1-sol` / high, separate implementation/review WFC dispatch. Research skill background source investigation is supplemental, not an independent review.
+- WFC command `python3 <candidate-dir>/wfc.pyz`, version0.4.7-rc.1 (fixed d8e0695 payload); state `<private-state>`.
+- Controller thread alias `thread-herdr-feasibility`; unique relay pid1592555, log `<state>/relay.log`, no parallel wait. Started from controller environment; first real delivery into this chat confirmed by receipt of exited message m-50728b8621a948c281517cd88745d478. Do not touch any other range's relay.
 - Minimal durable notes only; no new factory logging infrastructure.
 
 ## Tasks
 
 | Task | Identity / path | State | Next |
 |---|---|---|---|
-| Source audit | research subagent `/root/herdr_kernel_sources`, `docs/research/herdr-kernel-source-map.md` | returned: source map read, source/patch references checked; no runtime claim | Use as experiment/review source |
+| Source audit | research subagent `herdr_kernel_sources`, `docs/research/herdr-kernel-source-map.md` | returned: source map read, source/patch references checked; no runtime claim | Use as experiment/review source |
 | Prototype implementation | WFC d-37371ace, attempt a-b1e6c39e2132, model gpt-6.1-sol/high | r2 returned; final source/binary hashes and artifacts checked | Freeze candidate and dispatch independent review |
 | Failed initial startup | WFC d-1c2107ee, attempt a-d7483847f47c | blocked: process exited1 before work (TERM=dumb) | Retain diagnostic; corrected isolated launch env for replacement, no unknown-input replay |
 | Independent review | not dispatched | prepared later | Distinct WFC session on fixed candidate after implementation and source map |
@@ -28,8 +28,8 @@ Implementation task: `prompts/kernel-impl-r1.md`; report `reports/impl/r1.md`. W
 
 - User direction delivered by operator-b5805dc4a72645d2996d3eaebcc606b7 in this chat; not a router DB message, no ack issued for that instruction.
 - Explicitly authorized source analysis, isolated build/run, controlled-host validation then real-host probe, preserve correctness mechanisms and report limits; prepare reviewable docs/prototype/spec/ticket proposals. No formal migration approved.
-- Worker network exception: fetch pinned Cargo/Zig dependencies needed for independent build; no credentials/global installation/SDK license acceptance. Controller installed isolated Rust1.96.1 (official rustup-init checksum verified) and Zig0.16.0 (official download index SHA256 verified) under `/tmp/wfc-kernel-tools`; no global PATH/profile change.
-- Scratch `/tmp/wfc-herdr-kernel-prototype-r1`; tool inputs/source manifests under `/tmp/wfc-kernel-tools`. Do not clean up active artifacts or worker sessions without user direction.
+- Worker network exception: fetch pinned Cargo/Zig dependencies needed for independent build; no credentials/global installation/SDK license acceptance. Controller installed isolated Rust1.96.1 (official rustup-init checksum verified) and Zig0.16.0 (official download index SHA256 verified) under `<toolchain-dir>`; no global PATH/profile change.
+- Scratch `<scratch-dir>`; tool inputs/source manifests under `<toolchain-dir>`. Do not clean up active artifacts or worker sessions without user direction.
 
 ## History
 

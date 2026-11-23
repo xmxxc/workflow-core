@@ -1,6 +1,6 @@
 # Herdr 0.9.5 执行内核裁剪：源码与依赖边界
 
-调查日期：2026-11-15。固定来源为 `herdrdev/herdr` 的 `ee5bfb5041bb3e4a49d591c72308aae3c81ecdde`，本地只读副本 `/tmp/wfc-herdr-source`。本文是源码调查与原型设计依据，不代表 Windows 运行验收，也不改变 PR #25 的候选状态。未向 Herdr 上游提交、推送或发布。
+调查日期：2026-11-15。固定来源为 `herdrdev/herdr` 的 `ee5bfb5041bb3e4a49d591c72308aae3c81ecdde`，本地只读副本 `<pinned-herdr-checkout>`。本文是源码调查与原型设计依据，不代表 Windows 运行验收，也不改变 PR #25 的候选状态。未向 Herdr 上游提交、推送或发布。
 
 ## 结论与候选切口
 
@@ -28,7 +28,7 @@ WFC 继续拥有 dispatch/round/attempt、消息确认、owner fencing、总控�
 
 ## portable-pty 0.9.0 的实际差异
 
-已下载官方 [0.9.0 crate](https://static.crates.io/crates/portable-pty/portable-pty-0.9.0.crate)，SHA-256 `b4a596a2b3d2752d94f51fac2d4a96737b8705dddd311a32b9af47211f08671e`，在 `/tmp/wfc-portable-pty-upstream` 展开并对比。除 Herdr 未保留 registry 包的 `.cargo_vcs_info.json` 和 `Cargo.lock` 外，只有 `Cargo.toml`、`Cargo.toml.orig`、`src/cmdbuilder.rs`、`src/win/psuedocon.rs` 不同，符合以下四项 patch 记录。此比较是文件级差异检查，不等于所有 Windows 行为已实测。[完整索引与移除条件](https://github.com/herdrdev/herdr/blob/ee5bfb5041bb3e4a49d591c72308aae3c81ecdde/vendor/portable-pty.patches.md#L1-L171)。
+已下载官方 [0.9.0 crate](https://static.crates.io/crates/portable-pty/portable-pty-0.9.0.crate)，SHA-256 `b4a596a2b3d2752d94f51fac2d4a96737b8705dddd311a32b9af47211f08671e`，在 `<upstream-portable-pty-extraction>` 展开并对比。除 Herdr 未保留 registry 包的 `.cargo_vcs_info.json` 和 `Cargo.lock` 外，只有 `Cargo.toml`、`Cargo.toml.orig`、`src/cmdbuilder.rs`、`src/win/psuedocon.rs` 不同，符合以下四项 patch 记录。此比较是文件级差异检查，不等于所有 Windows 行为已实测。[完整索引与移除条件](https://github.com/herdrdev/herdr/blob/ee5bfb5041bb3e4a49d591c72308aae3c81ecdde/vendor/portable-pty.patches.md#L1-L171)。
 
 | 补丁 | 原因及保留建议 |
 |---|---|

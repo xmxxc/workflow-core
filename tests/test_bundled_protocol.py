@@ -18,7 +18,8 @@ class FragmentedStream:
         self.timeout = value
 
     def recv(self, count):
-        time.sleep(self.delay)
+        if self.delay:
+            time.sleep(self.delay)
         part, self.data = self.data[:1], self.data[1:]
         return part
 

@@ -32,7 +32,7 @@ reports recovery as lost and supplies no reconnect or input replay.
 
 ## Fixed source and extraction seam
 
-Primary source is the local checkout `/tmp/wfc-herdr-source`, Herdr 0.9.5 commit
+Primary source is the local checkout `<pinned-herdr-checkout>`, Herdr 0.9.5 commit
 `ee5bfb5041bb3e4a49d591c72308aae3c81ecdde`, Git tree
 `d2fc8428a9ce5be7e1d89a10b62be3e289b479dd`. Ghostty's vendor base is
 `44f2a44df7e8c4a0c6df3f7d872ef3d7ead88e51`, as recorded in the copied vendor
@@ -101,13 +101,13 @@ fixture replaces that unavailable parent check.
 The exact successful build entry is:
 
 ```bash
-env CARGO_HOME=/tmp/wfc-kernel-tools/cargo \
-  RUSTUP_HOME=/tmp/wfc-kernel-tools/rustup \
-  PATH=/tmp/wfc-kernel-tools/cargo/bin:$PATH \
-  ZIG=/tmp/wfc-kernel-tools/zig-x86_64-linux-0.16.0/zig \
-  ZIG_GLOBAL_CACHE_DIR=/tmp/wfc-kernel-tools/zig-cache \
+env CARGO_HOME="$WFC_TOOLCHAIN_DIR/cargo" \
+  RUSTUP_HOME="$WFC_TOOLCHAIN_DIR/rustup" \
+  PATH="$WFC_TOOLCHAIN_DIR/cargo/bin:$PATH" \
+  ZIG="$WFC_TOOLCHAIN_DIR/zig-x86_64-linux-0.16.0/zig" \
+  ZIG_GLOBAL_CACHE_DIR="$WFC_TOOLCHAIN_DIR/zig-cache" \
   cargo +1.96.1 build --release --locked --offline \
-    --manifest-path /tmp/wfc-herdr-kernel-prototype-r1/Cargo.toml
+    --manifest-path "$WFC_SCRATCH_DIR/Cargo.toml"
 ```
 
 The first three manual builds exited **101**, at 8.64 s, 1.05 s and 9.11 s,
@@ -133,15 +133,15 @@ exited 1 because rustfmt was absent. That failure remains in
 matching component in the isolated toolchain. Round 2 ran only:
 
 ```bash
-env CARGO_HOME=/tmp/wfc-kernel-tools/cargo \
-  RUSTUP_HOME=/tmp/wfc-kernel-tools/rustup \
-  /tmp/wfc-kernel-tools/cargo/bin/rustfmt +1.96.1 --edition 2021 \
+env CARGO_HOME="$WFC_TOOLCHAIN_DIR/cargo" \
+  RUSTUP_HOME="$WFC_TOOLCHAIN_DIR/rustup" \
+  "$WFC_TOOLCHAIN_DIR/cargo/bin/rustfmt" +1.96.1 --edition 2021 \
     experiments/herdr-kernel-prototype/src/main.rs
-env CARGO_HOME=/tmp/wfc-kernel-tools/cargo \
-  RUSTUP_HOME=/tmp/wfc-kernel-tools/rustup \
-  /tmp/wfc-kernel-tools/cargo/bin/rustfmt +1.96.1 --edition 2021 --check \
+env CARGO_HOME="$WFC_TOOLCHAIN_DIR/cargo" \
+  RUSTUP_HOME="$WFC_TOOLCHAIN_DIR/rustup" \
+  "$WFC_TOOLCHAIN_DIR/cargo/bin/rustfmt" +1.96.1 --edition 2021 --check \
     experiments/herdr-kernel-prototype/src/main.rs
-PYTHONPYCACHEPREFIX=/tmp/wfc-herdr-kernel-prototype-r1/pycache-r2 \
+PYTHONPYCACHEPREFIX="$WFC_SCRATCH_DIR/pycache-r2" \
   /usr/bin/python3 -m py_compile experiments/herdr-kernel-prototype/*.py
 ```
 
@@ -208,7 +208,7 @@ the measured descendant gap rather than claiming safe cleanup.
 
 ## Actual WFC contract and completion callback
 
-The candidate zipapp is `/tmp/wfc-opencode2-candidate-local/wfc.pyz`, source
+The candidate zipapp is `$WFC_CANDIDATE_DIR/wfc.pyz`, source
 marker `d8e0695f91e6a21dd40f309596e131d0e3e95f58`, SHA256
 `785e46dcdf11a8982fa1dd44a9e955941a9748245874d0ca2f37043094d1c55d`.
 `probe.py` imports its real router and registers `KernelBackend` **only in the
@@ -221,8 +221,8 @@ Its deliberately unsupported resume returns uncertain with a lost-PTY reason.
 The controlled child writes its report and executes the real command:
 
 ```text
-/usr/bin/python3 /tmp/wfc-opencode2-candidate-local/wfc.pyz done
-  --report /tmp/wfc-herdr-kernel-prototype-r1/controlled-wfc-1794745658903497774/report.md
+/usr/bin/python3 $WFC_CANDIDATE_DIR/wfc.pyz done
+  --report $WFC_SCRATCH_DIR/controlled-wfc-1794745658903497774/report.md
   --attempt a-3a01bf9d4404 --message-id controlled:a-3a01bf9d4404
 ```
 
@@ -238,7 +238,7 @@ message acknowledgement or wakeup policy were moved into the kernel.
 
 OpenCode **1.19.5** was launched in a real extracted PTY with XDG config/data/
 state/cache directories under
-`/tmp/wfc-herdr-kernel-prototype-r1/actual-host-1794745659341944003` and
+`$WFC_SCRATCH_DIR/actual-host-1794745659341944003` and
 `OPENCODE_CONFIG_CONTENT={"autoupdate":false}`. No existing user host/session
 was reused. Startup's interpreted Alternate screen contains the OpenCode logo,
 input prompt, working directory and version. Startup observation takes

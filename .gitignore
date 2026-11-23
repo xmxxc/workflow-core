@@ -3,3 +3,15 @@ __pycache__/
 dist/
 
 /.herdr-test/
+
+# WFC state may contain worker prompts, credentials and environment snapshots.
+.wfc-state/
+router.db
+router.db-*
+relay.log
+input-d-*.lock
+owner-*.lock
+**/launches/d-*-*.spec*
+**/launches/d-*-*.json*
+**/bundled/[0-9a-f]*.spec*
+**/bundled/[0-9a-f]*.json*

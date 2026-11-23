@@ -20,7 +20,7 @@ Windows waiter 探活使用 `OpenProcess` 的只读查询/同步权限、`WaitFo
 
 `relay --detach` 在 Windows 使用 `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`，Unix 保留 setsid。日志写入状态目录，子进程不继承终端 stdio；启动父进程退出后可继续运行。Windows Job Object/组织终端策略仍可能约束子进程生命周期，不能承诺逃逸管理策略。停止前应核对 PID、creation identity、scope 与 state；没有自动终止未知进程的回退。
 
-Windows worker 回调明确为 PowerShell 命令，使用 `Start-Process` 的单个 CRT 转义参数串，并以 PowerShell 单引号 literal 包裹；保留内嵌双引号和空参数，兼容 Windows PowerShell 5.1。owner token 从继承环境读取。路由执行仍以 argv 调用，不把宿主参数拼成 shell 程序。CLI JSON、router 文本文件与 Windows stdio 使用 UTF-8。Windows 不自动改写 Claude 信任配置，因为 Unix mode 不能证明 ACL 安全；由用户在宿主确认。
+Windows worker 回调明确为 PowerShell 命令，使用 `Start-Process` 的单个 CRT 转义参数串，并以 PowerShell 单引号 literal 包裹；保留内嵌双引号和空参数，兼容 Windows PowerShell 5.1。新 worker 的独立回报凭据从宿主环境继承；scope owner 凭据保留在控制端。路由执行仍以 argv 调用，不把宿主参数拼成 shell 程序。CLI JSON、router 文本文件与 Windows stdio 使用 UTF-8。Windows 不自动改写 Claude 信任配置，因为 Unix mode 不能证明 ACL 安全；由用户在宿主确认。
 
 ## 验证范围
 

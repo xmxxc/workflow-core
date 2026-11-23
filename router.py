@@ -12,6 +12,8 @@ import collections
 import calendar
 import wfc_platform
 import hashlib
+import hmac
+import secrets
 import host_launch
 import herdr_backend
 import bundled_backend
@@ -28,6 +30,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 
 _HERE = Path(__file__).resolve()
@@ -44,7 +47,8 @@ def tmux(*args):
     """Run a tmux command; a tmux that cannot be run reads as a failed command marked
     `not_run` (it certainly did nothing), not a traceback."""
     try:
-        return subprocess.run(["tmux", *args], capture_output=True, text=True)
+        return subprocess.run(["tmux", *args], capture_output=True, text=True,
+                              env=host_launch.without_router_credentials(os.environ))
     except OSError as err:
         result = subprocess.CompletedProcess(["tmux", *args], 127, "", f"cannot run tmux: {err}")
         result.not_run = True
@@ -63,7 +67,7 @@ def session_name(dispatch_id):
 TABLES = {
     "controller_owner": "scope TEXT PRIMARY KEY, owner TEXT NOT NULL, token TEXT NOT NULL, generation INTEGER NOT NULL DEFAULT 1, lease_until REAL NOT NULL, updated REAL NOT NULL",
     "dispatch": "id TEXT PRIMARY KEY, host TEXT, backend TEXT DEFAULT 'tmux', cwd TEXT, task TEXT, created REAL, scope TEXT, role TEXT, current_round INTEGER DEFAULT 1, current_attempt TEXT",
-    "dispatch_round": "dispatch TEXT, round INTEGER, attempt TEXT, task TEXT, report TEXT, state TEXT DEFAULT 'running', result TEXT, created REAL, completed REAL, PRIMARY KEY (dispatch, round, attempt)",
+    "dispatch_round": "dispatch TEXT, round INTEGER, attempt TEXT, task TEXT, report TEXT, state TEXT DEFAULT 'running', result TEXT, created REAL, completed REAL, callback_channel TEXT, callback_hash TEXT, PRIMARY KEY (dispatch, round, attempt)",
     "message": "id INTEGER PRIMARY KEY AUTOINCREMENT, dispatch TEXT, recipient TEXT, "
                "type TEXT, body TEXT, created REAL, delivered INTEGER DEFAULT 0, "
                "message_uid TEXT, request_key TEXT, body_hash TEXT, state TEXT DEFAULT 'unsent', "
@@ -92,11 +96,12 @@ ADDED_COLUMNS = {
                  "effort": "TEXT", "network": "INTEGER", "label": "TEXT", "git": "INTEGER",
                  "scope": "TEXT", "role": "TEXT", "current_round": "INTEGER", "current_attempt": "TEXT",
                  "launch_config": "TEXT", "launch_receipt": "TEXT", "backend_handle": "TEXT"},
+    "dispatch_round": {"callback_channel": "TEXT", "callback_hash": "TEXT"},
     "message": {"message_uid": "TEXT", "request_key": "TEXT", "body_hash": "TEXT",
                 "state": "TEXT", "status_version": "INTEGER", "resolver_actor": "TEXT",
                 "resolution_source": "TEXT", "resolution_reason": "TEXT", "resolution_evidence": "TEXT",
                 "resolved_at": "REAL"},
-    "lifecycle_event": {"owner_generation": "INTEGER", "owner_token": "TEXT", "resolver_actor": "TEXT", "resolution_evidence": "TEXT", "resolution_owner_generation": "INTEGER", "resolved_at": "REAL", "consumed_at": "REAL"},
+    "lifecycle_event": {"creator_pid": "INTEGER", "creator_start": "TEXT", "owner_generation": "INTEGER", "owner_token": "TEXT", "resolver_actor": "TEXT", "resolution_evidence": "TEXT", "resolution_owner_generation": "INTEGER", "resolved_at": "REAL", "consumed_at": "REAL"},
     "waiter": {"process_start": "TEXT"},
 }
 
@@ -241,6 +246,69 @@ def require_owner(db, scope, token, operation):
     return row
 
 
+def callback_digest(value):
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def bind_callback(db, dispatch, round_no, attempt, channel, proof_hash):
+    db.execute("UPDATE dispatch_round SET callback_channel = ?, callback_hash = ? "
+               "WHERE dispatch = ? AND round = ? AND attempt = ?",
+               (channel, proof_hash, dispatch, round_no, attempt))
+
+
+def launch_callback(db, env, dispatch, round_no, attempt):
+    secret = secrets.token_hex(32)
+    env["WFC_WORKER_CALLBACK"] = secret
+    channel = callback_digest(secret)
+    bind_callback(db, dispatch, round_no, attempt, channel, channel)
+
+
+def round_proof(channel, reference):
+    # The reference in a continued brief is a public challenge. Only the
+    # launched host can present the channel secret through the callback CLI.
+    return hmac.digest(bytes.fromhex(channel), reference.encode("ascii"), "sha256").hex()
+
+
+def continue_callback(db, dispatch, previous, next_round, attempt):
+    old = db.execute("SELECT callback_channel FROM dispatch_round WHERE dispatch = ? AND round = ? AND attempt = ?",
+                     (dispatch, previous["current_round"], previous["current_attempt"])).fetchone()
+    if not old or not old["callback_channel"]:
+        return None  # A legacy host never received an independent credential.
+    channel = old["callback_channel"]
+    ref = secrets.token_hex(32)
+    bind_callback(db, dispatch, next_round, attempt, channel, round_proof(channel, ref))
+    return ref
+
+
+def callback_proof(args):
+    # A live host cannot change its inherited environment on continue. Its new
+    # brief selects a freshly authorized assignment. Neither a public attempt
+    # ID nor the reference is a credential without the launch secret.
+    secret = os.environ.get("WFC_WORKER_CALLBACK")
+    if not secret and not args.callback_ref:
+        return None
+    if secret:
+        channel = callback_digest(secret)
+        if not args.callback_ref:
+            return channel, channel
+        if re.fullmatch(r"[0-9a-f]{64}", args.callback_ref):
+            return channel, round_proof(channel, args.callback_ref)
+    raise SystemExit(json.dumps({"error": "invalid_worker_callback", "operation": args.command}))
+
+
+def require_callback(db, dispatch, args, proof):
+    if proof is None:
+        return require_owner(db, owner_scope(db, dispatch), owner_token(args), args.command)
+    row = db.execute("SELECT r.callback_channel, r.callback_hash FROM dispatch d JOIN dispatch_round r "
+                     "ON r.dispatch = d.id AND r.round = d.current_round AND r.attempt = d.current_attempt "
+                     "WHERE d.id = ? AND (? IS NULL OR r.attempt = ?)",
+                     (dispatch, args.attempt, args.attempt)).fetchone()
+    if not (row and row["callback_channel"] and row["callback_hash"]
+            and hmac.compare_digest(row["callback_channel"], proof[0])
+            and hmac.compare_digest(row["callback_hash"], proof[1])):
+        raise SystemExit(json.dumps({"error": "invalid_worker_callback", "operation": args.command}))
+
+
 def preflight_controller(db, scope, token, operation):
     """Fence a controller before any watchdog scan or message claim."""
     if scope:
@@ -310,11 +378,13 @@ def emit(obj):
 FIRST_BRIEF = "You are a worker dispatched by the controller"
 
 
-def worker_brief(dispatch_id, task, report, opening=FIRST_BRIEF, attempt=None, owner=False):
+def worker_brief(dispatch_id, task, report, opening=FIRST_BRIEF, attempt=None, callback_ref=None):
     context = {"dispatch": dispatch_id, "state": str(state_dir())}
     if wfc_platform.WINDOWS:
         base = [sys.executable, str(PROGRAM)]
         identity = ["--attempt", attempt] if attempt else []
+        if callback_ref:
+            identity.extend(["--callback-ref", callback_ref])
         done = wfc_platform.callback_command([*base, "done", "--report", str(report), *identity,
                                               *(["--message-id", f"done:{dispatch_id}:{attempt}"] if attempt else [])], **context)
         ask = wfc_platform.callback_command([*base, "ask", "<question text>", *identity], **context)
@@ -326,7 +396,7 @@ def worker_brief(dispatch_id, task, report, opening=FIRST_BRIEF, attempt=None, o
                 f"then end your turn; the answer arrives as your next message. "
                 f"Never ask questions in plain text or with an interactive question tool; nobody watches this window.")
     router = wfc_platform.callback_command([sys.executable, str(PROGRAM)], **context)
-    owner_arg = ' --owner-token "$WFC_OWNER_TOKEN"' if owner else ""
+    ref_arg = " --callback-ref " + shlex.quote(callback_ref) if callback_ref else ""
     attempt_arg = " --attempt " + shlex.quote(attempt) if attempt else ""
     message_arg = (" --message-id done:" + shlex.quote(dispatch_id) + ":" + shlex.quote(attempt)
                    if attempt else "")
@@ -335,9 +405,9 @@ def worker_brief(dispatch_id, task, report, opening=FIRST_BRIEF, attempt=None, o
             f"Stop any server or background process you started before you report. "
             f"When the task is finished, write your report and run: "
             f"{router} done --report {shlex.quote(str(report))}"
-            f"{owner_arg}{attempt_arg}{message_arg}; "
+            f"{attempt_arg}{ref_arg}{message_arg}; "
             f"If you need a decision, run: {router} ask \"<question>\" [--options a,b]"
-            f"{owner_arg}{attempt_arg}; then end your turn; "
+            f"{attempt_arg}{ref_arg}; then end your turn; "
             f"the answer arrives as your next message. Never ask questions in plain text "
             f"or with an interactive question tool; nobody watches this window.")
 
@@ -713,7 +783,6 @@ def cmd_dispatch(args):
     dispatch_id = "d-" + uuid.uuid4().hex[:8]
     scope = clean_label(args.scope or "") or "s-" + uuid.uuid4().hex[:8]
     db.execute("BEGIN IMMEDIATE")
-    controller = db.execute("SELECT token FROM controller_owner WHERE scope = ?", (scope,)).fetchone()
     require_owner(db, scope, owner_token(args), "dispatch")
     cwd = Path(args.cwd).resolve()
     task = Path(args.task).resolve()
@@ -725,16 +794,13 @@ def cmd_dispatch(args):
     role = clean_label(args.role or "") or readable(report.parent.name).rpartition("-")[2] or "worker"
     attempt = "a-" + uuid.uuid4().hex[:12]
     backend = backend_for(args.backend, db)
-    command, extra_env = LAUNCHERS[args.host](worker_brief(dispatch_id, task, report, attempt=attempt,
-                                                           owner=bool(controller)),
+    command, extra_env = LAUNCHERS[args.host](worker_brief(dispatch_id, task, report, attempt=attempt),
                                               [state_dir(), report.parent], cwd, args.model, host_session,
                                               effort=args.effort, network=args.network, label=label, git=args.git)
     config = getattr(args, "launch_config", None) or os.environ.get("WFC_LAUNCH_CONFIG")
     config = str(Path(config).expanduser().resolve()) if config else None
     command, extra_env = host_launch.configure(args.host, command, extra_env, config)
     extra_env.update(WFC_DISPATCH=dispatch_id, WFC_STATE=str(state_dir()))
-    if controller:
-        extra_env["WFC_OWNER_TOKEN"] = controller["token"]
     ignored = [note for option, note in IGNORED_OPTIONS.get(args.host, {}).items() if getattr(args, option)]
     trusted_by = trust_claude_worktree(cwd) if args.host == "claude" else None
     created = time.time()
@@ -744,6 +810,7 @@ def cmd_dispatch(args):
                 args.model, host_session, args.effort, int(args.network), label, int(args.git), scope, role, 1, attempt))
     db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, created) VALUES (?, ?, ?, ?, ?, ?)",
                (dispatch_id, 1, attempt, str(task), str(report), created))
+    launch_callback(db, extra_env, dispatch_id, 1, attempt)
     db.execute("UPDATE dispatch SET launch_config = ? WHERE id = ?", (config, dispatch_id))
     create_audit = None
     if args.backend in ("herdr", "bundled"):
@@ -752,7 +819,11 @@ def cmd_dispatch(args):
                    (json.dumps({"endpoint": endpoint} if args.backend == "herdr" else {"state": "not-started"}), time.time(), dispatch_id))
         create_audit = lifecycle_event(db, dispatch_id, "create", round=1, attempt=attempt, to_attempt=attempt,
                                        to_host=args.host, result="pending", diagnostic=f"{args.backend} create pending")
-        # The attempt exists durably before Herdr can start an external writer.
+        if args.backend == "bundled":
+            pid = os.getpid()
+            db.execute("UPDATE lifecycle_event SET creator_pid = ?, creator_start = ? WHERE id = ?",
+                       (pid, wfc_platform.process_identity(pid), create_audit))
+        # Commit the attempt and its create audit before launching an external writer.
         db.execute("COMMIT")
         try:
             with input_lock(dispatch_id):
@@ -974,30 +1045,45 @@ def receipt_response(db, message_id, duplicate=False):
     return result
 
 
+def existing_done(db, dispatch, args, report, request_key, current, worker_proof):
+    if not request_key:
+        return None
+    prior = db.execute("SELECT * FROM message WHERE dispatch = ? AND request_key = ?",
+                       (dispatch, request_key)).fetchone()
+    if prior is None:
+        return None
+    old = json.loads(prior["body"])
+    # Only legacy controller-authorized retries can refer to pre-identity receipts.
+    old_round = old.get("round", None if worker_proof else current["current_round"])
+    old_attempt = old.get("attempt", None if worker_proof else current["current_attempt"])
+    if (prior["type"] != "done" or old.get("report") != str(report)
+            or old_round != current["current_round"]
+            or old_attempt != current["current_attempt"]
+            or (args.attempt and args.attempt != current["current_attempt"])):
+        raise SystemExit(f"message request {request_key} conflicts with an existing receipt")
+    return receipt_response(db, prior["id"], duplicate=True)
+
+
 def cmd_done(args):
     report = Path(args.report).resolve()
     if not report.is_file():
         raise SystemExit(f"report not found: {report}")
     db = connect()
     dispatch_id = current_dispatch(db)
-    require_owner(db, owner_scope(db, dispatch_id), owner_token(args), "done")
+    proof = callback_proof(args)
+    db.execute("BEGIN IMMEDIATE")
+    require_callback(db, dispatch_id, args, proof)
     request_key = args.message_id or (("done:" + dispatch_id + ":" + args.attempt) if args.attempt else None)
-    # Resolve an existing stable receipt before reading volatile worktree metadata.
-    # A retry must return its original head/dirty snapshot even if the worktree moved.
-    if request_key:
-        prior = db.execute("SELECT * FROM message WHERE dispatch = ? AND request_key = ?",
-                           (dispatch_id, request_key)).fetchone()
-        if prior:
-            old = json.loads(prior["body"])
-            if old.get("report") != str(report):
-                raise SystemExit(f"message request {request_key} conflicts with an existing receipt")
-            emit(receipt_response(db, prior["id"], duplicate=True))
-            return
-    # Read before any lock: git may be slow, and it reads the worktree, not router.db.
-    head = worktree_head(db.execute("SELECT cwd FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()["cwd"])
-    with input_lock(dispatch_id):  # a nudge being typed lands before this done, as recorded
-        return finish_round(db, dispatch_id, report, head, expected_attempt=args.attempt,
-                            request_key=request_key, owner_credential=owner_token(args))
+    current = db.execute("SELECT cwd, current_round, current_attempt FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
+    duplicate = existing_done(db, dispatch_id, args, report, request_key, current, proof)
+    db.execute("COMMIT")
+    if duplicate:
+        emit(duplicate)
+        return
+    # Git may be slow. A competing callback can complete while we read the worktree.
+    head = worktree_head(current["cwd"])
+    with input_lock(dispatch_id):
+        return finish_round(db, dispatch_id, report, head, args, request_key, proof)
 
 
 GIT_TIMEOUT = 5
@@ -1024,26 +1110,18 @@ def worktree_head(cwd):
     return {"head": head, "dirty": dirty}
 
 
-def finish_round(db, dispatch_id, report, head, expected_attempt=None, request_key=None, owner_credential=None):
+def finish_round(db, dispatch_id, report, head, args, request_key, proof):
     db.execute("BEGIN IMMEDIATE")
-    scope_check = db.execute("SELECT scope FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()["scope"]
-    require_owner(db, scope_check, owner_credential, "done")
-    current_row = db.execute("SELECT report, current_round, current_attempt FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
-    scope, role = db.execute("SELECT scope, role FROM dispatch WHERE id = ?", (dispatch_id,)).fetchone()
-    if request_key:
-        prior = db.execute("SELECT * FROM message WHERE dispatch = ? AND request_key = ?",
-                           (dispatch_id, request_key)).fetchone()
-        if prior:
-            old = json.loads(prior["body"])
-            candidate = {"report": str(report), "scope": scope, "role": role,
-                         "round": old.get("round"), "attempt": old.get("attempt"), **head}
-            if prior["body_hash"] != hashlib.sha256(json.dumps(candidate, ensure_ascii=False, sort_keys=True).encode()).hexdigest():
-                db.execute("ROLLBACK")
-                raise SystemExit(f"message request {request_key} conflicts with an existing receipt")
-            db.execute("ROLLBACK")
-            emit({**receipt_response(db, prior["id"], duplicate=True)})
-            return
-    attempts = db.execute("SELECT COUNT(*) FROM dispatch_round WHERE dispatch = ?", (dispatch_id,)).fetchone()[0]
+    require_callback(db, dispatch_id, args, proof)
+    expected_attempt = args.attempt
+    current_row = db.execute("SELECT report, scope, role, current_round, current_attempt FROM dispatch WHERE id = ?",
+                             (dispatch_id,)).fetchone()
+    scope, role = current_row["scope"], current_row["role"]
+    duplicate = existing_done(db, dispatch_id, args, report, request_key, current_row, proof)
+    if duplicate:
+        db.execute("COMMIT")
+        emit(duplicate)
+        return
     same_report = db.execute("SELECT COUNT(*) FROM dispatch_round WHERE dispatch = ? AND report = ?",
                              (dispatch_id, current_row["report"])).fetchone()[0]
     if (expected_attempt and current_row["current_attempt"] != expected_attempt) or (not expected_attempt and same_report > 1):
@@ -1084,8 +1162,9 @@ def cmd_ask(args):
     db = connect()
     options = [o for o in (args.options or "").split(",") if o]
     dispatch_id = current_dispatch(db)
+    proof = callback_proof(args)
     db.execute("BEGIN IMMEDIATE")
-    require_owner(db, owner_scope(db, dispatch_id), owner_token(args), "ask")
+    require_callback(db, dispatch_id, args, proof)
     identity = db.execute("SELECT scope, role, current_round, current_attempt, report, backend FROM dispatch WHERE id = ?",
                           (dispatch_id,)).fetchone()
     body = {"question": args.question, "options": options, "scope": identity["scope"],
@@ -1099,13 +1178,13 @@ def cmd_ask(args):
         prior = db.execute("SELECT * FROM message WHERE dispatch = ? AND request_key = ?",
                            (dispatch_id, request_key)).fetchone()
         if prior:
-            old = json.loads(prior["body"])
-            compare = {**body, "round": old.get("round"), "attempt": old.get("attempt")}
-            if prior["body_hash"] != hashlib.sha256(json.dumps(compare, ensure_ascii=False, sort_keys=True).encode()).hexdigest():
+            if (prior["type"] != "question" or (args.attempt and args.attempt != identity["current_attempt"])
+                    or prior["body_hash"] != hashlib.sha256(json.dumps(body, ensure_ascii=False, sort_keys=True).encode()).hexdigest()):
                 db.execute("ROLLBACK")
                 raise SystemExit(f"message request {request_key} conflicts with an existing receipt")
-            db.execute("ROLLBACK")
-            emit(receipt_response(db, prior["id"], duplicate=True))
+            response = receipt_response(db, prior["id"], duplicate=True)
+            db.execute("COMMIT")
+            emit(response)
             return
     same_report = db.execute("SELECT COUNT(*) FROM dispatch_round WHERE dispatch = ? AND report = ?",
                              (dispatch_id, identity["report"])).fetchone()[0]
@@ -1296,6 +1375,7 @@ def new_notice(session, before, seconds):
 # tells: Codex repeats each submitted message in the transcript after the same `›`.
 # OpenCode argv prefill is checked separately by Herdr; ordinary OpenCode/Claude input gets one Enter.
 ENTER_RETRIES = 2
+PASTE_SETTLE_SECONDS = 0.5
 _BOX_SCROLL = re.compile(r"\s*[↑↓]$")
 # What a reader saw in an input box: its text, and whether lines above it are scrolled out of
 # sight (Codex marks that with ↑), so that the text may start inside the typed text.
@@ -1433,7 +1513,7 @@ def type_into(session, text, host=None):
     if sent.returncode != 0:
         state = NOT_SENT if getattr(sent, "not_run", False) else UNCERTAIN
         return state, None, sent.stderr or sent.stdout or f"tmux send-keys exited {sent.returncode}"
-    time.sleep(0.5)  # TUIs drop an Enter that arrives in the same burst as the text
+    time.sleep(PASTE_SETTLE_SECONDS)  # TUIs drop an Enter that arrives in the same burst as the text
     entered = tmux("send-keys", "-t", session, "Enter")
     if entered.returncode != 0:
         return PARTIAL, None, entered.stderr or entered.stdout or f"tmux Enter exited {entered.returncode}"
@@ -1513,7 +1593,7 @@ class TmuxBackend(ExecutionBackend):
     def create(self, dispatch_id, cwd, command, extra_env, label=None):
         if not shutil.which("tmux"):
             return backend_result(DEFINITELY_NOT_SENT, "tmux could not run: executable missing")
-        env = {**os.environ, **extra_env, "WFC_DISPATCH": dispatch_id, "WFC_STATE": str(state_dir())}
+        env = {**extra_env, "WFC_DISPATCH": dispatch_id, "WFC_STATE": str(state_dir())}
         try:
             argv = host_launch.prepare(command, env, cwd)
         except host_launch.LaunchError as err:
@@ -1526,8 +1606,7 @@ class TmuxBackend(ExecutionBackend):
         host_launch.write_private(receipt, {"category": "unknown", "diagnostic": "host startup not confirmed", "at": time.time()})
         # tmux's multi-argument command form execs argv directly. No shell quoting of host/task data.
         status, diagnostic = _tmux_create(dispatch_id, cwd, [sys.executable, str(PROGRAM), "_host-run", str(spec), *command],
-                              {"WFC_DISPATCH": dispatch_id, "WFC_STATE": str(state_dir()),
-                               **({"WFC_OWNER_TOKEN": env["WFC_OWNER_TOKEN"]} if "WFC_OWNER_TOKEN" in env else {})}, label)
+                              {"WFC_DISPATCH": dispatch_id, "WFC_STATE": str(state_dir())}, label)
         if status == NOT_SENT:
             spec.unlink(missing_ok=True)
             return backend_result(DEFINITELY_NOT_SENT, "tmux could not run", receipt=str(receipt))
@@ -1853,11 +1932,13 @@ def cmd_continue(args):
             "scope": identity["scope"], "role": identity["role"], "round": next_round, "attempt": attempt})
         db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, created) VALUES (?, ?, ?, ?, ?, ?)",
                    (args.dispatch, next_round, attempt, str(task), str(report), time.time()))
+        callback_ref = continue_callback(db, args.dispatch, previous, next_round, attempt)
         db.execute("UPDATE dispatch SET task = ?, report = ?, current_round = ?, current_attempt = ? WHERE id = ?",
                    (str(task), str(report), next_round, attempt, args.dispatch))
         db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
         db.execute("COMMIT")
-        brief = worker_brief(args.dispatch, task, report, opening="[router] New task for you", attempt=attempt)
+        brief = worker_brief(args.dispatch, task, report, opening="[router] New task for you", attempt=attempt,
+                             callback_ref=callback_ref)
         outcome = backend_submit(row, brief)
         typed, diagnostic = backend_fault_state(outcome), outcome.get("diagnostic")
         if outcome["result"] in (DEFINITELY_NOT_SENT, "refused"):
@@ -2258,16 +2339,13 @@ def cmd_handoff(args):
         next_round = current["round"] + (1 if args.task else 0)
         attempt = "a-" + uuid.uuid4().hex[:12]
         host_session = str(uuid.uuid4()) if args.host == "claude" else None
-        controller = db.execute("SELECT token FROM controller_owner WHERE scope = ?", (row["scope"],)).fetchone()
         command, extra_env = LAUNCHERS[args.host](
             worker_brief(args.dispatch, task, report, opening="[router] This task has been handed off to a new host",
-                         attempt=attempt, owner=bool(controller)),
+                         attempt=attempt),
             [state_dir(), Path(row["report_dir"])], Path(row["cwd"]), args.model or row["model"], host_session,
             effort=row["effort"], network=bool(row["network"]), label=row["label"], git=bool(row["git"]))
         command, extra_env = host_launch.configure(args.host, command, extra_env, row["launch_config"])
         extra_env.update(WFC_DISPATCH=args.dispatch, WFC_STATE=str(state_dir()))
-        if controller:
-            extra_env["WFC_OWNER_TOKEN"] = controller["token"]
         db.execute("BEGIN IMMEDIATE")
         require_owner(db, row["scope"], owner_token(args), "handoff")
         latest, _ = _current_attempt(db, args.dispatch)
@@ -2284,6 +2362,7 @@ def cmd_handoff(args):
                        + UNFINISHED_ROUND, (time.time(), args.dispatch, current["round"], current["attempt"]))
         db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, state, created) VALUES (?, ?, ?, ?, ?, 'unknown', ?)",
                    (args.dispatch, next_round, attempt, str(task), str(report), time.time()))
+        launch_callback(db, extra_env, args.dispatch, next_round, attempt)
         db.execute("UPDATE dispatch SET host = ?, host_session = ?, model = ?, task = ?, report = ?, current_round = ?, current_attempt = ? WHERE id = ?",
                    (args.host, host_session, args.model or row["model"], str(task), str(report), next_round, attempt, args.dispatch))
         db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
@@ -2695,17 +2774,14 @@ def cmd_resume(args):
         raise SystemExit(f"cannot find the {row['host']} conversation of dispatch {args.dispatch}; dispatch a new worker")
     opening = ("[router] Your session was interrupted and has been resumed. Check the worktree and what you "
                "already did, then continue" if not args.task else "[router] Resumed with a new task for you")
-    controller = db.execute("SELECT token FROM controller_owner WHERE scope = ?", (row["scope"],)).fetchone()
     command, extra_env = LAUNCHERS[row["host"]](worker_brief(args.dispatch, task, report, opening=opening,
-                                                              attempt=resume_attempt, owner=bool(controller)),
+                                                              attempt=resume_attempt),
                                                 [state_dir(), Path(row["report_dir"])], Path(row["cwd"]),
                                                 row["model"], host_session, resume=True,
                                                 effort=row["effort"], network=bool(row["network"]), label=row["label"],
                                                 git=bool(row["git"]))
     command, extra_env = host_launch.configure(row["host"], command, extra_env, row["launch_config"])
     extra_env.update(WFC_DISPATCH=args.dispatch, WFC_STATE=str(state_dir()))
-    if controller:
-        extra_env["WFC_OWNER_TOKEN"] = controller["token"]
     # From the locked re-check to the last keystroke under the input lock (taken before the SQLite
     # lock, as everywhere), so no nudge, done or continue can come between the launch and the brief.
     with input_lock(args.dispatch):
@@ -2768,6 +2844,7 @@ def cmd_resume(args):
         db.execute("INSERT INTO dispatch_round (dispatch, round, attempt, task, report, state, created) VALUES (?, ?, ?, ?, ?, 'unknown', ?)",
                    (args.dispatch, next_round, attempt, str(task), str(report), time.time()))
         db.execute("DELETE FROM screen_watch WHERE dispatch = ?", (args.dispatch,))
+        launch_callback(db, extra_env, args.dispatch, next_round, attempt)
         db.execute("UPDATE dispatch SET task = ?, report = ?, host_session = ?, current_round = ?, current_attempt = ? WHERE id = ?",
                    (str(task), str(report), host_session, next_round, attempt, args.dispatch))
         db.execute("COMMIT")
@@ -3022,6 +3099,50 @@ def awaiting_answer(db, dispatch_id):
         (dispatch_id, current["current_round"], current["current_attempt"])))
 
 
+def pending_bundled_create(db, row):
+    if row["backend"] == "bundled":
+        return db.execute("SELECT id, creator_pid, creator_start, created FROM lifecycle_event WHERE dispatch = ? "
+                          "AND round = ? AND to_attempt = ? AND operation = 'create' AND result = 'pending'",
+                          (row["id"], row["current_round"], row["current_attempt"])).fetchone()
+
+
+BUNDLED_CREATOR_EXIT = "bundled creator exited or changed; reconcile the pending create; do not replay"
+
+
+def pending_create_observation(create, max_turn):
+    # A pending handle describes an unfinished operation, not a worker exit.
+    if create["creator_pid"] and create["creator_start"]:
+        probe = wfc_platform.process_probe(create["creator_pid"])
+        if probe["state"] == "exited" or (probe["state"] == "alive" and probe["identity"] != create["creator_start"]):
+            return backend_result(UNCERTAIN, BUNDLED_CREATOR_EXIT, observation="creator_exit")
+    if max_turn and time.time() - create["created"] >= max_turn:
+        return backend_result(UNCERTAIN, "bundled create exceeded the turn deadline; inspect the pending create; do not replay",
+                              observation="create_deadline")
+    # Older audits and unreadable process identities cannot prove creator death.
+    return None
+
+
+def claim_create_observation(db, row, create, observation):
+    # Under the same write transaction as the message. Creator exit is final for this audit.
+    if not db.execute("SELECT 1 FROM lifecycle_event WHERE id = ? AND result = 'pending'", (create["id"],)).fetchone():
+        return False
+    audit = str(create["id"])
+    if watchdog_fault_seen(db, row, "creator_exit", audit):
+        return False
+    if observation == "create_deadline" and watchdog_fault_seen(db, row, observation, audit):
+        return False
+    # R3 could already have posted the exit before it had per-audit watchdog markers.
+    # Each bundled dispatch has just one initial create, even across resumes.
+    if db.execute("SELECT 1 FROM message WHERE dispatch = ? AND recipient = 'controller' "
+                  "AND type = 'unknown' AND json_extract(body, '$.kind') = 'backend_observation' "
+                  "AND json_extract(body, '$.message') = ? LIMIT 1",
+                  (row["id"], BUNDLED_CREATOR_EXIT)).fetchone():
+        remember_watchdog_fault(db, row, "creator_exit", audit)
+        return False
+    remember_watchdog_fault(db, row, observation, audit)
+    return True
+
+
 def check_workers(db, stall_after, scope=None, token=None):
     """Report workers whose execution unit ended, or whose activity stopped changing,
     without `done` or a pending question. A busy TUI redraws a timer or spinner;
@@ -3035,7 +3156,10 @@ def check_workers(db, stall_after, scope=None, token=None):
             continue
         sampled_start = round_started(db, dispatch_id)
         backend = backend_for(row)
-        inspected = backend.inspect(dispatch_id)
+        create = pending_bundled_create(db, row)
+        inspected = pending_create_observation(create, max_turn) if create else backend.inspect(dispatch_id)
+        if inspected is None:
+            continue
         alive = inspected["result"] == "accepted" and inspected.get("alive", False)
         read_view = backend.read(dispatch_id) if alive else None
         backend_fault = inspected if inspected["result"] == UNCERTAIN else None
@@ -3063,6 +3187,8 @@ def check_workers(db, stall_after, scope=None, token=None):
                 pass  # external observations belong to an input/attempt that has moved on
             elif not watched(db, dispatch_id) or reclaimed(db, dispatch_id):
                 pass
+            elif create and not claim_create_observation(db, current, create, inspected["observation"]):
+                pass  # a settled audit or a superseded observation
             elif backend_fault:
                 prior_fault = db.execute("SELECT outcome, diagnostic FROM fault_event WHERE dispatch = ? AND operation = 'backend'",
                                          (dispatch_id,)).fetchone()
@@ -3207,6 +3333,7 @@ def queue_into_codex(thread, messages):
     try:
         result = subprocess.run(["codex", "queue", "--thread", thread, "--message", text, "--resume"],
                                 capture_output=True, text=True, timeout=float(os.environ.get("WFC_QUEUE_TIMEOUT", 60)),
+                                env=host_launch.without_router_credentials(os.environ),
                                 **({"creationflags": subprocess.CREATE_NO_WINDOW} if wfc_platform.WINDOWS else {}))
     except OSError as err:
         print(f"router relay: codex queue could not run: {err}", flush=True)
@@ -3329,11 +3456,11 @@ def cmd_relay(args):
         token = owner_token(args)
         argv = ["relay", *target_args, "--stall-after", str(args.stall_after),
                 *(["--scope", args.scope] if args.scope else []),
-                *(["--owner-token", token] if token else []),
                 *(["--for", str(args.for_seconds)] if args.for_seconds else [])]
         with open(log, "a", encoding="utf-8") as out:
             child = subprocess.Popen([sys.executable, str(PROGRAM), *argv], stdin=subprocess.DEVNULL,
-                                     stdout=out, stderr=out, **wfc_platform.detached_options())
+                                     stdout=out, stderr=out, env={**os.environ, **({"WFC_CONTROLLER_TOKEN": token} if token else {})},
+                                     **wfc_platform.detached_options())
         emit({"pid": child.pid, "log": str(log)})
         return 0
     db = connect()
@@ -3342,33 +3469,30 @@ def cmd_relay(args):
         while deadline is None or time.monotonic() < deadline:
             preflight_controller(db, args.scope, owner_token(args), "relay")
             check_workers(db, args.stall_after, scope=args.scope, token=owner_token(args))
-            messages = take_controller_messages(db, relay=True, scope=args.scope, token=owner_token(args))
-            # The internal claim and the external envelope both remain explicitly
-            # uncertain until the backend call returns. A later durable transition
-            # records received; this envelope cannot pre-claim that outcome.
-            envelope = [{**message, "state": "unknown", "delivery": "pending",
-                          "deliveryAttempt": "relay:" + message["messageId"] + ":" + str(message["statusVersion"])}
-                         for message in messages]
-            outcome = deliver(envelope) if envelope else None
-            if messages and outcome == "delivered":
-                db.execute("BEGIN IMMEDIATE")
-                db.executemany("UPDATE message SET delivered = 1, state = 'received', status_version = status_version + 1 "
-                               "WHERE id = ? AND state = 'unknown'", [(m["id"],) for m in messages])
-                db.execute("COMMIT")
-            elif messages and outcome in ("failed", "missing"):
-                # Definitely not sent: make it available to a later explicit attempt.
-                db.execute("BEGIN IMMEDIATE")
-                db.executemany("UPDATE message SET delivered = 0, state = 'unsent', status_version = status_version + 1 "
-                               "WHERE id = ? AND state = 'unknown'",
-                               [(m["id"],) for m in messages])
-                db.execute("COMMIT")
-                if outcome == "missing":
-                    return 1  # the thread is gone or wrong: every later batch would be lost too
-            elif messages and outcome == "uncertain":
-                # Keep unknown and undelivered. It is queryable, but wait/relay will not
-                # silently replay it after an external timeout.
-                pass
-                time.sleep(5)
+            # A committed takeover fences the next scoped queue call. The owner
+            # lock covers the external call, without holding a SQLite write lock.
+            with owner_lock(args.scope) if args.scope else nullcontext():
+                messages = take_controller_messages(db, relay=True, scope=args.scope, token=owner_token(args))
+                envelope = [{**message, "state": "unknown", "delivery": "pending",
+                             "deliveryAttempt": "relay:" + message["messageId"] + ":" + str(message["statusVersion"])}
+                            for message in messages]
+                outcome = deliver(envelope) if envelope else None
+                if outcome in ("delivered", "failed", "missing"):
+                    db.execute("BEGIN IMMEDIATE")
+                    # Settle only the claim that crossed the queue boundary. Lease
+                    # changes fence future claims; an explicit resolution wins.
+                    received = outcome == "delivered"
+                    db.executemany("UPDATE message SET delivered = ?, state = ?, status_version = status_version + 1 "
+                                   "WHERE id = ? AND message_uid = ? AND dispatch = ? AND recipient = 'controller' "
+                                   "AND delivered = 0 AND state = 'unknown' AND status_version = ?",
+                                   [(int(received), "received" if received else "unsent",
+                                     m["id"], m["messageId"], m["dispatch"], m["statusVersion"])
+                                    for m in messages])
+                    db.execute("COMMIT")
+                    if outcome == "missing":
+                        return 1
+            if outcome == "uncertain":
+                time.sleep(5)  # Leave unknown untouched. Never replay this claim.
             time.sleep(0.5)
     return 0
 
@@ -3491,6 +3615,7 @@ def main(argv):
     p = sub.add_parser("done")
     p.add_argument("--report", required=True)
     p.add_argument("--attempt", help="execution attempt identity from the worker brief")
+    p.add_argument("--callback-ref", help="public callback reference from the current assignment")
     p.add_argument("--message-id", help="stable worker receipt key; retries are idempotent")
     p.add_argument("--owner-token")
     p.set_defaults(func=cmd_done)
@@ -3498,6 +3623,7 @@ def main(argv):
     p.add_argument("question")
     p.add_argument("--options")
     p.add_argument("--attempt", help="execution attempt identity from the worker brief")
+    p.add_argument("--callback-ref", help="public callback reference from the current assignment")
     p.add_argument("--message-id", help="stable worker receipt key; retries are idempotent")
     p.add_argument("--owner-token")
     p.set_defaults(func=cmd_ask)
@@ -3613,6 +3739,8 @@ def main(argv):
         p.add_argument("--lease", type=float, default=OWNER_LEASE)
         p.set_defaults(func=cmd_owner, owner_action=("acquire" if action == "claim" else action))
     args = parser.parse_args(argv)
+    if os.environ.get("WFC_WORKER_CALLBACK") and args.command not in ("ask", "done"):
+        raise SystemExit(json.dumps({"error": "worker_callback_only", "operation": args.command}))
     return args.func(args) or 0
 
 

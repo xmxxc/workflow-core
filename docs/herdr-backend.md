@@ -41,7 +41,7 @@ python3 wfc.py herdr-reconcile d-... --pane p-... --terminal t-... \
 
 ## 宿主 shell 的回调上下文
 
-Codex 0.169.0 的 Linux 实测中，主进程已收到正确 WFC 环境，但其生成的 shell snapshot 带有上一个 dispatch/state，回调因 attempt 不匹配而被拒绝。WFC brief 的 ask/done 命令现在显式设置当前 `WFC_DISPATCH` 和绝对 `WFC_STATE`；Unix 以引用后的 `env` 参数传入，Windows 以 PowerShell literal 设置后启动 Python。不依赖宿主 shell snapshot 的这两个环境值，不改变宿主全局配置。owner token 仍从继承环境读取并校验；失效凭据拒绝，不在 brief 中嵌入凭据或绕过 owner fencing。
+Codex 0.169.0 的 Linux 实测中，主进程已收到正确 WFC 环境，但其生成的 shell snapshot 带有上一个 dispatch/state，回调因 attempt 不匹配而被拒绝。WFC brief 的 ask/done 命令现在显式设置当前 `WFC_DISPATCH` 和绝对 `WFC_STATE`；Unix 以引用后的 `env` 参数传入，Windows 以 PowerShell literal 设置后启动 Python。不依赖宿主 shell snapshot 的这两个环境值，不改变宿主全局配置。新启动的宿主通过私有环境获得 worker 回报凭据。接替不改变当前 attempt；continue 的 brief 另带新轮次的公开回报引用，须与宿主私有凭据配合使用，resume 和 handoff 为新宿主签发新的凭据。
 
 ## Codex reply 的 Enter
 

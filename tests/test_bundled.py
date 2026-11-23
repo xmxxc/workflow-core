@@ -6,11 +6,44 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class BundledSelection(unittest.TestCase):
+    def test_codex_receives_one_enter_outside_the_paste_burst(self):
+        from bundled_backend import BundledBackend
+        backend = BundledBackend()
+        answer = '[router] Answer to question 1: D_GO'
+        elapsed = 0.0
+        composer = 'Ask Codex to do anything'
+        writes = []
+
+        def advance(seconds):
+            nonlocal elapsed
+            elapsed += seconds
+
+        def input_event(dispatch, op, *, text):
+            nonlocal composer
+            writes.append(text)
+            if text == '\r':
+                if elapsed >= 0.5:
+                    composer = 'Ask Codex to do anything'
+            else:
+                composer = answer
+            return {'result': 'accepted'}
+
+        def read(dispatch):
+            return {'result': 'accepted', 'screen': f'› {composer}\n\n  model · cwd'}
+
+        with patch.object(backend, 'read', read), patch.object(backend, '_call', input_event), \
+                patch('bundled_backend.time.sleep', advance):
+            result = backend.submit('d-test', answer, 'codex')
+        self.assertEqual(writes, ['\x1b[200~' + answer + '\x1b[201~', '\r'])
+        self.assertEqual(result['result'], 'accepted')
+        self.assertEqual(composer, 'Ask Codex to do anything')
+
     def test_missing_companion_is_explicit_and_does_not_launch_host(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
@@ -67,12 +100,13 @@ class BundledNative(unittest.TestCase):
         self.evidence = self.root / 'descendant.pid'
         self.launch = self.root / 'launch.json'
         self.env = {key: value for key, value in os.environ.items()
-                    if key not in ('WFC_DISPATCH', 'WFC_OWNER_TOKEN', 'WFC_STATE', 'WFC_LAUNCH_CONFIG')}
+                    if key not in ('WFC_DISPATCH', 'WFC_OWNER_TOKEN', 'WFC_CONTROLLER_TOKEN', 'WFC_WORKER_CALLBACK', 'WFC_STATE', 'WFC_LAUNCH_CONFIG')}
         self.env.update(WFC_STATE=str(self.root / 'state'), CODEX_HOME=str(self.root / 'codex-home'), PYTHONUTF8='1',
                         WFC_BUNDLED_DIAGNOSTICS='1',
                         WFC_BUNDLED_KERNEL=str(Path(os.environ['WFC_BUNDLED_TEST_KERNEL']).resolve()))
         if os.environ.get('WFC_BUNDLED_TEST_DISCOVERY'):
             self.env.pop('WFC_BUNDLED_KERNEL', None)
+        self.gated_processes = []
         self.dispatches = []
         self.identities = []
         self.config()
@@ -80,7 +114,7 @@ class BundledNative(unittest.TestCase):
     def config(self, mode=''):
         self.launch.write_text(json.dumps({'hosts': {'codex': {
             'runtime': [sys.executable, '-u'], 'command': [str(ROOT / 'tests/fixtures/bundled_worker.py')],
-            'env': {'WFC_TEST_PROGRAM': str(self.program), 'WFC_TEST_REPORT': str(self.report),
+            'env': {'WFC_TEST_PROGRAM': str(getattr(self, 'worker_program', self.program)), 'WFC_TEST_REPORT': str(self.report),
                     'WFC_TEST_EVIDENCE': str(self.evidence), 'WFC_TEST_MODE': mode}}}}), encoding='utf-8')
 
     def cli(self, *args, success=True):
@@ -127,6 +161,10 @@ class BundledNative(unittest.TestCase):
         import time
         import wfc_platform
         import bundled_runtime
+        for process in self.gated_processes:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=5)
         for dispatch in self.dispatches:
             self.cli('close', dispatch, *getattr(self, 'owner_args', []), success=False)
         # Direct capability-guarded cleanup also covers a failed CLI create/close.
@@ -155,6 +193,238 @@ class BundledNative(unittest.TestCase):
                 survivors.append(identity)
         self.tmp.cleanup()
         self.assertFalse(survivors, 'test-owned processes required emergency cleanup: ' + str(survivors))
+
+    def gated_cli(self, *args):
+        process = subprocess.Popen([sys.executable, str(ROOT / 'tests/fixtures/bundled_create_gate.py'),
+                                    str(self.program), str(self.root), *args], env=self.env, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, encoding='utf-8')
+        self.gated_processes.append(process)
+        return process
+
+    def gated_dispatch(self, *args):
+        self.config('takeover')
+        return self.gated_cli('dispatch', '--backend', 'bundled', '--host', 'codex', '--task', str(self.task),
+                              '--cwd', str(self.root), '--report', str(self.report), '--launch-config',
+                              str(self.launch), *args)
+
+    def relay_before_dispatch(self, scope):
+        import uuid
+        thread = str(uuid.uuid4())
+        sessions = Path(self.env['CODEX_HOME']) / 'sessions'
+        sessions.mkdir(parents=True)
+        (sessions / f'rollout-controlled-{thread}.jsonl').write_text(json.dumps({
+            'type': 'session_meta', 'payload': {'id': thread, 'source': 'cli'}}) + '\n', encoding='utf-8')
+        self.env.pop('CODEX_THREAD_ID', None)
+        relay = self.gated_cli('relay', '--codex-thread', thread, '--scope', scope, '--for', '60')
+        self.until(lambda: any(w['pid'] == relay.pid and w['kind'] == 'relay' for w in self.cli('status')['waiters']))
+        dispatch = self.gated_dispatch('--scope', scope)
+        out, err = dispatch.communicate(timeout=30)
+        self.assertEqual(dispatch.returncode, 0, err)
+        value = json.loads(out)
+        self.dispatches.append(value['dispatch'])
+        self.assertTrue((self.root / 'scan-complete').exists())
+        self.assertIsNone(relay.poll())
+        return value, relay
+
+    def test_inflight_worker_reports_after_takeover(self):
+        import hashlib
+        import wfc_platform
+        migration = os.environ.get('WFC_TEST_DOT3_LAUNCH')
+        candidate = self.program
+        legacy = os.environ.get('WFC_TEST_DOT3_BASELINE') == '1' or bool(migration)
+        if migration:
+            # The original process and environment survive. Its callback executable
+            # and B's owner command now open the release-created DB using the candidate.
+            self.program = Path(migration).resolve()
+            self.worker_program = candidate
+        if legacy:
+            self.assertEqual(hashlib.sha256(self.program.read_bytes()).hexdigest(),
+                             'e9b9c07384d2710ea59e163940706a5146ef60594a02057b80ca52c32b59bea6')
+        scope = 'takeover-fixture'
+        first = self.cli('owner', 'acquire', '--scope', scope, '--owner', 'A', '--lease', '120')
+        self.env['WFC_CONTROLLER_TOKEN'] = first['token']
+        if legacy:
+            value = self.dispatch('takeover', '--scope', scope)
+        else:
+            value, relay = self.relay_before_dispatch(scope)
+        dispatch = value['dispatch']
+        self.handle(dispatch)
+        def evidence(action):
+            path = Path(str(self.evidence) + '.' + action)
+            self.until(lambda: path.exists() and path.stat().st_size)
+            return json.loads(path.read_text(encoding='utf-8'))
+        ready = evidence('ready')
+        worker_start = wfc_platform.process_identity(ready['pid'])
+        self.assertTrue(worker_start)
+        self.assertEqual(ready['attempt'], value['attempt'])
+        before = self.status(dispatch)
+        if not legacy:
+            [create] = before['audit']
+            self.assertEqual((create['result'], create['attempt'], before['attempt']),
+                             ('accepted', value['attempt'], value['attempt']))
+            self.assertTrue(before['backendAlive'])
+            initial = {'status': before['status'], 'lifecycle': before['lifecycle'], 'backendAlive': True,
+                       'roundState': before['rounds'][-1]['state'], 'fault': before['signals']['fault'],
+                       'messages': [(m['type'], m['state'], m['messageId']) for m in before['messages']]}
+            self.assertEqual((initial['roundState'], initial['fault'], initial['messages']),
+                             ('running', None, []), initial)
+            self.assertFalse((self.root / 'queue.jsonl').exists())
+        self.assertEqual((before['status'], before['lifecycle']), ('online', 'running'))
+        self.assertFalse(self.report.exists())
+        self.program = candidate
+        second = self.cli('owner', 'takeover', '--scope', scope, '--owner', 'B', '--lease', '120')
+        self.env['WFC_CONTROLLER_TOKEN'] = second['token']
+        self.assertEqual(second['generation'], first['generation'] + 1)
+        if not legacy:
+            _, error = relay.communicate(timeout=8)
+            self.assertEqual(relay.returncode, 1, error)
+            self.assertIn('stale_controller_owner', error)
+            self.assertFalse((self.root / 'queue.jsonl').exists())
+        Path(str(self.evidence) + '.release').touch()
+        ask = evidence('ask')
+        if legacy:
+            self.assertTrue(ready['ownerInHost'])
+            done = evidence('done')
+            for reply in (ask, done):
+                self.assertEqual((reply['exit'], reply['error']), (1, 'stale_controller_owner'))
+            view = self.status(dispatch)
+            self.assertEqual((view['status'], view['lifecycle']), ('online', 'running'))
+            self.assertFalse(any(m['type'] in ('question', 'done') for m in view['messages']))
+            if migration:
+                # Public identifiers alone cannot turn the old assignment into a grant.
+                probe = subprocess.run([sys.executable, str(candidate), 'ask', 'legacy identity only',
+                                        '--attempt', value['attempt']], capture_output=True, text=True, timeout=15,
+                                       env={**self.env, 'WFC_DISPATCH': dispatch, 'WFC_CONTROLLER_TOKEN': ''})
+                self.assertEqual(probe.returncode, 1)
+                self.assertEqual(json.loads(probe.stderr)['error'], 'stale_controller_owner')
+                view = self.status(dispatch)
+                self.assertEqual(view['messages'], [])
+        else:
+            self.assertFalse(ready['ownerInHost'])
+            self.assertEqual(ask['exit'], 0)
+            self.assertTrue(ask['stableRetry'])
+            self.env['WFC_CONTROLLER_TOKEN'] = first['token']
+            rejected = self.cli('wait', '--scope', scope, '--timeout', '1', success=False)
+            self.assertIn('stale_controller_owner', rejected.stderr)
+            rejected = self.cli('nudge', dispatch, '--text', 'unused', success=False)
+            self.assertIn('stale_controller_owner', rejected.stderr)
+            self.env['WFC_CONTROLLER_TOKEN'] = second['token']
+            [question] = self.cli('wait', '--scope', scope, '--timeout', '5')['messages']
+            self.assertEqual(question['messageId'], ask['messageId'])
+            self.cli('reply', str(question['id']), 'finish controlled task')
+            done = evidence('done')
+            self.assertEqual(done['exit'], 0)
+            self.assertTrue(done['stableRetry'])
+            [received] = self.cli('wait', '--scope', scope, '--timeout', '5')['messages']
+            self.assertEqual(received['messageId'], done['messageId'])
+            self.env['WFC_CONTROLLER_TOKEN'] = first['token']
+            rejected = self.cli('ack', done['messageId'], success=False)
+            self.assertIn('stale_controller_owner', rejected.stderr)
+            self.env['WFC_CONTROLLER_TOKEN'] = second['token']
+            self.assertEqual(self.cli('ack', done['messageId'])['state'], 'processed')
+            view = self.status(dispatch)
+            self.assertEqual(view['status'], 'completed')
+            self.assertEqual([m['type'] for m in view['messages']], ['question', 'reply', 'done'])
+        self.assertEqual((ask['pid'], done['pid']), (ready['pid'], ready['pid']))
+        self.assertEqual(wfc_platform.process_identity(ready['pid']), worker_start)
+        self.assertEqual(view['attempt'], value['attempt'])
+        self.assertEqual(self.cli('close', dispatch)['result'], 'completed')
+        print('TAKEOVER ' + json.dumps({'legacy': legacy, 'migrated': bool(migration), 'dispatch': dispatch, 'attempt': value['attempt'],
+              'programSHA256': hashlib.sha256(candidate.read_bytes()).hexdigest(), 'relayBeforeDispatch': not legacy,
+              'generation': second['generation'], 'ready': {**ready, 'creation': worker_start}, 'ask': ask, 'done': done,
+              'status': view['status'], 'closed': True, **({'beforeTakeover': initial} if not legacy else {})}), flush=True)
+
+    def test_pending_create_deadline_and_creator_exit_require_reconciliation(self):
+        dispatch = self.gated_dispatch()
+        try:
+            self.until(lambda: (self.root / 'create-pending').exists())
+            [view] = self.cli('status')['dispatches']
+            identity = (view['dispatch'], view['attempt'])
+            self.dispatches.append(identity[0])
+            self.assertEqual(self.cli('wait', '--timeout', '0')['messages'], [])
+            self.env['WFC_MAX_TURN_SECONDS'] = '0.001'
+            [deadline] = self.cli('wait', '--timeout', '0')['messages']
+            self.assertEqual(deadline['type'], 'unknown')
+            self.assertIn('exceeded the turn deadline', deadline['message'])
+            self.assertEqual(self.cli('wait', '--timeout', '0')['messages'], [])
+            self.assertIsNone(dispatch.poll())
+        finally:
+            if dispatch.poll() is None:
+                dispatch.kill()
+            dispatch.communicate(timeout=5)
+        self.env.pop('WFC_MAX_TURN_SECONDS')
+        [exited] = self.cli('wait', '--timeout', '0')['messages']
+        self.assertEqual(exited['type'], 'unknown')
+        self.assertIn('creator exited', exited['message'])
+        self.assertEqual(self.cli('wait', '--timeout', '0')['messages'], [])
+        view = self.status(identity[0])
+        self.assertEqual((view['dispatch'], view['attempt']), identity)
+        [create] = view['audit']
+        self.assertEqual((create['operation'], create['result']), ('create', 'pending'))
+        self.assertEqual([m['messageId'] for m in view['messages']], [deadline['messageId'], exited['messageId']])
+        self.assertFalse(Path(str(self.evidence) + '.ready').exists())
+        self.assertIn('lifecycle_reconcile_required', self.cli('close', identity[0], success=False).stderr)
+
+    def hold_create_deadline(self):
+        creator = self.gated_dispatch()
+        self.until(lambda: (self.root / 'create-pending').exists())
+        [view] = self.cli('status')['dispatches']
+        self.dispatches.append(view['dispatch'])
+
+        self.env['WFC_MAX_TURN_SECONDS'] = '0.001'
+        stale = self.gated_cli('wait', '--timeout', '0')
+        self.until(lambda: (self.root / 'wait-sampled').exists())
+        self.assertIsNone(creator.poll())
+        return creator, stale, view
+
+    def test_late_create_deadline_cannot_supersede_confirmed_creator_exit(self):
+        creator, stale, view = self.hold_create_deadline()
+        dispatch, attempt = view['dispatch'], view['attempt']
+        [audit] = view['audit']
+        creator.kill()
+        creator.communicate(timeout=5)
+        observer = Path(os.environ.get('WFC_TEST_R3_OBSERVER', self.program))
+        result = subprocess.run([sys.executable, str(observer), 'wait', '--timeout', '0'], env=self.env,
+                                capture_output=True, text=True, encoding='utf-8', timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [death] = json.loads(result.stdout)['messages']
+        self.assertEqual(death['type'], 'unknown')
+        self.assertIn('creator exited', death['message'])
+
+        (self.root / 'commit-sample').touch()
+        out, err = stale.communicate(timeout=10)
+        self.assertIn(stale.returncode, (0, 3), err)
+        late = json.loads(out)['messages']
+        after_late = self.status(dispatch)
+        repeated = self.cli('wait', '--timeout', '0')['messages']
+        final = self.status(dispatch)
+        self.assertEqual((final['attempt'], final['audit']), (attempt, [audit]))
+        self.assertEqual((audit['operation'], audit['result']), ('create', 'pending'))
+        self.assertEqual([(m['message'], m['messageId']) for m in final['messages']],
+                         [(death['message'], death['messageId'])])
+        self.assertEqual(after_late['last']['messageId'], death['messageId'])
+        self.assertEqual((late, repeated), ([], []))
+
+    def test_late_create_deadline_after_success_is_discarded(self):
+        creator, stale, view = self.hold_create_deadline()
+        (self.root / 'scan-complete').touch()
+        created, err = creator.communicate(timeout=15)
+        self.assertEqual(creator.returncode, 0, err)
+        dispatch = json.loads(created)['dispatch']
+        self.assertEqual(dispatch, view['dispatch'])
+        self.until(lambda: Path(str(self.evidence) + '.ready').exists())
+
+        (self.root / 'commit-sample').touch()
+        out, err = stale.communicate(timeout=10)
+        self.assertEqual(stale.returncode, 3, err)
+        self.assertEqual(json.loads(out)['messages'], [])
+        final = self.status(dispatch)
+        self.assertEqual((final['attempt'], final['status'], final['lifecycle']),
+                         (view['attempt'], 'online', 'running'))
+        self.assertTrue(final['backendAlive'])
+        self.assertEqual((final['signals']['fault'], final['messages']), (None, []))
+        [audit] = final['audit']
+        self.assertEqual((audit['id'], audit['result']), (view['audit'][0]['id'], 'accepted'))
 
     def test_standalone_dispatch_reply_done_and_close(self):
         import bundled_runtime
@@ -188,10 +458,13 @@ class BundledNative(unittest.TestCase):
         self.assertFalse(self.status(dispatch)['backendAlive'])
 
     def test_continue_reuses_owned_execution_and_accepts_new_round_reply(self):
-        value = self.dispatch('record-only')
+        scope = 'continued-host'
+        owner = self.cli('owner', 'acquire', '--scope', scope, '--lease', '180')
+        self.env['WFC_CONTROLLER_TOKEN'] = owner['token']
+        value = self.dispatch('continue-callback', '--scope', scope)
         dispatch = value['dispatch']
         handle = self.handle(dispatch)
-        question = self.question()
+        [question] = self.cli('wait', '--scope', scope, '--timeout', '5')['messages']
         self.cli('reply', str(question['id']), 'finish initial round')
         applied = Path(str(self.evidence) + '.applied')
         self.until(lambda: applied.exists())
@@ -215,23 +488,27 @@ class BundledNative(unittest.TestCase):
         import zipfile
         from unittest.mock import patch
         callback_program = self.program if zipfile.is_zipfile(self.program) else ROOT / 'router.py'
+        import re
+        received_brief = marker.read_text(encoding='utf-8')
+        ref = re.search(r'--callback-ref ([0-9a-f]{64})', received_brief).group(1)
         with patch.dict(os.environ, {'WFC_STATE': self.env['WFC_STATE']}), patch.object(router, 'PROGRAM', callback_program):
             expected_brief = router.worker_brief(dispatch, task.resolve(), report.resolve(),
-                                                opening='[router] New task for you', attempt=status['attempt'])
-        received_brief = marker.read_text(encoding='utf-8')
+                                                opening='[router] New task for you', attempt=status['attempt'], callback_ref=ref)
         self.assertEqual(received_brief, expected_brief)
         brief_digest = hashlib.sha256(received_brief.encode('utf-8')).hexdigest()
         self.assertEqual(brief_digest, hashlib.sha256(expected_brief.encode('utf-8')).hexdigest())
         second = self.handle(dispatch)
         self.assertEqual((second['generation'], second['service'], second['kernel']),
                          (handle['generation'], handle['service'], handle['kernel']))
-        question = self.cli('ask', 'controlled next-round question', '--attempt', status['attempt'])
+        [question] = [m for m in self.cli('wait', '--scope', scope, '--timeout', '5')['messages']
+                      if m.get('question') == 'controlled next-round question']
+        self.assertEqual(question['attempt'], status['attempt'])
         long_reply = ('复验路径-中文-42 Ω😀 ' + 'xyz-123456789 ' * 140 +
                       '\x1b[31mCSI-ORDER\x1b[0m ATTEMPT-TAIL:' + status['attempt'])
-        self.cli('reply', str(question['message']), long_reply)
+        self.cli('reply', str(question['id']), long_reply)
         self.until(lambda: applied.read_text() == 'once\nonce\n')
         recorded = [json.loads(line) for line in Path(str(self.evidence) + '.input.jsonl').read_text(encoding='utf-8').splitlines()]
-        self.assertEqual(recorded[-1], f"[router] Answer to question {question['message']}: {long_reply}")
+        self.assertEqual(recorded[-1], f"[router] Answer to question {question['id']}: {long_reply}")
         import bundled_runtime
         self.until(lambda: 'UNICODE_RECEIVED:复验路径-中文-42 Ω😀' in
                    bundled_runtime.call(handle, 'read').get('data', {}).get('text', ''))
@@ -644,6 +921,9 @@ class BundledNative(unittest.TestCase):
         [view] = self.cli('status')['dispatches']
         self.dispatches.append(view['dispatch'])
         self.assertEqual(view['status'], 'unknown')
+        [create] = view['audit']
+        self.assertEqual((create['operation'], create['result']), ('create', 'uncertain'))
+        self.assertEqual(view['rounds'][-1]['state'], 'unknown')
         self.assertFalse(self.evidence.exists())
         self.assertFalse(self.report.exists())
 

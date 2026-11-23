@@ -3,10 +3,10 @@
 ## Current state
 - Scope: workflow-core core reliability tickets #2-#7 (issue mapping: task identity through backend contract)
 - Development endpoint: each ticket has implementation, independent review, focused tests; stop before Windows/Herdr/native acceptance.
-- Repository: /opt/workflow-core
+- Repository: workflow-core
 - Branch: docs/router-core-spec-20261113
 - Base: 22a3099 (wfc 0.4.5 baseline)
-- WFC_STATE: /opt/workflow-core/.wfc-state/router-core-foundation-20261113
+- WFC_STATE: .wfc-state/router-core-foundation-20261113
 - wfc version: wfc 0.4.5
 - Controller: delegated workflow-core controller session
 - Role table: implementation Claude claude-opus-5-5 medium, fallback Codex gpt-6.1-sol medium; review Codex gpt-6.1-sol high with network
