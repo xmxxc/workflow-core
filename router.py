@@ -1375,6 +1375,7 @@ def new_notice(session, before, seconds):
 # tells: Codex repeats each submitted message in the transcript after the same `›`.
 # OpenCode argv prefill is checked separately by Herdr; ordinary OpenCode/Claude input gets one Enter.
 ENTER_RETRIES = 2
+PASTE_SETTLE_SECONDS = 0.5
 _BOX_SCROLL = re.compile(r"\s*[↑↓]$")
 # What a reader saw in an input box: its text, and whether lines above it are scrolled out of
 # sight (Codex marks that with ↑), so that the text may start inside the typed text.
@@ -1512,7 +1513,7 @@ def type_into(session, text, host=None):
     if sent.returncode != 0:
         state = NOT_SENT if getattr(sent, "not_run", False) else UNCERTAIN
         return state, None, sent.stderr or sent.stdout or f"tmux send-keys exited {sent.returncode}"
-    time.sleep(0.5)  # TUIs drop an Enter that arrives in the same burst as the text
+    time.sleep(PASTE_SETTLE_SECONDS)  # TUIs drop an Enter that arrives in the same burst as the text
     entered = tmux("send-keys", "-t", session, "Enter")
     if entered.returncode != 0:
         return PARTIAL, None, entered.stderr or entered.stdout or f"tmux Enter exited {entered.returncode}"

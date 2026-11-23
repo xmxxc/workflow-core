@@ -240,6 +240,9 @@ class BundledBackend:
         pasted = self._call(dispatch_id, 'input', text='\x1b[200~' + text + '\x1b[201~')
         if pasted['result'] != 'accepted':
             return pasted
+        if host == 'codex':
+            # Codex can absorb Enter into the paste burst before it submits the composer.
+            time.sleep(router.PASTE_SETTLE_SECONDS)
         entered = self._call(dispatch_id, 'input', text='\r')
         if entered['result'] != 'accepted':
             return {**entered, 'result': 'uncertain'}
